@@ -23,6 +23,7 @@ from pdi.principal import (
     PrincipalRecord,
     PrincipalRegistry,
 )
+from pdi.provider_identity import PostgreSQLProviderIdentityRepository
 from pdi.repository import PostgreSQLRepository
 from tests.integration.database_guard import require_safe_test_database_url
 
@@ -83,6 +84,29 @@ def test_two_principal_routing_roles_queries_and_resource_refs(
         harry.binding.database_url,
         Asset(id=shared_uuid, title="MU3 Harry Same UUID"),
     )
+
+    # Provider identities are Personal-DB-local: equal logical keys coexist.
+    harry_identity_engine = create_engine(
+        harry.binding.database_url, poolclass=NullPool
+    )
+    mother_identity_engine = create_engine(
+        mother.binding.database_url, poolclass=NullPool
+    )
+    try:
+        harry_instance = PostgreSQLProviderIdentityRepository(
+            harry_identity_engine
+        ).create_instance(
+            provider_type="nextcloud", instance_key="same-logical-key"
+        )
+        mother_instance = PostgreSQLProviderIdentityRepository(
+            mother_identity_engine
+        ).create_instance(
+            provider_type="nextcloud", instance_key="same-logical-key"
+        )
+        assert harry_instance.instance_key == mother_instance.instance_key
+    finally:
+        harry_identity_engine.dispose()
+        mother_identity_engine.dispose()
     _insert_asset(
         mother.binding.database_url,
         Asset(id=shared_uuid, title="MU3 Mother Same UUID"),

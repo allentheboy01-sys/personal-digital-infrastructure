@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_repository_has_exactly_one_schema_head() -> None:
-    assert repository_schema_head(ROOT) == "5e7a9c2d1f30"
+    assert repository_schema_head(ROOT) == "b8d4f2a6c901"
 
 
 def test_fleet_reports_unavailable_database_without_exposing_url() -> None:
@@ -36,7 +36,7 @@ def test_fleet_reports_unavailable_database_without_exposing_url() -> None:
     inspector = PersonalDatabaseFleetInspector(
         principals,
         databases,
-        expected_revision="5e7a9c2d1f30",
+        expected_revision="b8d4f2a6c901",
         engine_factory=create_engine,
     )
     status = inspector.inspect()[0]

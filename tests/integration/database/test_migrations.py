@@ -26,6 +26,7 @@ import pdi.repository.orm.blob
 import pdi.repository.orm.observation
 import pdi.repository.orm.person
 import pdi.repository.orm.pipeline_run
+import pdi.repository.orm.provider_identity
 import pdi.repository.orm.provider_sync_state
 import pdi.repository.orm.resource_person_relation
 
@@ -41,6 +42,7 @@ TYPED_RESOURCE_V0_1_REVISION = "3b1e6f8a4c20"
 PERSON_LABEL_RETRIEVAL_V0_1_REVISION = "7d2f4a6b8c10"
 SOURCE_OBSERVATION_FOUNDATION_REVISION = "2f6a8c1d4e90"
 PROVIDER_SYNC_STATE_REVISION = "5e7a9c2d1f30"
+PROVIDER_IDENTITY_REVISION = "b8d4f2a6c901"
 
 
 def _alembic_config(connection) -> Config:
@@ -63,6 +65,9 @@ def _run_alembic(
 
 def _drop_test_schema(engine: Engine) -> None:
     with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS observation_scopes"))
+        connection.execute(text("DROP TABLE IF EXISTS provider_accounts"))
+        connection.execute(text("DROP TABLE IF EXISTS provider_instances"))
         connection.execute(text("DROP TABLE IF EXISTS provider_sync_state"))
         connection.execute(text("DROP TABLE IF EXISTS resource_person_relations"))
         connection.execute(text("DROP TABLE IF EXISTS person_sources"))
@@ -159,6 +164,9 @@ def test_metadata_registration() -> None:
         "persons",
         "person_sources",
         "resource_person_relations",
+        "provider_instances",
+        "provider_accounts",
+        "observation_scopes",
     }
 
 
@@ -202,7 +210,7 @@ def test_empty_database_upgrade_and_schema(
                 "SELECT version_num "
                 "FROM alembic_version"
             )
-        ).scalar_one() == PROVIDER_SYNC_STATE_REVISION
+        ).scalar_one() == PROVIDER_IDENTITY_REVISION
 
 
 def test_query_v0_2_indexes_upgrade_reflection_and_downgrade(
@@ -506,7 +514,114 @@ def test_upgrade_downgrade_upgrade(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == PROVIDER_SYNC_STATE_REVISION
+        ).scalar_one() == PROVIDER_IDENTITY_REVISION
+
+
+def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(
+        migration_engine,
+        command.upgrade,
+        PROVIDER_SYNC_STATE_REVISION,
+    )
+    asset_id = uuid4()
+    blob_id = uuid4()
+    source_id = uuid4()
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO assets "
+                "(id, resource_type, title, metadata, created_at, updated_at) "
+                "VALUES (:id, 'file', 'MU4 preserved', '{}'::jsonb, now(), now())"
+            ),
+            {"id": asset_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO blobs (id, asset_id, hash, size, mime_type) "
+                "VALUES (:id, :asset, :hash, 7, 'text/plain')"
+            ),
+            {"id": blob_id, "asset": asset_id, "hash": f"mu4-{blob_id}"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO asset_sources "
+                "(id, blob_id, provider, external_id, metadata) "
+                "VALUES (:id, :blob, 'mu4-provider', :external, '{}'::jsonb)"
+            ),
+            {"id": source_id, "blob": blob_id, "external": f"mu4-{source_id}"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO provider_sync_state "
+                "(provider, mechanism, checkpoint, version, "
+                "reconciliation_required, created_at, updated_at) "
+                "VALUES ('mu4-provider', 'mu4-mechanism', 'opaque-test', 3, "
+                "true, now(), now())"
+            )
+        )
+    _run_alembic(migration_engine, command.upgrade, "head")
+    with migration_engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT title FROM assets WHERE id = :id"),
+            {"id": asset_id},
+        ).scalar_one() == "MU4 preserved"
+        assert connection.execute(
+            text("SELECT asset_id FROM blobs WHERE id = :id"),
+            {"id": blob_id},
+        ).scalar_one() == asset_id
+        assert connection.execute(
+            text("SELECT blob_id FROM asset_sources WHERE id = :id"),
+            {"id": source_id},
+        ).scalar_one() == blob_id
+        assert connection.execute(
+            text(
+                "SELECT checkpoint, version, reconciliation_required "
+                "FROM provider_sync_state "
+                "WHERE provider = 'mu4-provider' AND mechanism = 'mu4-mechanism'"
+            )
+        ).one() == ("opaque-test", 3, True)
+        assert {
+            "provider_instances",
+            "provider_accounts",
+            "observation_scopes",
+        }.issubset(inspect(connection).get_table_names())
+        assert connection.execute(
+            text("SELECT count(*) FROM provider_instances")
+        ).scalar_one() == 0
+
+    _run_alembic(
+        migration_engine,
+        command.downgrade,
+        PROVIDER_SYNC_STATE_REVISION,
+    )
+    with migration_engine.connect() as connection:
+        tables = set(inspect(connection).get_table_names())
+        assert "provider_instances" not in tables
+        assert "provider_accounts" not in tables
+        assert "observation_scopes" not in tables
+        assert connection.execute(
+            text("SELECT title FROM assets WHERE id = :id"),
+            {"id": asset_id},
+        ).scalar_one() == "MU4 preserved"
+        assert connection.execute(
+            text("SELECT blob_id FROM asset_sources WHERE id = :id"),
+            {"id": source_id},
+        ).scalar_one() == blob_id
+        assert connection.execute(
+            text(
+                "SELECT checkpoint, version, reconciliation_required "
+                "FROM provider_sync_state "
+                "WHERE provider = 'mu4-provider' AND mechanism = 'mu4-mechanism'"
+            )
+        ).one() == ("opaque-test", 3, True)
+
+    _run_alembic(migration_engine, command.upgrade, "head")
+    with migration_engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one() == PROVIDER_IDENTITY_REVISION
 
 
 def test_provider_sync_state_upgrade_downgrade_reupgrade(
