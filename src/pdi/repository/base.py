@@ -4,7 +4,28 @@ from pdi.decision import Decision
 from pdi.models import Asset, AssetSource, Blob
 
 
+class SourceIdentityAmbiguityError(RuntimeError):
+    """A legacy identity is ambiguous across multiple scoped Sources."""
+
+
 class Repository(ABC):
+    @abstractmethod
+    def find_source_in_scope(
+        self,
+        observation_scope_id: str,
+        external_id: str,
+    ) -> AssetSource | None:
+        """Find a Source by its authoritative scoped observation identity."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_active_sources_in_scope(
+        self,
+        observation_scope_id: str,
+    ) -> list[AssetSource]:
+        """List active Sources belonging to one Observation Scope."""
+        raise NotImplementedError
+
     @abstractmethod
     def find_source(
         self,

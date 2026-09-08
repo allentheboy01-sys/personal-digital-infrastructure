@@ -3,10 +3,36 @@ from copy import deepcopy
 from pdi.decision import ActionType, Decision
 from pdi.models import Asset, AssetSource, Blob
 
-from .base import Repository
+from .base import Repository, SourceIdentityAmbiguityError
 
 
 class InMemoryRepository(Repository):
+    def find_source_in_scope(
+        self,
+        observation_scope_id: str,
+        external_id: str,
+    ) -> AssetSource | None:
+        matches = [
+            source
+            for source in self.sources.values()
+            if source.observation_scope_id == observation_scope_id
+            and source.external_id == external_id
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("Ambiguous scoped Source identity")
+        return matches[0] if matches else None
+
+    def list_active_sources_in_scope(
+        self,
+        observation_scope_id: str,
+    ) -> list[AssetSource]:
+        return [
+            source
+            for source in self.sources.values()
+            if source.observation_scope_id == observation_scope_id
+            and source.is_active
+        ]
+
     def __init__(self) -> None:
         self.assets: dict[str, Asset] = {}
         self.blobs: dict[str, Blob] = {}
@@ -17,12 +43,23 @@ class InMemoryRepository(Repository):
         provider: str,
         external_id: str,
     ) -> AssetSource | None:
+        scoped_matches = []
         for source in self.sources.values():
             if (
+                source.observation_scope_id is None
+                and
                 source.provider == provider
                 and source.external_id == external_id
             ):
                 return source
+
+            if source.provider == provider and source.external_id == external_id:
+                scoped_matches.append(source)
+
+        if len(scoped_matches) > 1:
+            raise SourceIdentityAmbiguityError(
+                "Legacy Source identity is ambiguous across Observation Scopes"
+            )
 
         return None
 
@@ -34,6 +71,8 @@ class InMemoryRepository(Repository):
             source
             for source in self.sources.values()
             if (
+                source.observation_scope_id is None
+                and
                 source.provider == provider
                 and source.is_active
             )

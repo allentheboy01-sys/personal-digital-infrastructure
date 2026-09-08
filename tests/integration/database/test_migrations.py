@@ -43,6 +43,7 @@ PERSON_LABEL_RETRIEVAL_V0_1_REVISION = "7d2f4a6b8c10"
 SOURCE_OBSERVATION_FOUNDATION_REVISION = "2f6a8c1d4e90"
 PROVIDER_SYNC_STATE_REVISION = "5e7a9c2d1f30"
 PROVIDER_IDENTITY_REVISION = "b8d4f2a6c901"
+SOURCE_PROVENANCE_REVISION = "c3e5a7b9d102"
 
 
 def _alembic_config(connection) -> Config:
@@ -65,6 +66,7 @@ def _run_alembic(
 
 def _drop_test_schema(engine: Engine) -> None:
     with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS asset_sources"))
         connection.execute(text("DROP TABLE IF EXISTS observation_scopes"))
         connection.execute(text("DROP TABLE IF EXISTS provider_accounts"))
         connection.execute(text("DROP TABLE IF EXISTS provider_instances"))
@@ -75,9 +77,6 @@ def _drop_test_schema(engine: Engine) -> None:
         connection.execute(text("DROP TABLE IF EXISTS pipeline_runs"))
         connection.execute(text("DROP TABLE IF EXISTS resource_enrichments"))
         connection.execute(text("DROP TABLE IF EXISTS resource_statements"))
-        connection.execute(
-            text("DROP TABLE IF EXISTS asset_sources")
-        )
         connection.execute(
             text("DROP INDEX IF EXISTS ix_blobs_hash")
         )
@@ -210,7 +209,45 @@ def test_empty_database_upgrade_and_schema(
                 "SELECT version_num "
                 "FROM alembic_version"
             )
-        ).scalar_one() == PROVIDER_IDENTITY_REVISION
+        ).scalar_one() == SOURCE_PROVENANCE_REVISION
+
+
+def test_mu5_source_provenance_upgrade_preserves_legacy_source(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(migration_engine, command.upgrade, PROVIDER_IDENTITY_REVISION)
+    asset_id, blob_id, source_id = uuid4(), uuid4(), uuid4()
+    with migration_engine.begin() as connection:
+        connection.execute(text("INSERT INTO assets (id,resource_type,title,metadata,created_at,updated_at) VALUES (:id,'file','MU5','{}',now(),now())"), {"id": asset_id})
+        connection.execute(text("INSERT INTO blobs (id,asset_id,hash) VALUES (:id,:asset,:hash)"), {"id": blob_id, "asset": asset_id, "hash": f"mu5-{blob_id}"})
+        connection.execute(text("INSERT INTO asset_sources (id,blob_id,provider,external_id,metadata) VALUES (:id,:blob,'nextcloud','legacy','{}')"), {"id": source_id, "blob": blob_id})
+    _run_alembic(migration_engine, command.upgrade, "head")
+    with migration_engine.connect() as connection:
+        row = connection.execute(text("SELECT id,blob_id,provider,external_id,observation_scope_id FROM asset_sources WHERE id=:id"), {"id": source_id}).one()
+        assert row == (source_id, blob_id, "nextcloud", "legacy", None)
+        indexes = {item["name"]: item for item in inspect(connection).get_indexes("asset_sources")}
+        assert indexes["uq_asset_sources_scope_external_id"]["unique"] is True
+        assert indexes["uq_asset_sources_legacy_provider_external_id"]["unique"] is True
+
+
+def test_mu5_downgrade_fails_before_ddl_when_legacy_namespace_collides(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(migration_engine, command.upgrade, "head")
+    instance, scope_a, scope_b = uuid4(), uuid4(), uuid4()
+    with migration_engine.begin() as connection:
+        connection.execute(text("INSERT INTO provider_instances (id,provider_type,instance_key,enabled,created_at,updated_at) VALUES (:id,'nextcloud',:key,true,now(),now())"), {"id": instance, "key": f"mu5-{instance}"})
+        for scope, key in ((scope_a, "a"), (scope_b, "b")):
+            connection.execute(text("INSERT INTO observation_scopes (id,provider_instance_id,scope_key,enabled,created_at,updated_at) VALUES (:id,:instance,:key,true,now(),now())"), {"id": scope, "instance": instance, "key": f"scope-{key}"})
+        for scope in (scope_a, scope_b):
+            asset, blob, source = uuid4(), uuid4(), uuid4()
+            connection.execute(text("INSERT INTO assets (id,resource_type,title,metadata,created_at,updated_at) VALUES (:id,'file','MU5','{}',now(),now())"), {"id": asset})
+            connection.execute(text("INSERT INTO blobs (id,asset_id,hash) VALUES (:id,:asset,:hash)"), {"id": blob, "asset": asset, "hash": f"mu5-{blob}"})
+            connection.execute(text("INSERT INTO asset_sources (id,blob_id,provider,external_id,observation_scope_id,metadata) VALUES (:id,:blob,'nextcloud','123',:scope,'{}')"), {"id": source, "blob": blob, "scope": scope})
+    with pytest.raises(Exception, match="downgrade blocked"):
+        _run_alembic(migration_engine, command.downgrade, PROVIDER_IDENTITY_REVISION)
+    with migration_engine.connect() as connection:
+        assert "observation_scope_id" in {column["name"] for column in inspect(connection).get_columns("asset_sources")}
 
 
 def test_query_v0_2_indexes_upgrade_reflection_and_downgrade(
@@ -514,7 +551,7 @@ def test_upgrade_downgrade_upgrade(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == PROVIDER_IDENTITY_REVISION
+        ).scalar_one() == SOURCE_PROVENANCE_REVISION
 
 
 def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
@@ -621,7 +658,7 @@ def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == PROVIDER_IDENTITY_REVISION
+        ).scalar_one() == SOURCE_PROVENANCE_REVISION
 
 
 def test_provider_sync_state_upgrade_downgrade_reupgrade(

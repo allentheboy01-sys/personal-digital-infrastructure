@@ -8,7 +8,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Text,
-    UniqueConstraint,
     text,
     true,
 )
@@ -20,14 +19,6 @@ from pdi.repository.orm.base import Base
 
 class AssetSourceORM(Base):
     __tablename__ = "asset_sources"
-
-    __table_args__ = (
-        UniqueConstraint(
-            "provider",
-            "external_id",
-            name="uq_asset_sources_provider_external_id",
-        ),
-    )
 
     id: Mapped[UUID] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -52,6 +43,16 @@ class AssetSourceORM(Base):
     external_id: Mapped[str] = mapped_column(
         Text,
         nullable=False,
+    )
+
+    observation_scope_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "observation_scopes.id",
+            ondelete="RESTRICT",
+            name="fk_asset_sources_observation_scope",
+        ),
+        nullable=True,
     )
 
     path: Mapped[str | None] = mapped_column(
@@ -104,4 +105,18 @@ Index(
     "ix_asset_sources_active_blob_id",
     AssetSourceORM.blob_id,
     postgresql_where=AssetSourceORM.is_active.is_(True),
+)
+Index(
+    "uq_asset_sources_scope_external_id",
+    AssetSourceORM.observation_scope_id,
+    AssetSourceORM.external_id,
+    unique=True,
+    postgresql_where=AssetSourceORM.observation_scope_id.is_not(None),
+)
+Index(
+    "uq_asset_sources_legacy_provider_external_id",
+    AssetSourceORM.provider,
+    AssetSourceORM.external_id,
+    unique=True,
+    postgresql_where=AssetSourceORM.observation_scope_id.is_(None),
 )

@@ -58,12 +58,16 @@ from pdi.retrieval import (
     RetrievalMappingError,
     RetrievalMappingRepository,
 )
-from pdi.repository.base import Repository
+from pdi.repository.base import Repository, SourceIdentityAmbiguityError
 from pdi.repository.orm.asset import AssetORM
 from pdi.repository.orm.asset_source import AssetSourceORM
 from pdi.repository.orm.blob import BlobORM
 from pdi.repository.orm.observation import ResourceStatementORM
 from pdi.repository.orm.person import PersonSourceORM
+from pdi.repository.orm.provider_identity import (
+    ObservationScopeORM,
+    ProviderInstanceORM,
+)
 from pdi.repository.orm.resource_person_relation import (
     ResourcePersonRelationORM,
 )
@@ -180,6 +184,11 @@ class PostgreSQLRepository(
             blob_id=UUID(source.blob_id),
             provider=source.provider,
             external_id=source.external_id,
+            observation_scope_id=(
+                UUID(source.observation_scope_id)
+                if source.observation_scope_id
+                else None
+            ),
             path=source.path,
             name=source.name,
             version_tag=source.version_tag,
@@ -199,6 +208,11 @@ class PostgreSQLRepository(
             blob_id=str(source_orm.blob_id),
             provider=source_orm.provider,
             external_id=source_orm.external_id,
+            observation_scope_id=(
+                str(source_orm.observation_scope_id)
+                if source_orm.observation_scope_id
+                else None
+            ),
             path=source_orm.path,
             name=source_orm.name,
             version_tag=source_orm.version_tag,
@@ -237,6 +251,7 @@ class PostgreSQLRepository(
                 .where(
                     AssetSourceORM.provider == provider,
                     AssetSourceORM.external_id == external_id,
+                    AssetSourceORM.observation_scope_id.is_(None),
                 )
             )
 
@@ -246,9 +261,43 @@ class PostgreSQLRepository(
             )
 
             if source_orm is None:
+                scoped_count = session.execute(
+                    select(func.count()).select_from(AssetSourceORM).where(
+                        AssetSourceORM.provider == provider,
+                        AssetSourceORM.external_id == external_id,
+                        AssetSourceORM.observation_scope_id.is_not(None),
+                    )
+                ).scalar_one()
+                if scoped_count > 1:
+                    raise SourceIdentityAmbiguityError(
+                        "Legacy Source identity is ambiguous across Observation Scopes"
+                    )
                 return None
 
             return self._asset_source_to_domain(source_orm)
+
+    def find_source_in_scope(
+        self,
+        observation_scope_id: str,
+        external_id: str,
+    ) -> AssetSource | None:
+        with self._session_factory() as session:
+            row = session.execute(select(AssetSourceORM).where(
+                AssetSourceORM.observation_scope_id == UUID(observation_scope_id),
+                AssetSourceORM.external_id == external_id,
+            )).scalar_one_or_none()
+            return None if row is None else self._asset_source_to_domain(row)
+
+    def list_active_sources_in_scope(
+        self,
+        observation_scope_id: str,
+    ) -> list[AssetSource]:
+        with self._session_factory() as session:
+            rows = session.execute(select(AssetSourceORM).where(
+                AssetSourceORM.observation_scope_id == UUID(observation_scope_id),
+                AssetSourceORM.is_active.is_(True),
+            )).scalars().all()
+            return [self._asset_source_to_domain(row) for row in rows]
 
     def list_active_sources(
         self,
@@ -259,6 +308,7 @@ class PostgreSQLRepository(
                 select(AssetSourceORM)
                 .where(
                     AssetSourceORM.provider == provider,
+                    AssetSourceORM.observation_scope_id.is_(None),
                     AssetSourceORM.is_active.is_(True),
                 )
             )
@@ -1647,6 +1697,7 @@ class PostgreSQLRepository(
                 "CREATE_SOURCE requires source"
             )
 
+        self._validate_source_scope(session, action.source)
         source_orm = self._asset_source_to_orm(
             action.source
         )
@@ -1664,6 +1715,7 @@ class PostgreSQLRepository(
             )
 
         source = action.source
+        self._validate_source_scope(session, source)
 
         source_orm = session.get(
             AssetSourceORM,
@@ -1689,6 +1741,20 @@ class PostgreSQLRepository(
         source_orm.metadata_ = source.metadata
         source_orm.is_active = source.is_active
         source_orm.deleted_at = source.deleted_at
+
+    @staticmethod
+    def _validate_source_scope(session: Session, source: AssetSource) -> None:
+        if source.observation_scope_id is None:
+            return
+        scope = session.get(ObservationScopeORM, UUID(source.observation_scope_id))
+        if scope is None:
+            raise ValueError("Observation Scope does not exist")
+        instance = session.get(ProviderInstanceORM, scope.provider_instance_id)
+        if instance is None or instance.provider_type != source.provider:
+            raise ValueError(
+                "Source provider does not match Observation Scope "
+                "Provider Instance"
+            )
 
     def _execute_deactivate_source(
         self,

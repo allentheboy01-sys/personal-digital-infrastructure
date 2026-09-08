@@ -43,6 +43,7 @@ class AssetSource:
     blob_id: str | None = None
     provider: str = "unknown"
     external_id: str | None = None
+    observation_scope_id: str | None = None
     path: str | None = None
     name: str | None = None
     version_tag: str | None = None
@@ -54,3 +55,11 @@ class AssetSource:
 
     def __post_init__(self) -> None:
         validate_provider_size(self.provider_size)
+        if self.observation_scope_id is not None:
+            if (
+                not isinstance(self.observation_scope_id, str)
+                or not self.observation_scope_id.strip()
+            ):
+                raise ValueError("observation_scope_id must be a non-empty UUID string")
+            if not isinstance(self.external_id, str) or not self.external_id.strip():
+                raise ValueError("scoped Source external_id must be non-empty")
