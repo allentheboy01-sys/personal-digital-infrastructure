@@ -15,6 +15,7 @@ import pdi.repository.orm.pipeline_run
 import pdi.repository.orm.provider_identity
 import pdi.repository.orm.provider_sync_state
 import pdi.repository.orm.resource_person_relation
+import pdi.repository.orm.scope_sync_state
 
 
 config = context.config
@@ -38,6 +39,7 @@ _EXPECTED_TABLES = {
     "provider_instances",
     "provider_accounts",
     "observation_scopes",
+    "observation_scope_sync_state",
     "persons",
     "person_sources",
     "resource_person_relations",

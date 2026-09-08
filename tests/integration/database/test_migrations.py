@@ -29,6 +29,7 @@ import pdi.repository.orm.pipeline_run
 import pdi.repository.orm.provider_identity
 import pdi.repository.orm.provider_sync_state
 import pdi.repository.orm.resource_person_relation
+import pdi.repository.orm.scope_sync_state
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -44,6 +45,7 @@ SOURCE_OBSERVATION_FOUNDATION_REVISION = "2f6a8c1d4e90"
 PROVIDER_SYNC_STATE_REVISION = "5e7a9c2d1f30"
 PROVIDER_IDENTITY_REVISION = "b8d4f2a6c901"
 SOURCE_PROVENANCE_REVISION = "c3e5a7b9d102"
+SCOPE_SYNC_STATE_REVISION = "d4f6a8c0e213"
 
 
 def _alembic_config(connection) -> Config:
@@ -66,6 +68,7 @@ def _run_alembic(
 
 def _drop_test_schema(engine: Engine) -> None:
     with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS observation_scope_sync_state"))
         connection.execute(text("DROP TABLE IF EXISTS asset_sources"))
         connection.execute(text("DROP TABLE IF EXISTS observation_scopes"))
         connection.execute(text("DROP TABLE IF EXISTS provider_accounts"))
@@ -166,6 +169,7 @@ def test_metadata_registration() -> None:
         "provider_instances",
         "provider_accounts",
         "observation_scopes",
+        "observation_scope_sync_state",
     }
 
 
@@ -209,7 +213,7 @@ def test_empty_database_upgrade_and_schema(
                 "SELECT version_num "
                 "FROM alembic_version"
             )
-        ).scalar_one() == SOURCE_PROVENANCE_REVISION
+        ).scalar_one() == SCOPE_SYNC_STATE_REVISION
 
 
 def test_mu5_source_provenance_upgrade_preserves_legacy_source(
@@ -551,7 +555,7 @@ def test_upgrade_downgrade_upgrade(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == SOURCE_PROVENANCE_REVISION
+        ).scalar_one() == SCOPE_SYNC_STATE_REVISION
 
 
 def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
@@ -658,7 +662,7 @@ def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == SOURCE_PROVENANCE_REVISION
+        ).scalar_one() == SCOPE_SYNC_STATE_REVISION
 
 
 def test_provider_sync_state_upgrade_downgrade_reupgrade(
@@ -1167,3 +1171,32 @@ def test_autogenerate_has_zero_diff(
             migration_context,
             Base.metadata,
         ) == []
+
+
+def test_mu6_additive_scope_state_preserves_legacy_state(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(migration_engine, command.upgrade, SOURCE_PROVENANCE_REVISION)
+    with migration_engine.begin() as connection:
+        connection.execute(text("INSERT INTO provider_sync_state (provider,mechanism,checkpoint,version,reconciliation_required,created_at,updated_at) VALUES ('nextcloud','activity_v2_hint_v1','synthetic-opaque',7,true,'2026-09-08T01:00:00+00:00','2026-09-08T02:00:00+00:00')"))
+        before = dict(connection.execute(text("SELECT * FROM provider_sync_state")).mappings().one())
+    _run_alembic(migration_engine, command.upgrade, "head")
+    with migration_engine.connect() as connection:
+        after = dict(connection.execute(text("SELECT * FROM provider_sync_state")).mappings().one())
+        assert after == before
+        assert connection.execute(text("SELECT count(*) FROM observation_scope_sync_state")).scalar_one() == 0
+
+
+def test_mu6_downgrade_rejects_nonempty_scope_state_before_drop(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(migration_engine, command.upgrade, "head")
+    instance_id, scope_id = uuid4(), uuid4()
+    with migration_engine.begin() as connection:
+        connection.execute(text("INSERT INTO provider_instances (id,provider_type,instance_key,enabled,created_at,updated_at) VALUES (:id,'nextcloud',:key,true,now(),now())"), {"id": instance_id, "key": f"mu6-{instance_id}"})
+        connection.execute(text("INSERT INTO observation_scopes (id,provider_instance_id,scope_key,enabled,created_at,updated_at) VALUES (:id,:instance,:key,true,now(),now())"), {"id": scope_id, "instance": instance_id, "key": f"mu6-{scope_id}"})
+        connection.execute(text("INSERT INTO observation_scope_sync_state (observation_scope_id,mechanism,checkpoint,version,reconciliation_required,created_at,updated_at) VALUES (:scope,'synthetic-v1','synthetic',0,false,now(),now())"), {"scope": scope_id})
+    with pytest.raises(Exception, match="downgrade blocked"):
+        _run_alembic(migration_engine, command.downgrade, SOURCE_PROVENANCE_REVISION)
+    with migration_engine.connect() as connection:
+        assert "observation_scope_sync_state" in inspect(connection).get_table_names()
