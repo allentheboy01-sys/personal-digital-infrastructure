@@ -1,3 +1,4 @@
+from pdi.adapters.immich_account import ImmichAccountMismatchError
 from .adapter import ImmichAdapter, ImmichPaginationDriftError
 from .incremental import (
     IMMICH_INCREMENTAL_MECHANISM,
@@ -12,6 +13,7 @@ __all__ = [
     "IMMICH_INCREMENTAL_MECHANISM",
     "IMMICH_INCREMENTAL_OVERLAP",
     "ImmichAdapter",
+    "ImmichAccountMismatchError",
     "ImmichBootstrapRequiredError",
     "ImmichIncrementalSync",
     "ImmichPaginationDriftError",

@@ -7,6 +7,12 @@ import requests
 
 from pdi.adapters.base import Adapter, ProviderFact
 
+from pdi.adapters.immich_account import (
+    ImmichAccountMismatchError,
+    authenticated_immich_user_id,
+    canonical_immich_user_id,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,28 +29,49 @@ class ImmichAdapter(Adapter):
         self,
         base_url: str,
         api_key: str,
+        *,
+        expected_user_id: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.expected_user_id = (
+            None
+            if expected_user_id is None
+            else canonical_immich_user_id(expected_user_id)
+        )
+        self._account_verified = False
 
     def connect(self) -> None:
         """Connect to Immich and verify the API key."""
 
         logger.info("Connecting Immich...")
 
+        endpoint = (
+            "/api/server/about"
+            if self.expected_user_id is None
+            else "/api/users/me"
+        )
         response = requests.get(
-            f"{self.base_url}/api/server/about",
+            f"{self.base_url}{endpoint}",
             headers=self._headers(),
             timeout=10,
         )
 
         response.raise_for_status()
+        if self.expected_user_id is not None:
+            authenticated = authenticated_immich_user_id(response.json())
+            if authenticated != self.expected_user_id:
+                raise ImmichAccountMismatchError(
+                    "Immich credential does not match expected Provider Account"
+                )
+            self._account_verified = True
 
         logger.info("Connected to Immich")
 
     def scan(self) -> Iterable[ProviderFact]:
         """Scan assets visible to the configured API-key search scope."""
 
+        self._ensure_account_qualified()
         logger.info("Scanning Immich...")
 
         return self._search_metadata({"withDeleted": True})
@@ -57,6 +84,7 @@ class ImmichAdapter(Adapter):
     ) -> Iterable[ProviderFact]:
         """Stream assets updated inside one bounded Immich v3.1 window."""
 
+        self._ensure_account_qualified()
         return self._search_metadata(
             {
                 "updatedAfter": updated_after,
@@ -187,6 +215,7 @@ class ImmichAdapter(Adapter):
     ) -> Iterable[bytes]:
         """Stream the original bytes for one Immich asset."""
 
+        self._ensure_account_qualified()
         if fact.provider != self.provider_name:
             raise ValueError(
                 f"ProviderFact belongs to {fact.provider}, "
@@ -228,6 +257,10 @@ class ImmichAdapter(Adapter):
         return {
             "x-api-key": self.api_key,
         }
+
+    def _ensure_account_qualified(self) -> None:
+        if self.expected_user_id is not None and not self._account_verified:
+            self.connect()
 
     @staticmethod
     def _assets_page(

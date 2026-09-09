@@ -4,7 +4,11 @@ import pytest
 import requests
 
 from pdi.adapters.base import ProviderFact
-from pdi.adapters.immich import ImmichAdapter, ImmichPaginationDriftError
+from pdi.adapters.immich import (
+    ImmichAccountMismatchError,
+    ImmichAdapter,
+    ImmichPaginationDriftError,
+)
 
 
 class FakeResponse:
@@ -98,6 +102,80 @@ def test_connect_does_not_swallow_http_errors(
         match="Immich authentication failed",
     ):
         adapter.connect()
+
+
+def test_connect_binds_api_key_to_expected_authenticated_user(
+    monkeypatch,
+) -> None:
+    user_id = "65f0a1c2-3d4e-4f50-8123-456789abcdef"
+    response = FakeResponse(json_data={"id": user_id})
+    request = {}
+
+    def fake_get(url, **kwargs):
+        request.update(url=url, **kwargs)
+        return response
+
+    monkeypatch.setattr(
+        "pdi.adapters.immich.adapter.requests.get", fake_get
+    )
+    ImmichAdapter(
+        "https://immich.example",
+        "test-api-key",
+        expected_user_id=user_id,
+    ).connect()
+
+    assert request["url"] == "https://immich.example/api/users/me"
+    assert request["headers"] == {"x-api-key": "test-api-key"}
+
+
+def test_connect_rejects_valid_key_for_different_user(monkeypatch) -> None:
+    expected = "65f0a1c2-3d4e-4f50-8123-456789abcdef"
+    actual = "75f0a1c2-3d4e-4f50-8123-456789abcdef"
+    monkeypatch.setattr(
+        "pdi.adapters.immich.adapter.requests.get",
+        lambda *args, **kwargs: FakeResponse(json_data={"id": actual}),
+    )
+
+    with pytest.raises(ImmichAccountMismatchError):
+        ImmichAdapter(
+            "https://immich.example",
+            "valid-wrong-user-key",
+            expected_user_id=expected,
+        ).connect()
+
+
+def test_incremental_scan_qualifies_account_before_metadata_request(
+    monkeypatch,
+) -> None:
+    expected = "65f0a1c2-3d4e-4f50-8123-456789abcdef"
+    actual = "75f0a1c2-3d4e-4f50-8123-456789abcdef"
+    calls: list[tuple[str, str]] = []
+
+    def fake_get(url, **kwargs):
+        calls.append(("GET", url))
+        return FakeResponse(json_data={"id": actual})
+
+    def fake_post(url, **kwargs):
+        calls.append(("POST", url))
+        raise AssertionError("metadata request must not follow account mismatch")
+
+    monkeypatch.setattr("pdi.adapters.immich.adapter.requests.get", fake_get)
+    monkeypatch.setattr("pdi.adapters.immich.adapter.requests.post", fake_post)
+    adapter = ImmichAdapter(
+        "https://immich.example",
+        "valid-wrong-user-key",
+        expected_user_id=expected,
+    )
+
+    with pytest.raises(ImmichAccountMismatchError):
+        tuple(
+            adapter.scan_updated_window(
+                updated_after="2026-01-01T00:00:00Z",
+                updated_before="2026-01-01T00:05:00Z",
+            )
+        )
+
+    assert calls == [("GET", "https://immich.example/api/users/me")]
 
 
 def test_scan_paginates_and_maps_provider_facts(

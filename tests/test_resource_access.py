@@ -678,6 +678,73 @@ def test_immich_adapter_forwards_range_to_official_video_endpoint() -> None:
     assert request_seen.headers["x-api-key"] == "sensitive-key"
 
 
+def test_immich_adapter_qualifies_expected_account_before_asset_access() -> None:
+    locator = str(uuid4())
+    expected = str(uuid4())
+    paths = []
+
+    class MockByteStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"ok"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/api/users/me":
+            return httpx.Response(200, json={"id": expected})
+        return httpx.Response(
+            200,
+            headers={"content-type": "image/webp", "content-length": "2"},
+            stream=MockByteStream(),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ImmichRepresentationAdapter(
+        "https://immich.example",
+        "sensitive-key",
+        expected_user_id=expected,
+        client=client,
+    )
+
+    async def run() -> None:
+        opened = await adapter.open_representation(
+            locator, ResourceRepresentationKind.THUMBNAIL
+        )
+        assert b"".join([chunk async for chunk in opened.body]) == b"ok"
+        await opened.close()
+        await client.aclose()
+
+    asyncio.run(run())
+    assert paths == ["/api/users/me", f"/api/assets/{locator}/thumbnail"]
+
+
+def test_immich_adapter_rejects_wrong_valid_user_before_asset_access() -> None:
+    expected = str(uuid4())
+    actual = str(uuid4())
+    paths = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"id": actual})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ImmichRepresentationAdapter(
+        "https://immich.example",
+        "valid-wrong-user-key",
+        expected_user_id=expected,
+        client=client,
+    )
+
+    async def run() -> None:
+        with pytest.raises(ResourceAccessUnavailableError):
+            await adapter.open_representation(
+                str(uuid4()), ResourceRepresentationKind.THUMBNAIL
+            )
+        await client.aclose()
+
+    asyncio.run(run())
+    assert paths == ["/api/users/me"]
+
+
 def test_frozen_size_constants() -> None:
     assert THUMBNAIL_MAX_BYTES == 2 * 1024 * 1024
     assert PREVIEW_MAX_BYTES == 16 * 1024 * 1024

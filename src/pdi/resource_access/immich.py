@@ -3,9 +3,15 @@ from uuid import UUID
 
 import httpx
 
+from pdi.adapters.immich_account import (
+    authenticated_immich_user_id,
+    canonical_immich_user_id,
+)
+
 from .errors import (
     ProviderInvalidResponseError,
     ProviderUnavailableError,
+    ResourceAccessUnavailableError,
 )
 from .models import ResourceRepresentationKind
 from .provider import ProviderRepresentation
@@ -22,10 +28,17 @@ class ImmichRepresentationAdapter:
         base_url: str,
         api_key: str,
         *,
+        expected_user_id: str | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._expected_user_id = (
+            None
+            if expected_user_id is None
+            else canonical_immich_user_id(expected_user_id)
+        )
+        self._account_verified = False
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             follow_redirects=False,
@@ -46,6 +59,7 @@ class ImmichRepresentationAdapter:
         provider_locator: str,
         representation_kind: ResourceRepresentationKind,
     ) -> ProviderRepresentation:
+        await self._verify_account()
         try:
             locator = UUID(provider_locator)
         except (TypeError, ValueError, AttributeError) as error:
@@ -99,6 +113,7 @@ class ImmichRepresentationAdapter:
         provider_locator: str,
         byte_range: str | None,
     ) -> ProviderRepresentation:
+        await self._verify_account()
         try:
             locator = UUID(provider_locator)
         except (TypeError, ValueError, AttributeError):
@@ -152,3 +167,23 @@ class ImmichRepresentationAdapter:
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()
+
+    async def _verify_account(self) -> None:
+        if self._expected_user_id is None or self._account_verified:
+            return
+        try:
+            response = await self._client.get(
+                f"{self._base_url}/api/users/me",
+                headers={"x-api-key": self._api_key},
+            )
+            response.raise_for_status()
+            authenticated = authenticated_immich_user_id(response.json())
+        except Exception:
+            raise ResourceAccessUnavailableError(
+                "Immich account qualification failed"
+            ) from None
+        if authenticated != self._expected_user_id:
+            raise ResourceAccessUnavailableError(
+                "Immich credential does not match expected Provider Account"
+            )
+        self._account_verified = True
