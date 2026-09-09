@@ -16,6 +16,8 @@ class ResourceAccessSource:
     provider_locator: str = field(repr=False)
     resource_type: str
     mime_type: str | None
+    source_id: str | None = field(default=None, repr=False)
+    observation_scope_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,6 +16,7 @@ class TextResourceAccessSource:
     size_bytes: int | None
     blob_sha256: str = field(repr=False)
     version_tag: str | None = field(default=None, repr=False)
+    observation_scope_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

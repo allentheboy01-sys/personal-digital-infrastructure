@@ -528,12 +528,18 @@ class PostgreSQLRepository(
 
             return tuple(
                 ResourceAccessSource(
+                    source_id=str(source.id),
                     provider=source.provider,
                     provider_locator=source.external_id,
                     resource_type=asset.resource_type,
                     mime_type=effective_source_mime_type(
                         source.provider_mime_type,
                         blob.mime_type,
+                    ),
+                    observation_scope_id=(
+                        None
+                        if source.observation_scope_id is None
+                        else str(source.observation_scope_id)
                     ),
                 )
                 for source, blob, asset in rows
@@ -579,6 +585,11 @@ class PostgreSQLRepository(
                     size_bytes=blob.size,
                     blob_sha256=blob.hash,
                     version_tag=source.version_tag,
+                    observation_scope_id=(
+                        None
+                        if source.observation_scope_id is None
+                        else str(source.observation_scope_id)
+                    ),
                 )
                 for source, blob, asset in rows
             )

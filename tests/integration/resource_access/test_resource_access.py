@@ -154,12 +154,14 @@ def test_postgres_resource_access_mapping_is_read_only_and_detached() -> None:
 
         assert eligible is not None and set(eligible) == {
             ResourceAccessSource(
+                source_id=str(source_ids["eligible"]),
                 provider="immich",
                 provider_locator=locators["eligible"],
                 resource_type="file",
                 mime_type="image/jpeg",
             ),
             ResourceAccessSource(
+                source_id=str(source_ids["video"]),
                 provider="immich",
                 provider_locator=locators["video"],
                 resource_type="file",
@@ -183,6 +185,7 @@ def test_postgres_resource_access_mapping_is_read_only_and_detached() -> None:
                 size_bytes=100,
                 blob_sha256="b" * 64,
                 version_tag="1",
+                observation_scope_id=None,
             ),
             TextResourceAccessSource(
                 source_id=str(source_ids["nextcloud_text"]),
@@ -193,6 +196,7 @@ def test_postgres_resource_access_mapping_is_read_only_and_detached() -> None:
                 size_bytes=100,
                 blob_sha256="a" * 64,
                 version_tag="1",
+                observation_scope_id=None,
             ),
         }
         assert missing_text is None

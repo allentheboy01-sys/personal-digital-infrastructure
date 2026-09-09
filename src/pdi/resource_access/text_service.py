@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from hashlib import sha256
 import re
 import unicodedata
+from typing import Protocol
 
 import anyio
 
@@ -46,20 +47,32 @@ _APPLICATION_TEXT_MEDIA_TYPES = {
 }
 
 
+class TextAdapterResolver(Protocol):
+    async def resolve_text_adapter(
+        self, source: TextResourceAccessSource
+    ) -> ProviderTextAdapter: ...
+
+
 class ResourceTextService:
     """Read and verify one bounded complete Provider-backed text Resource."""
 
     def __init__(
         self,
         repository: ResourceTextRepository,
-        provider_adapters: Mapping[str, ProviderTextAdapter],
+        provider_adapters: Mapping[str, ProviderTextAdapter] | None = None,
         *,
+        adapter_resolver: TextAdapterResolver | None = None,
         max_active_reads: int = MAX_ACTIVE_TEXT_READS,
     ) -> None:
         if max_active_reads < 1:
             raise ValueError("max_active_reads must be positive")
         self._repository = repository
-        self._provider_adapters = dict(provider_adapters)
+        if (provider_adapters is None) == (adapter_resolver is None):
+            raise ValueError(
+                "exactly one provider adapter mapping or scoped resolver is required"
+            )
+        self._provider_adapters = dict(provider_adapters or {})
+        self._adapter_resolver = adapter_resolver
         self._semaphore = asyncio.Semaphore(max_active_reads)
 
     async def read_text(
@@ -86,11 +99,14 @@ class ResourceTextService:
                     "Text representation exceeds the source byte limit"
                 )
 
-        adapter = self._provider_adapters.get(source.provider)
-        if adapter is None:
-            raise ResourceAccessUnavailableError(
-                "Text Provider access is not configured"
-            )
+        if self._adapter_resolver is not None:
+            adapter = await self._adapter_resolver.resolve_text_adapter(source)
+        else:
+            adapter = self._provider_adapters.get(source.provider)
+            if adapter is None:
+                raise ResourceAccessUnavailableError(
+                    "Text Provider access is not configured"
+                )
 
         async with self._semaphore:
             upstream: ProviderTextContent | None = None

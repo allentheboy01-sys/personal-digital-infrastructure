@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator, Mapping
+from typing import Protocol
 import re
 
 import anyio
@@ -49,18 +50,30 @@ _CONTENT_RANGE = re.compile(
 )
 
 
+class RepresentationAdapterResolver(Protocol):
+    async def resolve_representation_adapter(
+        self, source: ResourceAccessSource
+    ) -> ProviderRepresentationAdapter: ...
+
+
 class ResourceAccessService:
     def __init__(
         self,
         repository: ResourceAccessRepository,
-        provider_adapters: Mapping[str, ProviderRepresentationAdapter],
+        provider_adapters: Mapping[str, ProviderRepresentationAdapter] | None = None,
         *,
+        adapter_resolver: RepresentationAdapterResolver | None = None,
         max_active_streams: int = MAX_ACTIVE_STREAMS,
     ) -> None:
         if max_active_streams < 1:
             raise ValueError("max_active_streams must be positive")
         self._repository = repository
-        self._provider_adapters = dict(provider_adapters)
+        if (provider_adapters is None) == (adapter_resolver is None):
+            raise ValueError(
+                "exactly one provider adapter mapping or scoped resolver is required"
+            )
+        self._provider_adapters = dict(provider_adapters or {})
+        self._adapter_resolver = adapter_resolver
         self._semaphore = asyncio.Semaphore(max_active_streams)
 
     async def open_representation(
@@ -92,7 +105,7 @@ class ResourceAccessService:
             )
 
         source = eligible[0]
-        adapter = self._provider_adapters[source.provider]
+        adapter = await self._adapter_for(source)
         await self._semaphore.acquire()
         released = False
         upstream: ProviderRepresentation | None = None
@@ -192,7 +205,7 @@ class ResourceAccessService:
             )
 
         source = eligible[0]
-        adapter = self._provider_adapters[source.provider]
+        adapter = await self._adapter_for(source)
         await self._semaphore.acquire()
         released = False
         upstream: ProviderRepresentation | None = None
@@ -281,11 +294,28 @@ class ResourceAccessService:
     ) -> bool:
         return (
             source.provider == "immich"
-            and source.provider in self._provider_adapters
+            and (
+                self._adapter_resolver is not None
+                or source.provider in self._provider_adapters
+            )
             and source.resource_type == "file"
             and isinstance(source.mime_type, str)
             and source.mime_type.lower().startswith(mime_prefixes)
         )
+
+    async def _adapter_for(
+        self, source: ResourceAccessSource
+    ) -> ProviderRepresentationAdapter:
+        if self._adapter_resolver is not None:
+            return await self._adapter_resolver.resolve_representation_adapter(
+                source
+            )
+        try:
+            return self._provider_adapters[source.provider]
+        except KeyError:
+            raise ResourceAccessUnavailableError(
+                "Provider access is not configured"
+            ) from None
 
     @staticmethod
     def _max_bytes(kind: ResourceRepresentationKind) -> int:
