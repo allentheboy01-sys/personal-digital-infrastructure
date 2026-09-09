@@ -1738,6 +1738,11 @@ class PostgreSQLRepository(
         source_orm.version_tag = source.version_tag
         source_orm.provider_mime_type = source.provider_mime_type
         source_orm.provider_size = source.provider_size
+        source_orm.observation_scope_id = (
+            UUID(source.observation_scope_id)
+            if source.observation_scope_id is not None
+            else None
+        )
         source_orm.metadata_ = source.metadata
         source_orm.is_active = source.is_active
         source_orm.deleted_at = source.deleted_at
