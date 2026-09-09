@@ -33,16 +33,16 @@ class NextcloudAdapter(Adapter):
         self.password = password
 
     def connect(self) -> None:
-        """连接 Nextcloud，并验证地址和凭据是否有效。"""
-        url = f"{self.base_url}/status.php"
-
-        response = requests.get(
-            url,
-            auth=(self.username, self.password),
-            timeout=10,
+        """Validate credentials against the configured user's WebDAV root."""
+        facts = self._request_propfind(
+            "",
+            depth="0",
+            include_self=True,
         )
-
-        response.raise_for_status()
+        if len(facts) != 1 or facts[0].kind != "folder":
+            raise ValueError(
+                "Nextcloud user WebDAV root is unavailable or malformed"
+            )
 
     def scan(self, path: str = "") -> Iterable[ProviderFact]:
         """扫描指定 Nextcloud 目录下的完整可见文件树。"""

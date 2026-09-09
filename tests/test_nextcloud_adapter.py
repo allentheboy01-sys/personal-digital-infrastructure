@@ -104,6 +104,53 @@ def _adapter() -> NextcloudAdapter:
     )
 
 
+def test_connect_validates_configured_user_webdav_root(monkeypatch) -> None:
+    calls = []
+
+    def fake_request(*, method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(
+            _multistatus(
+                _webdav_response(
+                    path="",
+                    external_id="root-self",
+                    collection=True,
+                )
+            )
+        )
+
+    monkeypatch.setattr(
+        "pdi.adapters.nextcloud.adapter.requests.request", fake_request
+    )
+
+    _adapter().connect()
+
+    assert len(calls) == 1
+    method, url, kwargs = calls[0]
+    assert method == "PROPFIND"
+    assert url == "https://nextcloud.example" + DAV_ROOT
+    assert kwargs["headers"]["Depth"] == "0"
+    assert kwargs["auth"] == ("test-user", "test-password")
+
+
+def test_connect_rejects_failed_or_malformed_user_webdav_root(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pdi.adapters.nextcloud.adapter.requests.request",
+        lambda **kwargs: FakeResponse("", status_code=401),
+    )
+    with pytest.raises(requests.HTTPError):
+        _adapter().connect()
+
+    monkeypatch.setattr(
+        "pdi.adapters.nextcloud.adapter.requests.request",
+        lambda **kwargs: FakeResponse(_multistatus()),
+    )
+    with pytest.raises(ValueError, match="WebDAV root"):
+        _adapter().connect()
+
+
 def test_scan_discovers_complete_tree_with_stable_external_ids(
     monkeypatch,
 ) -> None:
