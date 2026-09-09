@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import Engine, and_, case, func, or_, select, text
+from sqlalchemy import Engine, and_, case, func, or_, select, text, union_all
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -63,12 +63,16 @@ from pdi.repository.orm.asset import AssetORM
 from pdi.repository.orm.asset_source import AssetSourceORM
 from pdi.repository.orm.blob import BlobORM
 from pdi.repository.orm.observation import ResourceStatementORM
-from pdi.repository.orm.person import PersonSourceORM
+from pdi.repository.orm.person import (
+    ObservationScopePersonSourceORM,
+    PersonSourceORM,
+)
 from pdi.repository.orm.provider_identity import (
     ObservationScopeORM,
     ProviderInstanceORM,
 )
 from pdi.repository.orm.resource_person_relation import (
+    ObservationScopeResourcePersonRelationORM,
     ResourcePersonRelationORM,
 )
 
@@ -929,34 +933,63 @@ class PostgreSQLRepository(
         primary: PersonLabelPrimary,
         limit: int,
     ) -> tuple[RichCandidate, ...]:
+        person_sources = union_all(
+            select(
+                PersonSourceORM.person_id.label("person_id"),
+                PersonSourceORM.display_name.label("display_name"),
+                PersonSourceORM.provider.label("provider"),
+            ).where(PersonSourceORM.inactive_at.is_(None)),
+            select(
+                ObservationScopePersonSourceORM.person_id.label("person_id"),
+                ObservationScopePersonSourceORM.display_name.label("display_name"),
+                ProviderInstanceORM.provider_type.label("provider"),
+            )
+            .join(
+                ObservationScopeORM,
+                ObservationScopeORM.id
+                == ObservationScopePersonSourceORM.observation_scope_id,
+            )
+            .join(
+                ProviderInstanceORM,
+                ProviderInstanceORM.id == ObservationScopeORM.provider_instance_id,
+            )
+            .where(ObservationScopePersonSourceORM.inactive_at.is_(None)),
+        ).subquery()
+        relations = union_all(
+            select(
+                ResourcePersonRelationORM.resource_id.label("resource_id"),
+                ResourcePersonRelationORM.person_id.label("person_id"),
+            ).where(ResourcePersonRelationORM.inactive_at.is_(None)),
+            select(
+                ObservationScopeResourcePersonRelationORM.resource_id.label(
+                    "resource_id"
+                ),
+                ObservationScopeResourcePersonRelationORM.person_id.label("person_id"),
+            ).where(
+                ObservationScopeResourcePersonRelationORM.inactive_at.is_(None)
+            ),
+        ).subquery()
         source_filters = [
-            PersonSourceORM.inactive_at.is_(None),
-            PersonSourceORM.display_name.is_not(None),
-            func.lower(PersonSourceORM.display_name)
-            == func.lower(primary.label),
+            person_sources.c.display_name.is_not(None),
+            func.lower(person_sources.c.display_name) == func.lower(primary.label),
         ]
         if primary.provider is not None:
-            source_filters.append(
-                PersonSourceORM.provider == primary.provider
-            )
+            source_filters.append(person_sources.c.provider == primary.provider)
 
         with self._session_factory() as session:
             asset_orms = list(
                 session.execute(
                     select(AssetORM)
                     .join(
-                        ResourcePersonRelationORM,
-                        ResourcePersonRelationORM.resource_id
-                        == AssetORM.id,
+                        relations,
+                        relations.c.resource_id == AssetORM.id,
                     )
                     .join(
-                        PersonSourceORM,
-                        PersonSourceORM.person_id
-                        == ResourcePersonRelationORM.person_id,
+                        person_sources,
+                        person_sources.c.person_id == relations.c.person_id,
                     )
                     .where(
                         *source_filters,
-                        ResourcePersonRelationORM.inactive_at.is_(None),
                         AssetORM.resource_type
                         == ResourceType.FILE.value,
                         self._active_source_exists(
@@ -1421,24 +1454,43 @@ class PostgreSQLRepository(
         self,
         query: ResourceAggregationQuery,
     ) -> ResourceAggregationResult:
-        source_filters = [
-            PersonSourceORM.inactive_at.is_(None),
-            PersonSourceORM.display_name.is_not(None),
-        ]
+        person_sources = union_all(
+            select(
+                PersonSourceORM.person_id.label("person_id"),
+                PersonSourceORM.display_name.label("display_name"),
+                PersonSourceORM.provider.label("provider"),
+            ).where(PersonSourceORM.inactive_at.is_(None)),
+            select(
+                ObservationScopePersonSourceORM.person_id.label("person_id"),
+                ObservationScopePersonSourceORM.display_name.label("display_name"),
+                ProviderInstanceORM.provider_type.label("provider"),
+            )
+            .join(
+                ObservationScopeORM,
+                ObservationScopeORM.id
+                == ObservationScopePersonSourceORM.observation_scope_id,
+            )
+            .join(
+                ProviderInstanceORM,
+                ProviderInstanceORM.id == ObservationScopeORM.provider_instance_id,
+            )
+            .where(ObservationScopePersonSourceORM.inactive_at.is_(None)),
+        ).subquery()
+        source_filters = [person_sources.c.display_name.is_not(None)]
         if query.filters.provider is not None:
             source_filters.append(
-                PersonSourceORM.provider == query.filters.provider
+                person_sources.c.provider == query.filters.provider
             )
 
         normalized_label = func.lower(
-            PersonSourceORM.display_name
+            person_sources.c.display_name
         ).label("normalized_label")
         label_buckets = (
             select(
                 normalized_label,
-                func.min(PersonSourceORM.display_name).label("bucket"),
+                func.min(person_sources.c.display_name).label("bucket"),
                 func.count(
-                    func.distinct(PersonSourceORM.person_id)
+                    func.distinct(person_sources.c.person_id)
                 ).label("bucket_count"),
             )
             .where(*source_filters)
@@ -1450,7 +1502,7 @@ class PostgreSQLRepository(
             total_count = session.execute(
                 select(
                     func.count(
-                        func.distinct(PersonSourceORM.person_id)
+                        func.distinct(person_sources.c.person_id)
                     )
                 ).where(*source_filters)
             ).scalar_one()

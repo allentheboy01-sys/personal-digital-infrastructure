@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_repository_has_exactly_one_schema_head() -> None:
-    assert repository_schema_head(ROOT) == "d4f6a8c0e213"
+    assert repository_schema_head(ROOT) == "e5a7b9d1f324"
 
 
 def test_fleet_reports_unavailable_database_without_exposing_url() -> None:

@@ -2,6 +2,12 @@ from typing import Any
 
 import requests
 
+from pdi.adapters.immich_account import (
+    ImmichAccountMismatchError,
+    authenticated_immich_user_id,
+    canonical_immich_user_id,
+)
+
 from .models import EnumerablePersonInventory, ProviderPersonIdentity
 
 
@@ -9,19 +15,40 @@ class ImmichEnumerablePeopleAdapter:
     provider = "immich"
     _PAGE_SIZE = 1000
 
-    def __init__(self, base_url: str, api_key: str) -> None:
+    def __init__(
+        self, base_url: str, api_key: str, *, expected_user_id: str | None = None
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._headers = {"x-api-key": api_key}
+        self._expected_user_id = (
+            None
+            if expected_user_id is None
+            else canonical_immich_user_id(expected_user_id)
+        )
+        self._account_verified = False
 
     def connect(self) -> None:
+        endpoint = (
+            "/api/server/about"
+            if self._expected_user_id is None
+            else "/api/users/me"
+        )
         response = requests.get(
-            f"{self._base_url}/api/server/about",
+            f"{self._base_url}{endpoint}",
             headers=self._headers,
             timeout=10,
         )
         response.raise_for_status()
+        if self._expected_user_id is not None:
+            if authenticated_immich_user_id(response.json()) != self._expected_user_id:
+                raise ImmichAccountMismatchError(
+                    "Immich credential does not match expected Provider Account"
+                )
+            self._account_verified = True
 
     def scan(self) -> EnumerablePersonInventory:
+        if self._expected_user_id is not None and not self._account_verified:
+            self.connect()
         page = 1
         identities: list[ProviderPersonIdentity] = []
         seen: set[str] = set()

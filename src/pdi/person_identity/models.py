@@ -46,6 +46,15 @@ class PersonSource:
 
 
 @dataclass(frozen=True)
+class ScopedPersonSource:
+    observation_scope_id: UUID
+    external_id: str
+    person_id: UUID
+    display_name: str | None
+    inactive_at: datetime | None
+
+
+@dataclass(frozen=True)
 class ProviderPersonIdentity:
     external_id: str
     display_name: str | None = None

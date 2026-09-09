@@ -43,6 +43,8 @@ _EXPECTED_TABLES = {
     "persons",
     "person_sources",
     "resource_person_relations",
+    "observation_scope_person_sources",
+    "observation_scope_resource_person_relations",
 }
 
 if set(target_metadata.tables) != _EXPECTED_TABLES:

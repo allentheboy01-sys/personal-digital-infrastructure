@@ -299,6 +299,7 @@ class PostgreSQLObservationRepository:
                     AssetSourceORM.path,
                     AssetSourceORM.name,
                     AssetSourceORM.version_tag,
+                    AssetSourceORM.observation_scope_id,
                 )
                 .join(BlobORM, BlobORM.asset_id == AssetORM.id)
                 .join(AssetSourceORM, AssetSourceORM.blob_id == BlobORM.id)
@@ -322,6 +323,7 @@ class PostgreSQLObservationRepository:
                 path,
                 name,
                 version_tag,
+                observation_scope_id,
             ) in rows:
                 grouped.setdefault(asset_id, []).append(
                     EnrichmentSource(
@@ -335,6 +337,12 @@ class PostgreSQLObservationRepository:
                         path,
                         name,
                         version_tag,
+                        True,
+                        (
+                            None
+                            if observation_scope_id is None
+                            else str(observation_scope_id)
+                        ),
                     )
                 )
             return tuple(EnrichmentResource(format_resource_ref(asset_id), tuple(sources)) for asset_id, sources in grouped.items())

@@ -6,6 +6,11 @@ import urllib.parse
 
 import requests
 
+from pdi.adapters.immich_account import (
+    ImmichAccountMismatchError,
+    authenticated_immich_user_id,
+    canonical_immich_user_id,
+)
 from pdi.config import ImmichSettings
 
 from .errors import ObservationExtractionError
@@ -46,15 +51,46 @@ class ImmichOCRReader:
         settings: ImmichSettings,
         *,
         timeout: float = 10.0,
+        expected_user_id: str | None = None,
     ) -> None:
         self._base_url = settings.url.rstrip("/")
         self._api_key = settings.api_key
         self._timeout = timeout
+        self._expected_user_id = (
+            None
+            if expected_user_id is None
+            else canonical_immich_user_id(expected_user_id)
+        )
+        self._account_verified = False
+
+    def _verify_account(self) -> None:
+        if self._expected_user_id is None or self._account_verified:
+            return
+        try:
+            response = requests.get(
+                f"{self._base_url}/api/users/me",
+                headers={"x-api-key": self._api_key},
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            authenticated = authenticated_immich_user_id(response.json())
+        except ImmichAccountMismatchError:
+            raise
+        except (requests.RequestException, TypeError, ValueError) as error:
+            raise _extraction_error(
+                "provider_unavailable", "Immich account qualification failed"
+            ) from error
+        if authenticated != self._expected_user_id:
+            raise ImmichAccountMismatchError(
+                "Immich credential does not match expected Provider Account"
+            )
+        self._account_verified = True
 
     def get_asset_ocr(
         self,
         provider_locator: str,
     ) -> tuple[OCRRegion, ...]:
+        self._verify_account()
         locator = urllib.parse.quote(provider_locator, safe="")
         try:
             response = requests.get(
@@ -162,6 +198,8 @@ def _truncate_ocr_text(text: str) -> str:
 
 
 def _fingerprint(
+    source_id: str,
+    observation_scope_id: str | None,
     provider_locator: str,
     normalized_regions: tuple[str, ...],
 ) -> str:
@@ -171,6 +209,9 @@ def _fingerprint(
         "provider_locator": provider_locator,
         "regions": normalized_regions,
     }
+    if observation_scope_id is not None:
+        payload["source_id"] = source_id
+        payload["observation_scope_id"] = observation_scope_id
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -212,17 +253,27 @@ class ImmichOCRExtractor:
     def _read(
         self,
         resource: EnrichmentResource,
-    ) -> tuple[str, tuple[str, ...]]:
+    ) -> tuple[object, str, tuple[str, ...]]:
         source = self._selected_source(resource)
-        regions = self._reader.get_asset_ocr(source.provider_locator)
-        return source.provider_locator, _normalize_regions(regions)
+        scoped_read = getattr(self._reader, "get_source_ocr", None)
+        regions = (
+            scoped_read(source)
+            if scoped_read is not None
+            else self._reader.get_asset_ocr(source.provider_locator)
+        )
+        return source, source.provider_locator, _normalize_regions(regions)
 
     def input_fingerprint(self, resource: EnrichmentResource) -> str:
-        provider_locator, normalized_regions = self._read(resource)
-        return _fingerprint(provider_locator, normalized_regions)
+        source, provider_locator, normalized_regions = self._read(resource)
+        return _fingerprint(
+            source.source_id,
+            source.observation_scope_id,
+            provider_locator,
+            normalized_regions,
+        )
 
     def extract(self, resource: EnrichmentResource) -> ObservationBatch:
-        provider_locator, normalized_regions = self._read(resource)
+        source, provider_locator, normalized_regions = self._read(resource)
         full_text = _combined_text(normalized_regions)
         statements = ()
         if full_text:
@@ -244,6 +295,11 @@ class ImmichOCRExtractor:
             resource.resource_ref,
             self.generator,
             self.covered_predicates,
-            _fingerprint(provider_locator, normalized_regions),
+            _fingerprint(
+                source.source_id,
+                source.observation_scope_id,
+                provider_locator,
+                normalized_regions,
+            ),
             statements,
         )

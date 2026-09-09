@@ -3,13 +3,14 @@ from .models import (
     EnumerablePersonInventory,
     Person,
     PersonSource,
+    ScopedPersonSource,
     PersonSyncResult,
     ProviderPersonIdentity,
     normalize_person_display_name,
     normalize_person_label_query,
 )
-from .repository import PersonRepository
-from .service import EnumerablePeopleAdapter, PersonSyncService
+from .repository import PersonRepository, ScopedPersonRepository
+from .service import EnumerablePeopleAdapter, PersonSyncService, ScopedPersonSyncService
 
 __all__ = [
     "EnumerablePeopleAdapter",
@@ -20,6 +21,9 @@ __all__ = [
     "PersonSource",
     "PersonSyncResult",
     "PersonSyncService",
+    "ScopedPersonRepository",
+    "ScopedPersonSource",
+    "ScopedPersonSyncService",
     "ProviderPersonIdentity",
     "normalize_person_display_name",
     "normalize_person_label_query",

@@ -254,6 +254,7 @@ class EnrichmentSource:
     name: str | None = field(default=None, repr=False)
     version_tag: str | None = field(default=None, repr=False)
     is_active: bool = field(default=True, repr=False)
+    observation_scope_id: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _non_empty(self.source_id, "source_id")
@@ -262,6 +263,8 @@ class EnrichmentSource:
             _non_empty(self.provider_locator, "provider_locator")
         if type(self.is_active) is not bool:
             raise ObservationValidationError("is_active must be boolean")
+        if self.observation_scope_id is not None:
+            _non_empty(self.observation_scope_id, "observation_scope_id")
         object.__setattr__(self, "metadata", _freeze(dict(self.metadata)))
 
 

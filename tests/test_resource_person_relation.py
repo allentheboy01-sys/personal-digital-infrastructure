@@ -2,6 +2,7 @@ import requests
 
 import pytest
 
+from pdi.adapters.immich_account import ImmichAccountMismatchError
 from pdi.resource_person_relation import (
     ImmichResourcePersonRelationAdapter,
     ProviderRelationInventory,
@@ -47,6 +48,30 @@ def test_immich_adapter_paginates_and_deduplicates_without_faces(monkeypatch) ->
     assert [call[1]["json"]["page"] for call in calls] == [1, 2, 1]
     assert all("personIds" in call[1]["json"] for call in calls)
     assert all("faces" not in call[0] for call in calls)
+
+
+def test_scoped_relation_adapter_rejects_valid_wrong_user_before_scan(
+    monkeypatch,
+) -> None:
+    expected = "65f0a1c2-3d4e-4f50-8123-456789abcdef"
+    actual = "75f0a1c2-3d4e-4f50-8123-456789abcdef"
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        return FakeResponse({"id": actual})
+
+    monkeypatch.setattr(
+        "pdi.resource_person_relation.immich.requests.get", get
+    )
+    adapter = ImmichResourcePersonRelationAdapter(
+        "https://immich.example",
+        "valid-wrong-user-key",
+        expected_user_id=expected,
+    )
+    with pytest.raises(ImmichAccountMismatchError):
+        adapter.scan(("person-a",))
+    assert calls == ["https://immich.example/api/users/me"]
 
 
 @pytest.mark.parametrize(

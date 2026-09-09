@@ -46,6 +46,7 @@ PROVIDER_SYNC_STATE_REVISION = "5e7a9c2d1f30"
 PROVIDER_IDENTITY_REVISION = "b8d4f2a6c901"
 SOURCE_PROVENANCE_REVISION = "c3e5a7b9d102"
 SCOPE_SYNC_STATE_REVISION = "d4f6a8c0e213"
+SCOPED_PERSON_RELATION_REVISION = "e5a7b9d1f324"
 
 
 def _alembic_config(connection) -> Config:
@@ -68,6 +69,8 @@ def _run_alembic(
 
 def _drop_test_schema(engine: Engine) -> None:
     with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS observation_scope_resource_person_relations"))
+        connection.execute(text("DROP TABLE IF EXISTS observation_scope_person_sources"))
         connection.execute(text("DROP TABLE IF EXISTS observation_scope_sync_state"))
         connection.execute(text("DROP TABLE IF EXISTS asset_sources"))
         connection.execute(text("DROP TABLE IF EXISTS observation_scopes"))
@@ -170,6 +173,8 @@ def test_metadata_registration() -> None:
         "provider_accounts",
         "observation_scopes",
         "observation_scope_sync_state",
+        "observation_scope_person_sources",
+        "observation_scope_resource_person_relations",
     }
 
 
@@ -213,7 +218,7 @@ def test_empty_database_upgrade_and_schema(
                 "SELECT version_num "
                 "FROM alembic_version"
             )
-        ).scalar_one() == SCOPE_SYNC_STATE_REVISION
+            ).scalar_one() == SCOPED_PERSON_RELATION_REVISION
 
 
 def test_mu5_source_provenance_upgrade_preserves_legacy_source(
@@ -555,7 +560,7 @@ def test_upgrade_downgrade_upgrade(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == SCOPE_SYNC_STATE_REVISION
+        ).scalar_one() == SCOPED_PERSON_RELATION_REVISION
 
 
 def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
@@ -662,7 +667,7 @@ def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == SCOPE_SYNC_STATE_REVISION
+        ).scalar_one() == SCOPED_PERSON_RELATION_REVISION
 
 
 def test_provider_sync_state_upgrade_downgrade_reupgrade(
@@ -1200,3 +1205,39 @@ def test_mu6_downgrade_rejects_nonempty_scope_state_before_drop(
         _run_alembic(migration_engine, command.downgrade, SOURCE_PROVENANCE_REVISION)
     with migration_engine.connect() as connection:
         assert "observation_scope_sync_state" in inspect(connection).get_table_names()
+
+
+def test_mu11_additive_tables_preserve_legacy_person_relation_state(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(migration_engine, command.upgrade, SCOPE_SYNC_STATE_REVISION)
+    resource_id, person_id = uuid4(), uuid4()
+    with migration_engine.begin() as connection:
+        connection.execute(text("INSERT INTO assets (id,resource_type,title,metadata,created_at,updated_at) VALUES (:id,'file','legacy','{}',now(),now())"), {"id": resource_id})
+        connection.execute(text("INSERT INTO persons (id,created_at) VALUES (:id,now())"), {"id": person_id})
+        connection.execute(text("INSERT INTO person_sources (provider,external_id,person_id,display_name,inactive_at) VALUES ('immich','legacy-person',:id,'Legacy',NULL)"), {"id": person_id})
+        connection.execute(text("INSERT INTO resource_person_relations (resource_id,person_id,provider,inactive_at) VALUES (:resource,:person,'immich',NULL)"), {"resource": resource_id, "person": person_id})
+        before_person = dict(connection.execute(text("SELECT * FROM person_sources")).mappings().one())
+        before_relation = dict(connection.execute(text("SELECT * FROM resource_person_relations")).mappings().one())
+    _run_alembic(migration_engine, command.upgrade, "head")
+    with migration_engine.connect() as connection:
+        assert dict(connection.execute(text("SELECT * FROM person_sources")).mappings().one()) == before_person
+        assert dict(connection.execute(text("SELECT * FROM resource_person_relations")).mappings().one()) == before_relation
+        assert connection.execute(text("SELECT count(*) FROM observation_scope_person_sources")).scalar_one() == 0
+        assert connection.execute(text("SELECT count(*) FROM observation_scope_resource_person_relations")).scalar_one() == 0
+
+
+def test_mu11_downgrade_rejects_nonempty_scoped_person_before_drop(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(migration_engine, command.upgrade, "head")
+    instance_id, scope_id, person_id = uuid4(), uuid4(), uuid4()
+    with migration_engine.begin() as connection:
+        connection.execute(text("INSERT INTO provider_instances (id,provider_type,instance_key,enabled,created_at,updated_at) VALUES (:id,'immich',:key,true,now(),now())"), {"id": instance_id, "key": str(instance_id)})
+        connection.execute(text("INSERT INTO observation_scopes (id,provider_instance_id,scope_key,enabled,created_at,updated_at) VALUES (:id,:instance,:key,true,now(),now())"), {"id": scope_id, "instance": instance_id, "key": str(scope_id)})
+        connection.execute(text("INSERT INTO persons (id,created_at) VALUES (:id,now())"), {"id": person_id})
+        connection.execute(text("INSERT INTO observation_scope_person_sources (observation_scope_id,external_id,person_id) VALUES (:scope,'synthetic-person',:person)"), {"scope": scope_id, "person": person_id})
+    with pytest.raises(Exception, match="downgrade blocked"):
+        _run_alembic(migration_engine, command.downgrade, SCOPE_SYNC_STATE_REVISION)
+    with migration_engine.connect() as connection:
+        assert "observation_scope_person_sources" in inspect(connection).get_table_names()

@@ -123,6 +123,9 @@ def _input_fingerprint(source: EnrichmentSource) -> str:
         "mime_type": _normalized_mime_type(source.mime_type),
         "extractor_version": "1",
     }
+    if source.observation_scope_id is not None:
+        payload["source_id"] = source.source_id
+        payload["observation_scope_id"] = source.observation_scope_id
     canonical = json.dumps(
         payload,
         ensure_ascii=False,

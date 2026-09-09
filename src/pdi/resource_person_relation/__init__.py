@@ -1,7 +1,13 @@
 from .immich import ImmichResourcePersonRelationAdapter
 from .models import ProviderRelationInventory, RelationSyncResult
-from .repository import ResourcePersonRelationRepository
-from .service import ResourcePersonRelationSyncService
+from .repository import (
+    ResourcePersonRelationRepository,
+    ScopedResourcePersonRelationRepository,
+)
+from .service import (
+    ResourcePersonRelationSyncService,
+    ScopedResourcePersonRelationSyncService,
+)
 
 __all__ = [
     "ImmichResourcePersonRelationAdapter",
@@ -9,4 +15,6 @@ __all__ = [
     "RelationSyncResult",
     "ResourcePersonRelationRepository",
     "ResourcePersonRelationSyncService",
+    "ScopedResourcePersonRelationRepository",
+    "ScopedResourcePersonRelationSyncService",
 ]

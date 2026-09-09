@@ -588,11 +588,12 @@ def test_person_label_primary_is_relation_backed_exact_and_filtered(
             for statement in select_statements
             if "resource_person_relations" in statement
         )
-        assert "JOIN person_sources" in candidate_sql
-        assert "lower(person_sources.display_name)" in candidate_sql
-        assert "resource_person_relations.inactive_at IS NULL" in (
-            candidate_sql
-        )
+        assert "person_sources" in candidate_sql
+        assert "observation_scope_person_sources" in candidate_sql
+        assert "resource_person_relations" in candidate_sql
+        assert "observation_scope_resource_person_relations" in candidate_sql
+        assert "lower(anon_" in candidate_sql
+        assert "inactive_at IS NULL" in candidate_sql
         expected_ids = sorted((ocr_id, document_id, multi_id))
         assert [
             UUID(hit.resource.resource_ref.removeprefix("pdi:resource:"))

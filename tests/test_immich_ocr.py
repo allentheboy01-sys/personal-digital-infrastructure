@@ -4,6 +4,7 @@ from uuid import uuid4
 import pytest
 import requests
 
+from pdi.adapters.immich import ImmichAccountMismatchError
 from pdi.config import ImmichSettings
 from pdi.observation import (
     EnrichmentResource,
@@ -25,6 +26,10 @@ class FakeResponse:
         if isinstance(self._payload, Exception):
             raise self._payload
         return self._payload
+
+    def raise_for_status(self) -> None:
+        if not 200 <= self.status_code < 300:
+            raise requests.HTTPError(str(self.status_code))
 
 
 class FakeReader:
@@ -115,6 +120,28 @@ def test_reader_uses_only_curated_immutable_region_text(
     assert not hasattr(regions[0], "boxScore")
     with pytest.raises(FrozenInstanceError):
         regions[0].text = "changed"
+
+
+def test_reader_rejects_wrong_valid_user_before_ocr(monkeypatch) -> None:
+    requested_urls: list[str] = []
+
+    def fake_get(url: str, **kwargs):
+        requested_urls.append(url)
+        return FakeResponse(
+            200,
+            {"id": "22222222-2222-4222-8222-222222222222"},
+        )
+
+    monkeypatch.setattr("pdi.observation.ocr.requests.get", fake_get)
+    reader = ImmichOCRReader(
+        ImmichSettings(url="https://immich.example", api_key="synthetic-key"),
+        expected_user_id="11111111-1111-4111-8111-111111111111",
+    )
+
+    with pytest.raises(ImmichAccountMismatchError):
+        reader.get_asset_ocr("asset")
+
+    assert requested_urls == ["https://immich.example/api/users/me"]
 
 
 @pytest.mark.parametrize("payload", [[], [{"text": "one"}], [{"text": "one"}, {"text": "two"}]])

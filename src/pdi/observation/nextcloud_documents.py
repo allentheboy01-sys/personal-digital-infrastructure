@@ -219,6 +219,9 @@ def _input_fingerprint(
         "extractor_name": extractor.generator_name,
         "extractor_version": extractor.generator_version,
     }
+    if source.observation_scope_id is not None:
+        payload["source_id"] = source.source_id
+        payload["observation_scope_id"] = source.observation_scope_id
     canonical = json.dumps(
         payload,
         ensure_ascii=False,

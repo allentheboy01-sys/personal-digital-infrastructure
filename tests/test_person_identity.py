@@ -2,6 +2,7 @@ import requests
 
 import pytest
 
+from pdi.adapters.immich_account import ImmichAccountMismatchError
 from pdi.person_identity import (
     EnumerablePersonInventory,
     ImmichEnumerablePeopleAdapter,
@@ -91,6 +92,28 @@ def test_immich_adapter_connects_to_read_only_about(monkeypatch) -> None:
     assert captured["url"] == "https://immich.example/api/server/about"
     assert captured["timeout"] == 10
     assert response.raise_for_status_called is True
+
+
+def test_scoped_people_adapter_rejects_valid_wrong_user_before_scan(
+    monkeypatch,
+) -> None:
+    expected = "65f0a1c2-3d4e-4f50-8123-456789abcdef"
+    actual = "75f0a1c2-3d4e-4f50-8123-456789abcdef"
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(url)
+        return FakeResponse({"id": actual})
+
+    monkeypatch.setattr("pdi.person_identity.immich.requests.get", get)
+    adapter = ImmichEnumerablePeopleAdapter(
+        "https://immich.example",
+        "valid-wrong-user-key",
+        expected_user_id=expected,
+    )
+    with pytest.raises(ImmichAccountMismatchError):
+        adapter.scan()
+    assert calls == ["https://immich.example/api/users/me"]
 
 
 def test_person_name_is_nfc_normalized_and_empty_is_unnamed(
