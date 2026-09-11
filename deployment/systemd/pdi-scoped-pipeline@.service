@@ -1,0 +1,16 @@
+[Unit]
+Description=PDI Principal-bound scoped pipeline (%i)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pdi
+Group=pdi
+EnvironmentFile=/etc/pdi/scoped/units/%i.env
+WorkingDirectory=/opt/pdi/current
+ExecStart=/opt/pdi/current/.venv/bin/python -m pdi.scoped_operational --config /etc/pdi/scoped/registry.toml --principal-ref ${PDI_PRINCIPAL_REF} --pipeline-key ${PDI_SCOPED_PIPELINE_KEY} --lock-timeout 300
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/lock

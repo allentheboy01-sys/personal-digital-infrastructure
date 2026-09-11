@@ -24,11 +24,32 @@ class SourceProvenanceBackfillResult:
     updated: int
 
 
+def plan_source_observation_scopes(
+    engine: Engine,
+    provider_scope_ids: Mapping[str, UUID],
+) -> SourceProvenanceBackfillResult:
+    """Validate the complete Source plan without changing provenance."""
+    return _source_observation_scope_plan(
+        engine, provider_scope_ids, apply=False
+    )
+
+
 def backfill_source_observation_scopes(
     engine: Engine,
     provider_scope_ids: Mapping[str, UUID],
 ) -> SourceProvenanceBackfillResult:
     """Validate and atomically apply a complete provider-to-Scope mapping."""
+    return _source_observation_scope_plan(
+        engine, provider_scope_ids, apply=True
+    )
+
+
+def _source_observation_scope_plan(
+    engine: Engine,
+    provider_scope_ids: Mapping[str, UUID],
+    *,
+    apply: bool,
+) -> SourceProvenanceBackfillResult:
     if not provider_scope_ids or any(
         not key.strip() for key in provider_scope_ids
     ):
@@ -37,11 +58,10 @@ def backfill_source_observation_scopes(
         )
 
     with Session(engine) as session, session.begin():
-        sources = list(
-            session.execute(
-                select(AssetSourceORM).with_for_update()
-            ).scalars()
-        )
+        statement = select(AssetSourceORM)
+        if apply:
+            statement = statement.with_for_update()
+        sources = list(session.execute(statement).scalars())
         providers = {source.provider for source in sources}
         if providers - set(provider_scope_ids):
             raise SourceProvenanceBackfillError(
@@ -81,9 +101,10 @@ def backfill_source_observation_scopes(
             if source.observation_scope_id is None:
                 updates.append((source, target))
 
-        for source, target in updates:
-            source.observation_scope_id = target
-        session.flush()
+        if apply:
+            for source, target in updates:
+                source.observation_scope_id = target
+            session.flush()
         return SourceProvenanceBackfillResult(
             examined=len(sources),
             updated=len(updates),
