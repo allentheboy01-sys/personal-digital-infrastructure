@@ -1,0 +1,24 @@
+[Unit]
+Description=PDI scoped writer (%i)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pdi
+Group=pdi
+WorkingDirectory=/opt/pdi/current
+EnvironmentFile=/etc/pdi/scoped/units/%i.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/pdi/current/src
+ExecStart=/opt/pdi/current/.venv/bin/python -m pdi.production_ops.writer --config /etc/pdi/scoped/registry.toml --lock-timeout 300
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/lock
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+KillMode=control-group
+# Do not forward arbitrary library stdout/stderr containing Provider URLs.
+StandardOutput=null
+StandardError=null

@@ -20,6 +20,9 @@ capabilities have real self-hosted validation. A portable manual installation
 path, automated correctness checks, and reviewed dependency snapshot now exist;
 general-user polish and package publication remain future work.
 
+Scoped multi-user writer cutover [automation is a development candidate](docs/releases/mu13-p3c-development.md);
+production enablement and Consumer cutover require separate explicit gates.
+
 ## Architecture
 
 ```text

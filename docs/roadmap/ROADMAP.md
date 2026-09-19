@@ -42,6 +42,11 @@ Public Readiness Phases A-E establish:
 
 ## Release policy
 
+Scoped writer promotion tooling is a development candidate, not production
+enablement. [MU13-P3C](../releases/mu13-p3c-development.md) prepares an explicit
+human-controlled cutover with fail-closed abort. Consumer cutover, enrichment
+scheduling and scoped Gmail remain separate future gates.
+
 - Package metadata, the public release note, and the annotated Git tag must
   agree. Only the exact commit carrying `v0.6.0` is the public release.
 - Evaluate any PyPI publication separately; it is not required for the
