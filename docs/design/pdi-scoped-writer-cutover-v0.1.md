@@ -154,6 +154,14 @@ Legacy writers remain disabled. Ingestion pauses.
 The new release/config may remain installed but inert for diagnosis; no automatic
 symlink reversal into legacy runtime occurs. The old symlink target is recorded.
 Cleanup errors produce `ABORT_INCOMPLETE`, never a false assurance of safety.
+Abort reads back all three identity tables, including both preservation
+Providers, and verifies timer disablement rather than trusting command exit
+codes alone. CLI pause confirmation comes only from cleanup completed in the
+current invocation; a historical `ABORTED` journal is not current evidence.
+The journal binds the frozen identity plan and DB route with an internal
+fingerprint. A changed route/plan refuses DB cleanup against the new target and
+reports incomplete cleanup; a human must recover the original configuration.
+These fingerprints are private operational metadata, not report output.
 Failed attempts are not silently resumed. A durable journal makes all repeated
 `apply` calls refuse without mutation; explicit `abort` can be retried under
 the control lock. After an abrupt kill/power failure, a human must inspect the

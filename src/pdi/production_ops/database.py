@@ -112,3 +112,22 @@ class Database:
                     result = c.execute(text(f"UPDATE {table} SET enabled=:e, updated_at=now() WHERE id=CAST(:id AS uuid)"),
                                        {"e": enabled, "id": maps[table][provider]})
                     require(result.rowcount == 1, "ENABLEMENT_TARGET_MISSING")
+
+    def verify_disabled(self):
+        """Fresh readback after abort; failed checkpoints/ledgers are allowed.
+
+        UPDATE rowcounts alone do not prove effective disablement or that the
+        preservation Providers remained disabled.
+        """
+        with self.engine.connect() as c, c.begin():
+            c.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+            require(c.execute(text("SELECT version_num FROM alembic_version")).scalars().all() == [HEAD], 'ABORT_SCHEMA_MISMATCH')
+            for table, expected in (
+                ('provider_instances', self.plan.instances),
+                ('provider_accounts', self.plan.accounts),
+                ('observation_scopes', self.plan.scopes),
+            ):
+                rows = c.execute(text(f'SELECT id, enabled FROM {table}')).mappings()
+                rows = list(rows)
+                require({str(r['id']) for r in rows} == set(expected.values()) and
+                        all(r['enabled'] is False for r in rows), 'ABORT_IDENTITIES_NOT_DISABLED')

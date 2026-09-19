@@ -9,6 +9,7 @@ from uuid import UUID
 from dataclasses import replace
 import subprocess
 import sys
+import shutil
 
 import pytest
 
@@ -205,6 +206,10 @@ class FakeHost:
         self.fail = fail
         self.value = baseline()
         self.db = self
+        self.context = 'synthetic-context'
+
+    def context_fingerprint(self):
+        return self.context
 
     @contextmanager
     def control(self):
@@ -242,6 +247,9 @@ class FakeHost:
         self.enabled = enabled
         self.events.append(('identities', enabled))
 
+    def verify_disabled(self):
+        assert self.locked and not self.enabled
+
     def save(self, state):
         self.journal = deepcopy(state)
 
@@ -278,6 +286,9 @@ class FakeHost:
 
     def verify_schedules(self):
         assert self.locked and self.scheduled
+
+    def verify_schedules_off(self):
+        assert self.locked and not self.scheduled
 
     def stop(self):
         assert not self.locked
@@ -558,7 +569,8 @@ def test_identity_enable_disable_transaction_exact_targets(enabled):
     assert ('provider_instances' if enabled else 'observation_scopes') in statements[0][0]
 
 
-def test_real_install_in_temp_filesystem_with_fake_systemctl(tmp_path, monkeypatch):
+@pytest.mark.parametrize('umask', [0o022, 0o077])
+def test_real_install_in_temp_filesystem_with_fake_systemctl(tmp_path, monkeypatch, umask):
     release = tmp_path / 'release'
     target = release / 'deployment/systemd'
     target.mkdir(parents=True)
@@ -579,7 +591,11 @@ def test_real_install_in_temp_filesystem_with_fake_systemctl(tmp_path, monkeypat
     monkeypatch.setattr(Path, 'lstat', lambda p: SimpleNamespace(st_uid=0, st_mode=original(p).st_mode))
     h.properties = lambda unit: {'User': 'pdi', 'Group': 'pdi', 'NoNewPrivileges': 'yes', 'DropInPaths': '',
                                 'FragmentPath': str(units / 'pdi-p3c-writer@.service')}
-    h.install()
+    old_umask = os.umask(umask)
+    try:
+        h.install()
+    finally:
+        os.umask(old_umask)
     assert current.resolve() == release
     assert (paths.config / 'registry.toml').stat().st_mode & 0o777 == 0o640
     assert paths.config.stat().st_mode & 0o777 == 0o750
@@ -595,7 +611,7 @@ def test_real_install_in_temp_filesystem_with_fake_systemctl(tmp_path, monkeypat
 
 def test_stop_attempts_every_scoped_unit_even_if_one_stop_fails(monkeypatch):
     h = ops.Host(ops.Paths(), Path('/synthetic'), 'c'*40, 'synthetic', 'a'*64, 'b'*40)
-    h.properties = lambda _: {'LoadState': 'loaded', 'ActiveState': 'inactive'}
+    h.properties = lambda _: {'LoadState': 'loaded', 'ActiveState': 'inactive', 'UnitFileState': 'disabled'}
     calls = []
     def cmd(argv, **kwargs):
         calls.append(argv)
@@ -606,3 +622,139 @@ def test_stop_attempts_every_scoped_unit_even_if_one_stop_fails(monkeypatch):
         h.stop()
     assert ['systemctl', 'stop', 'pdi-p3c-writer@immich-relation.service'] in calls
     assert all(not any(prefix in x for prefix in c.LEGACY) for argv in calls for x in argv)
+
+
+def test_stale_aborted_journal_cannot_confirm_current_failure(monkeypatch, capsys):
+    h = SimpleNamespace(db=None, read_state=lambda: {'phase': 'ABORTED'},
+        load=lambda: (_ for _ in ()).throw(c.Refused('CURRENT_PREFLIGHT_FAILED')))
+    monkeypatch.setattr(ops, 'Host', lambda *args: h)
+    result = ops.main(['verify', '--release', str(ROOT), '--expected-sha', 'c'*40,
+        '--production-host', 'synthetic', '--rollback-snapshot', 'a'*64,
+        '--rollback-source-sha', 'b'*40,
+        '--expected-counts', ','.join(k + '=2' for k in c.COUNT_KEYS)])
+    assert result == 1
+    output = capsys.readouterr().out
+    assert 'INGESTION_PAUSED=NOT_CONFIRMED' in output
+    assert 'SCOPED_WRITER_PRODUCTION_ENABLED=NOT_CONFIRMED' in output
+
+
+def test_abort_plan_drift_refuses_wrong_target_database_mutation(tmp_path):
+    h = FakeHost(tmp_path)
+    runner = ops.Cutover(h, {})
+    runner.apply()
+    state = h.read_state()
+    h.context = 'different-principal-or-database'
+    with h.control(), pytest.raises(c.Refused, match='ABORT_INCOMPLETE'):
+        runner.abort(state)
+    assert ('identities', False) not in h.events
+    assert not h.scheduled and not runner.abort_confirmed
+    assert h.journal['phase'] == 'ABORT_INCOMPLETE'
+
+
+def test_abort_requires_fresh_database_readback(tmp_path):
+    h = FakeHost(tmp_path, 'immich-person')
+    h.verify_disabled = lambda: (_ for _ in ()).throw(c.Refused('ABORT_IDENTITIES_NOT_DISABLED'))
+    runner = ops.Cutover(h, {})
+    with pytest.raises(c.Refused, match='ABORT_INCOMPLETE'):
+        runner.apply()
+    assert not runner.abort_confirmed and h.journal['phase'] == 'ABORT_INCOMPLETE'
+
+
+@pytest.mark.parametrize('fault', [None, 'gmail', 'integration-test'])
+def test_database_abort_readback_includes_preservation_providers(fault):
+    p = plan()
+    connection = SyntheticConnection(p, fault)
+    db = Database(SimpleNamespace(connect=lambda: connection), p, {})
+    if fault:
+        with pytest.raises(c.Refused, match='ABORT_IDENTITIES_NOT_DISABLED'):
+            db.verify_disabled()
+    else:
+        db.verify_disabled()
+    assert not any('checkpoint' in sql or 'pipeline_runs' in sql for sql in connection.statements)
+
+
+def test_stop_does_not_trust_successful_disable_exit_code(monkeypatch):
+    h = ops.Host(ops.Paths(), Path('/synthetic'), 'c'*40, 'synthetic', 'a'*64, 'b'*40)
+    h.properties = lambda _: {'LoadState': 'loaded', 'ActiveState': 'inactive', 'UnitFileState': 'enabled'}
+    monkeypatch.setattr(ops, 'command', lambda *a, **k: '')
+    with pytest.raises(c.Refused, match='ABORT_STOP_FAILED'):
+        h.stop()
+
+
+@pytest.mark.parametrize('error', [KeyboardInterrupt, TimeoutError, RuntimeError])
+def test_qualification_exception_releases_lock_before_abort(tmp_path, error):
+    h = FakeHost(tmp_path)
+    h.qualify = lambda _: (_ for _ in ()).throw(error())
+    runner = ops.Cutover(h, {})
+    with pytest.raises(error):
+        runner.apply()
+    assert runner.abort_confirmed and not h.enabled and not h.scheduled
+
+
+def test_identity_enable_partial_failure_enters_cleanup(tmp_path):
+    h = FakeHost(tmp_path)
+    original = h.set_enabled
+    def partial(enabled):
+        original(enabled)
+        if enabled:
+            raise RuntimeError('synthetic-transaction-error')
+    h.set_enabled = partial
+    runner = ops.Cutover(h, {})
+    with pytest.raises(RuntimeError):
+        runner.apply()
+    assert not h.enabled and not h.scheduled and runner.abort_confirmed
+
+
+def test_journal_failure_cannot_confirm_abort(tmp_path):
+    h = FakeHost(tmp_path)
+    runner = ops.Cutover(h, {})
+    runner.apply()
+    h.save = lambda _: (_ for _ in ()).throw(OSError('synthetic-disk-failure'))
+    with h.control(), pytest.raises(OSError):
+        runner.abort(h.read_state())
+    assert not runner.abort_confirmed
+
+
+def test_context_fingerprint_binds_route_without_password(tmp_path):
+    h = ops.Host(ops.Paths(), tmp_path, 'c'*40, 'synthetic', 'a'*64, 'b'*40)
+    h.plan, h.env = plan(), environment()
+    first = h.context_fingerprint()
+    h.env['DATABASE__URL'] = h.env['DATABASE__URL'].replace('synthetic-db-secret', 'rotated-secret')
+    assert h.context_fingerprint() == first
+    h.env['DATABASE__URL'] += '_different'
+    assert h.context_fingerprint() != first
+
+
+def test_premature_timer_activation_refused():
+    h = ops.Host(ops.Paths(), Path('/synthetic'), 'c'*40, 'synthetic', 'a'*64, 'b'*40)
+    h.properties = lambda _: {'UnitFileState': 'enabled', 'ActiveState': 'inactive'}
+    with pytest.raises(c.Refused, match='PREMATURE_SCHEDULE'):
+        h.verify_schedules_off()
+
+
+def test_all_generated_units_with_systemd_analyze(tmp_path):
+    analyzer = shutil.which('systemd-analyze')
+    if analyzer is None:
+        pytest.skip('systemd-analyze unavailable; no static verification PASS')
+    # Offline disposable root: exact unit bytes, inert dependencies/executable.
+    # Does not load/reload/start any host service.
+    units = tmp_path / 'etc/systemd/system'
+    units.mkdir(parents=True)
+    service = 'pdi-p3c-writer@.service'
+    (units / service).write_text((ROOT / 'deployment/systemd' / service).read_text())
+    names = [service]
+    for instance in c.SCHEDULES:
+        name = f'pdi-p3c-{instance}.timer'
+        (units / name).write_text(ops.timer_text(instance))
+        names.append(name)
+    for name in ('sysinit', 'basic', 'shutdown', 'timers', 'network-online'):
+        (units / (name + '.target')).write_text('[Unit]\nDescription=Synthetic target\n')
+    executable = tmp_path / 'opt/pdi/current/.venv/bin/python'
+    executable.parent.mkdir(parents=True)
+    executable.write_text('#!/bin/sh\nexit 0\n')
+    executable.chmod(0o755)
+    result = subprocess.run([analyzer, '--root=' + str(tmp_path), '--generators=no', '--man=no',
+                             'verify', *names], capture_output=True, text=True, timeout=30)
+    if 'SO_PASSCRED failed: Operation not permitted' in result.stderr:
+        pytest.skip('sandbox denies systemd SO_PASSCRED; static verification NOT executed')
+    assert result.returncode == 0, result.stderr

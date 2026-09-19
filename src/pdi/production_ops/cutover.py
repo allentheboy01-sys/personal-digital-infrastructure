@@ -2,8 +2,9 @@
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from sqlalchemy.engine import make_url
 
 from pdi.database import create_postgres_engine
 from pdi.operational import acquire_formal_lock
@@ -233,12 +235,21 @@ class Host:
     def read_state(self):
         return json.loads(secure_file(self.paths.state / 'state.json', exact_mode=0o600))
 
+    def context_fingerprint(self):
+        # Bind recovery to the original Principal/identities and DB destination.
+        # Password rotation alone is not a change of database identity.
+        route = make_url(self.env['DATABASE__URL']).set(password=None)
+        payload = [asdict(self.plan), route.render_as_string(hide_password=True)]
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
     def install(self):
         p = self.paths
         gid = pwd.getpwnam('pdi').pw_gid
         p.config.mkdir(mode=0o750)
         os.chown(p.config, 0, gid)
+        os.chmod(p.config, 0o750)  # do not inherit an operator's restrictive umask
         (p.config / 'units').mkdir(mode=0o700)
+        os.chmod(p.config / 'units', 0o700)
         atomic_write(p.config / 'registry.toml', registry_text(self.plan, self.env), gid=gid, mode=0o640)
         cfg = load_scoped_operator_configuration(p.config / 'registry.toml', environment=self.env)
         require(cfg.router.resolve(self.plan.principal).database_url == self.env['DATABASE__URL'], 'DATABASE_ROUTE')
@@ -282,7 +293,9 @@ class Host:
                             command(action, timeout=120)
                         except Exception:
                             failures.append(unit)
-                    self.quiet(unit)
+                    s = self.quiet(unit)
+                    if unit.endswith('.timer'):
+                        require(s.get('UnitFileState') == 'disabled', 'ABORT_TIMER_STILL_ENABLED')
             except Exception:
                 failures.append(unit)
         require(not failures, 'ABORT_STOP_FAILED')
@@ -315,11 +328,17 @@ class Host:
             require(s.get('UnitFileState') == 'enabled' and s.get('ActiveState') == 'active' and not s.get('DropInPaths')
                     and s.get('FragmentPath') == str(self.paths.units / f'pdi-p3c-{i}.timer'), 'SCHEDULE_NOT_ACTIVE')
 
+    def verify_schedules_off(self):
+        for i in SCHEDULES:
+            s = self.properties(f'pdi-p3c-{i}.timer')
+            require(s.get('UnitFileState') == 'disabled' and s.get('ActiveState') == 'inactive', 'PREMATURE_SCHEDULE')
+
 
 class Cutover:
     """Injectable state machine; production and rehearsal use the same algorithm."""
     def __init__(self, host, expected_counts):
         self.host, self.counts = host, expected_counts
+        self.abort_confirmed = False
 
     def preflight(self):
         h = self.host
@@ -328,16 +347,18 @@ class Cutover:
 
     def apply(self):
         h = self.host
+        self.abort_confirmed = False
         with h.control():
             state = None
             try:
                 with h.sync():
                     before = self.preflight()  # never trust an earlier CLI preflight
                     state = {'phase': 'PREPARED', 'sha': h.sha, 'old_target': os.readlink(h.paths.current),
-                             'baseline': before, 'qualified': []}
+                             'context': h.context_fingerprint(), 'baseline': before, 'qualified': []}
                     h.save(state)  # durable marker BEFORE any production configuration write
                     h.install()
                     h.verify_files()
+                    h.verify_schedules_off()
                     h.db.set_enabled(True)
                     h.db.compare(before, h.db.evidence(enabled=True))
                 for instance in QUALIFICATION:
@@ -346,6 +367,7 @@ class Cutover:
                     h.qualify(instance)
                     with h.sync():
                         h.health()
+                        h.verify_schedules_off()
                         after = h.db.evidence(enabled=True)
                         h.db.compare(before, after, PIPELINES[instance])
                         before = after
@@ -354,6 +376,7 @@ class Cutover:
                 with h.sync():
                     h.health()
                     h.verify_files()
+                    h.verify_schedules_off()
                     final = h.db.evidence(enabled=True)
                     h.db.compare(state['baseline'], final)
                     state['verified'] = final
@@ -371,14 +394,22 @@ class Cutover:
 
     def abort(self, state):
         h = self.host
+        self.abort_confirmed = False
         problems = []
+        state['phase'] = 'ABORTING'
+        try:
+            h.save(state)
+        except BaseException:
+            problems.append('journal')
         try:
             h.stop()
         except BaseException:
             problems.append('stop')
         try:
             with h.sync():
+                require(state.get('context') == h.context_fingerprint(), 'ABORT_CONTEXT_CHANGED')
                 h.db.set_enabled(False)
+                h.db.verify_disabled()
                 h.health()
                 # Keep the new release/config inert for diagnosis. Restoring the
                 # old release could reactivate legacy composition; no auto rollback.
@@ -387,12 +418,14 @@ class Cutover:
         state['phase'] = 'ABORT_INCOMPLETE' if problems else 'ABORTED'
         h.save(state)
         require(not problems, 'ABORT_INCOMPLETE')
+        self.abort_confirmed = True
 
     def verify(self):
         h = self.host
         with h.control(), h.sync():
             state = h.read_state()
             require(state['phase'] == 'PASS' and state['sha'] == h.sha and state['qualified'] == list(QUALIFICATION), 'NO_SUCCESSFUL_CUTOVER')
+            require(state.get('context') == h.context_fingerprint(), 'VERIFY_CONTEXT_CHANGED')
             h.health()
             h.verify_files()
             h.verify_schedules()
@@ -415,6 +448,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     logging.disable(logging.CRITICAL)
     host = None
+    cutover = None
     try:
         require(Path(__file__).resolve().is_relative_to(args.release / 'src'), 'EXECUTE_EXACT_RELEASE')
         require(Path(sys.prefix).absolute() == args.release / '.venv', 'RELEASE_PYTHON')
@@ -447,12 +481,8 @@ def main(argv=None):
     except BaseException as error:
         code = str(error) if isinstance(error, Refused) else 'OPERATION_FAILED'
         print('MU13_P3C_STATUS=FAIL\nERROR_CODE=' + code)
-        paused = False
-        if host is not None:
-            try:
-                paused = host.read_state()['phase'] == 'ABORTED'
-            except Exception:
-                pass
+        # Historical journal status cannot establish current cleanup success.
+        paused = cutover is not None and cutover.abort_confirmed
         print('SCOPED_WRITER_PRODUCTION_ENABLED=' + ('NO' if paused else 'NOT_CONFIRMED'))
         print('INGESTION_PAUSED=' + ('YES' if paused else 'NOT_CONFIRMED'))
         print('AUTOMATIC_LEGACY_FALLBACK=NO\nAUTOMATIC_DATABASE_ROLLBACK=NO')
