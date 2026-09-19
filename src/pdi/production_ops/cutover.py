@@ -222,8 +222,13 @@ class Host:
         # Other scoped units must not be enabled or running before P3C.
         for line in command(['systemctl', 'list-units', '--all', '--plain', '--no-legend', 'pdi-scoped*', 'pdi-p3c*']).splitlines():
             require(not re.search(r'\s(active|activating|deactivating)\s', line), 'OTHER_SCOPED_WRITER')
-        for line in command(['systemctl', 'list-unit-files', '--no-legend', 'pdi-scoped*', 'pdi-p3c*']).splitlines():
-            require(not re.search(r'\s(enabled|enabled-runtime)\s', line), 'OTHER_SCOPED_SCHEDULE')
+        # A patterned query can return nonzero when nothing matches. Require a
+        # successful complete inventory, then select only our unit prefixes.
+        for line in command(['systemctl', 'list-unit-files', '--no-legend', '--no-pager']).splitlines():
+            fields = line.split()
+            if fields and fields[0].startswith(('pdi-scoped', 'pdi-p3c')):
+                require(len(fields) >= 2, 'SCOPED_UNIT_INVENTORY_MALFORMED')
+                require(fields[1] not in {'enabled', 'enabled-runtime'}, 'OTHER_SCOPED_SCHEDULE')
         self.health()
 
     def save(self, state):

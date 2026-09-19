@@ -451,6 +451,139 @@ def test_actual_host_preflight_wrong_release_sha(tmp_path, monkeypatch):
         h.preflight()
 
 
+@pytest.fixture
+def host_inventory_preflight(tmp_path, monkeypatch):
+    """Actual Host.preflight/health and command(), with no host commands/DB.
+
+    Only ownership is simulated for temporary files. The subprocess boundary
+    returns synthetic inventory; every attempted command must be read-only.
+    """
+    releases = tmp_path / 'releases'
+    release = releases / ('c' * 40)
+    release.mkdir(parents=True)
+    old = releases / 'old'
+    old.mkdir()
+    current = tmp_path / 'current'
+    current.symlink_to(old)
+    recovery = tmp_path / 'recovery'
+    recovery.mkdir()
+    (recovery / 'final-premigration.env').write_text(''.join(k + '=' + v + '\n' for k, v in rollback().items()))
+    (recovery / 'final-premigration.env').chmod(0o600)
+    (recovery / 'FINAL-PREMIGRATION.md').write_text('Synthetic recovery evidence')
+    paths = replace(ops.Paths(), releases=releases, current=current, recovery=recovery,
+                    config=tmp_path / 'config', state=tmp_path / 'state', units=tmp_path / 'units')
+    h = ops.Host(paths, release, 'c' * 40, 'synthetic', 'a' * 64, 'b' * 40)
+    for name in ('stat', 'lstat'):
+        original = getattr(Path, name)
+        def root_stat(path, *args, _original=original, **kwargs):
+            result = list(_original(path, *args, **kwargs))
+            result[0] &= ~0o022
+            result[4] = result[5] = 0
+            return os.stat_result(result)
+        monkeypatch.setattr(Path, name, root_stat)
+    original_iterdir = Path.iterdir
+    monkeypatch.setattr(Path, 'iterdir', lambda path: iter(()) if path == Path('/proc') else original_iterdir(path))
+    responses = {'unit_files': '', 'unit_files_rc': 0, 'units': '', 'units_rc': 0}
+    calls = []
+    def subprocess_run(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs['capture_output'] is True
+        assert kwargs['env'] == {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'GIT_OPTIONAL_LOCKS': '0'}
+        rc = 0
+        if argv == ['git', '-C', str(release), 'rev-parse', 'HEAD']:
+            output = h.sha
+        elif argv == ['git', '-C', str(release), 'status', '--porcelain', '--untracked-files=all']:
+            output = ''
+        elif argv[:2] == ['systemctl', 'show']:
+            unit = argv[2]
+            if unit in c.READ_SERVICES + c.BACKUP_TIMERS:
+                output = 'LoadState=loaded\nActiveState=active\nUnitFileState=enabled'
+            elif any(unit == prefix + suffix for prefix in c.LEGACY for suffix in ('.service', '.timer')):
+                output = 'LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled'
+            else:
+                assert unit.startswith('pdi-p3c-')
+                output = 'LoadState=not-found\nActiveState=inactive'
+        elif argv == ['systemctl', 'list-unit-files', '--no-legend', '--no-pager']:
+            output, rc = responses['unit_files'], responses['unit_files_rc']
+        elif argv == ['systemctl', 'list-units', '--all', '--plain', '--no-legend', 'pdi-scoped*', 'pdi-p3c*']:
+            output, rc = responses['units'], responses['units_rc']
+        else:
+            pytest.fail('unexpected or mutating preflight command')
+        return SimpleNamespace(returncode=rc, stdout=output, stderr='synthetic-hidden-stderr')
+    monkeypatch.setattr(ops.subprocess, 'run', subprocess_run)
+    def no_mutation(*args, **kwargs):
+        pytest.fail('preflight attempted mutation or DB connection')
+    for name in ('atomic_write', 'atomic_symlink', 'create_postgres_engine'):
+        monkeypatch.setattr(ops, name, no_mutation)
+    def snapshot():
+        return {str(p.relative_to(tmp_path)): ('link', os.readlink(p)) if p.is_symlink() else ('file', p.read_bytes())
+                for p in tmp_path.rglob('*') if p.is_symlink() or p.is_file()}
+    before = snapshot()
+    yield h, responses, calls
+    assert snapshot() == before
+    assert not paths.config.exists() and not paths.state.exists() and not paths.units.exists()
+    assert h.db is None
+
+
+@pytest.mark.parametrize('inventory', [
+    '',
+    'unrelated.timer enabled enabled\nother.service enabled-runtime disabled',
+    'not-pdi-scoped.timer enabled enabled',
+    'pdi-scoped@synthetic.service disabled enabled',
+    'pdi-p3c-extra.timer disabled enabled',
+    'pdi-scoped@.service static -',
+    'pdi-p3c-extra.timer static -',
+    'pdi-scoped-extra.timer masked enabled',
+])
+def test_preflight_accepts_empty_or_non_enabled_scoped_unit_inventory(host_inventory_preflight, inventory):
+    h, responses, calls = host_inventory_preflight
+    responses['unit_files'] = inventory
+    h.preflight()
+    assert ['systemctl', 'list-unit-files', '--no-legend', '--no-pager'] in calls
+    assert ['systemctl', 'list-units', '--all', '--plain', '--no-legend', 'pdi-scoped*', 'pdi-p3c*'] in calls
+
+
+@pytest.mark.parametrize('prefix', ['pdi-scoped', 'pdi-p3c'])
+@pytest.mark.parametrize('state', ['enabled', 'enabled-runtime'])
+def test_preflight_refuses_enabled_scoped_unit_inventory(host_inventory_preflight, prefix, state):
+    h, responses, _ = host_inventory_preflight
+    responses['unit_files'] = f'{prefix}-extra.timer {state} disabled'
+    with pytest.raises(c.Refused, match='^OTHER_SCOPED_SCHEDULE$'):
+        h.preflight()
+
+
+@pytest.mark.parametrize('inventory', ['', 'pdi-scoped-extra.timer disabled disabled'])
+def test_preflight_inventory_command_failure_is_fatal(host_inventory_preflight, inventory):
+    h, responses, _ = host_inventory_preflight
+    responses.update(unit_files=inventory, unit_files_rc=1)
+    with pytest.raises(c.Refused, match='^COMMAND_FAILED$'):
+        h.preflight()
+
+
+def test_preflight_refuses_malformed_matching_inventory(host_inventory_preflight):
+    h, responses, _ = host_inventory_preflight
+    responses['unit_files'] = 'pdi-scoped-extra.timer'
+    with pytest.raises(c.Refused, match='^SCOPED_UNIT_INVENTORY_MALFORMED$'):
+        h.preflight()
+
+
+@pytest.mark.parametrize('prefix', ['pdi-scoped', 'pdi-p3c'])
+@pytest.mark.parametrize('state', ['active', 'activating', 'deactivating'])
+def test_preflight_retains_active_scoped_writer_refusal(host_inventory_preflight, prefix, state):
+    h, responses, calls = host_inventory_preflight
+    responses['units'] = f'{prefix}@synthetic.service loaded {state} running Synthetic writer'
+    with pytest.raises(c.Refused, match='^OTHER_SCOPED_WRITER$'):
+        h.preflight()
+    assert not any(argv[:2] == ['systemctl', 'list-unit-files'] for argv in calls)
+
+
+def test_preflight_retains_list_units_command_failure(host_inventory_preflight):
+    h, responses, _ = host_inventory_preflight
+    responses['units_rc'] = 1
+    with pytest.raises(c.Refused, match='^COMMAND_FAILED$'):
+        h.preflight()
+
+
 class Result:
     def __init__(self, rows):
         self.rows = rows
