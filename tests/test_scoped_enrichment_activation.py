@@ -10,7 +10,13 @@ from pdi.scoped_enrichment_activation import (
     ScopedEnrichmentActivation,
 )
 from pdi.scoped_operational import ENRICHMENT_BATCH_SIZES, SCOPED_FORMAL_PIPELINES
-from pdi.scoped_enrichment_profiles import build_enrichment_profile, profile_keys
+from pdi.scoped_enrichment_profiles import (
+    build_enrichment_profile,
+    build_profile_from_binding_refs,
+    profile_keys,
+    render_environment_file,
+)
+from pdi.production_ops.enrichment_cutover import P3DControl, P3DControlRefused
 
 
 class Actions:
@@ -77,6 +83,23 @@ def test_unit_profile_contract_is_exact_and_local_profiles_have_no_provider_secr
         assert "IMMICH__API_KEY" not in profile_keys(key)
 
 
+def test_multi_scope_profile_uses_exact_secret_refs_and_renders_safely():
+    environment = {"NC_A_SECRET": "a\\quote\"", "NC_B_SECRET": "b"}
+    profile = build_profile_from_binding_refs(
+        "enrichment.nextcloud_text", principal_ref="primary", database_url="postgresql://isolated",
+        binding_secret_refs={"scope-a": "NC_A_SECRET", "scope-b": "NC_B_SECRET"},
+        environment=environment,
+    )
+    rendered = render_environment_file(profile)
+    assert 'NC_A_SECRET="a\\\\quote\\\""' in rendered
+    assert "IMMICH__API_KEY" not in rendered
+    with pytest.raises(ValueError, match="UNRELATED_PROVIDER_SECRET"):
+        build_profile_from_binding_refs(
+            "enrichment.file_metadata", principal_ref="primary", database_url="postgresql://isolated",
+            binding_secret_refs={"scope-a": "NC_A_SECRET"}, environment=environment,
+        )
+
+
 def test_activation_is_fail_closed_and_abort_only_disables_scoped_enrichments():
     actions = Actions()
     activation = ScopedEnrichmentActivation(actions)
@@ -126,6 +149,35 @@ def test_partial_activation_failure_cleans_all_scoped_timers():
         activation.activate()
     assert activation.state is ActivationState.ABORTED
     assert actions.events[-1] == ("disable", CANONICAL_SCOPED_ENRICHMENTS)
+
+
+def test_cleanup_failure_is_not_reported_as_aborted():
+    actions = Actions(fail_enable=True)
+    def failing_disable(_keys):
+        raise RuntimeError("synthetic cleanup failure")
+    actions.disable_scoped_enrichments = failing_disable
+    activation = ScopedEnrichmentActivation(actions)
+    activation.preflight()
+    activation.qualify()
+    with pytest.raises(EnrichmentActivationRefused, match="ABORT_NOT_CONFIRMED"):
+        activation.activate()
+    assert activation.state is ActivationState.ABORT_NOT_CONFIRMED
+
+
+def test_p3d_control_requires_preflight_and_records_fail_closed_abort(tmp_path):
+    control = P3DControl(tmp_path / "state.json", tmp_path / "journal", "abc", tmp_path / "release")
+    with pytest.raises(P3DControlRefused, match="QUALIFICATION_ORDER_INVALID"):
+        control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS})
+    evidence = {
+        "release_sha": "abc", "release_path": str(tmp_path / "release"),
+        "p3c_pass": True, "writers_healthy": True, "legacy_enrichment_disabled": True,
+        "p3d_timers_off": True, "gmail_disabled": True, "rollback_qualified": True,
+    }
+    control.preflight(evidence)
+    control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS})
+    with pytest.raises(P3DControlRefused, match="ABORT_NOT_CONFIRMED"):
+        control.abort(all_disabled=False)
+    assert '"state": "ABORT_NOT_CONFIRMED"' in (tmp_path / "state.json").read_text()
 
 
 def test_abort_is_idempotent_from_qualified_state():

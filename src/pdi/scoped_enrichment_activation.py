@@ -36,6 +36,7 @@ class ActivationState(StrEnum):
     ACTIVATING = "activating"
     ACTIVE = "active"
     ABORTED = "aborted"
+    ABORT_NOT_CONFIRMED = "abort_not_confirmed"
 
 
 class EnrichmentActivationRefused(RuntimeError):
@@ -46,7 +47,7 @@ class EnrichmentActivationActions(Protocol):
     def preflight(self) -> bool: ...
     def qualify(self, pipeline_keys: tuple[str, ...]) -> bool: ...
     def enable_scoped_enrichments(self, pipeline_keys: tuple[str, ...]) -> None: ...
-    def disable_scoped_enrichments(self, pipeline_keys: tuple[str, ...]) -> None: ...
+    def disable_scoped_enrichments(self, pipeline_keys: tuple[str, ...]) -> bool | None: ...
 
 
 @dataclass
@@ -78,9 +79,14 @@ class ScopedEnrichmentActivation:
             self.actions.enable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
         except BaseException as error:
             try:
-                self.actions.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
-            finally:
-                self.state = ActivationState.ABORTED
+                confirmed = self.actions.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
+            except BaseException as cleanup_error:
+                self.state = ActivationState.ABORT_NOT_CONFIRMED
+                raise EnrichmentActivationRefused("ABORT_NOT_CONFIRMED") from cleanup_error
+            if confirmed is False:
+                self.state = ActivationState.ABORT_NOT_CONFIRMED
+                raise EnrichmentActivationRefused("ABORT_NOT_CONFIRMED")
+            self.state = ActivationState.ABORTED
             raise EnrichmentActivationRefused("ACTIVATION_FAILED") from error
         self.state = ActivationState.ACTIVE
 
@@ -92,7 +98,14 @@ class ScopedEnrichmentActivation:
             ActivationState.ACTIVE,
             ActivationState.ABORTED,
         }:
-            self.actions.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
+            try:
+                confirmed = self.actions.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
+            except BaseException as error:
+                self.state = ActivationState.ABORT_NOT_CONFIRMED
+                raise EnrichmentActivationRefused("ABORT_NOT_CONFIRMED") from error
+            if confirmed is False:
+                self.state = ActivationState.ABORT_NOT_CONFIRMED
+                raise EnrichmentActivationRefused("ABORT_NOT_CONFIRMED")
         self.state = ActivationState.ABORTED
 
 

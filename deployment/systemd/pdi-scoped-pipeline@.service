@@ -7,10 +7,17 @@ Type=oneshot
 User=pdi
 Group=pdi
 EnvironmentFile=/etc/pdi/scoped/units/%i.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/pdi/current/src
 WorkingDirectory=/opt/pdi/current
-ExecStart=/opt/pdi/current/.venv/bin/python -m pdi.scoped_operational --config /etc/pdi/scoped/registry.toml --principal-ref ${PDI_PRINCIPAL_REF} --pipeline-key ${PDI_SCOPED_PIPELINE_KEY} --lock-timeout 300
+ExecStart=/opt/pdi/current/.venv/bin/python -m pdi.production_ops.enrichment --config /etc/pdi/scoped/registry.toml --principal-ref ${PDI_PRINCIPAL_REF} --pipeline-key ${PDI_SCOPED_PIPELINE_KEY} --lock-timeout 300
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/run/lock
+TimeoutStartSec=infinity
+TimeoutStopSec=60
+KillMode=control-group
+StandardOutput=null
+StandardError=null
