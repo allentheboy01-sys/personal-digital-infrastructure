@@ -23,8 +23,16 @@ no fallback.  Local enrichment still runs only in the routed Personal DB and
 does not require Provider secrets.
 
 The formal lock remains `/run/lock/pdi-sync.lock`.  Future activation is a
-separate fail-closed state machine: preflight, qualification, activation,
-verify, abort.  Qualification keeps all P3D timers off.  Abort disables only
+separate fail-closed state machine: preflight, pre-rehearsal qualification,
+activation, verify, abort.  The pre-rehearsal qualification is a static,
+side-effect-free proof of the candidate, routed database authority, canonical
+pipeline registry, and installed unit/profile bindings.  It does not start a
+service, run an enrichment worker, or require a `PipelineRun`.
+
+Real six-pipeline `PipelineRun` coverage is a distinct post-rehearsal proof.
+It is accepted only after an independently authorized runtime rehearsal and
+must cover all six canonical keys for the exact candidate/context.  A normal
+pre-rehearsal state therefore has runtime coverage `0/6`.  Abort disables only
 the P3D timers and never restores legacy enrichment timers or disables healthy
 P3C writers.
 

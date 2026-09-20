@@ -2,12 +2,12 @@
 import argparse
 import os
 import tomllib
-from datetime import UTC, datetime
 from pathlib import Path
 
 from pdi.production_ops.enrichment_cutover import (
     P3DControl, P3DControlRefused, ProductionEvidenceReader,
-    SystemdScopedEnrichmentActions, promote_release_atomically,
+    SystemdScopedEnrichmentActions, build_pre_rehearsal_qualification_proof,
+    promote_release_atomically,
 )
 from pdi.database import create_postgres_engine
 from pdi.scoped_operator_config import load_scoped_operator_configuration
@@ -18,7 +18,11 @@ from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("preflight", "apply", "qualify", "activate", "verify", "abort"))
+    parser.add_argument(
+        "action",
+        choices=("preflight", "apply", "qualify", "activate", "verify", "abort",
+                 "post-rehearsal-ledger"),
+    )
     parser.add_argument("--release", type=Path, required=True)
     parser.add_argument("--expected-sha", required=True)
     parser.add_argument("--rollback-source-sha", required=True)
@@ -35,11 +39,15 @@ def main(argv=None):
             current = root / "current"
             rollback = root / "rollback.env"
             config = root / "registry.toml"
+            unit_dir = root / "etc/systemd/system"
+            profile_dir = root / "etc/pdi/scoped/units"
         else:
             state, journal, lock = args.state, args.journal, Path("/run/lock/pdi-mu13-p3d-cutover.lock")
             current = Path("/opt/pdi/current")
             rollback = Path("/etc/pdi-backup-recovery/pdi-core/p3d-pre-enrichment.env")
             config = Path("/etc/pdi/scoped/registry.toml")
+            unit_dir = Path("/etc/systemd/system")
+            profile_dir = Path("/etc/pdi/scoped/units")
         raw_config = tomllib.loads(config.read_text())
         principals = raw_config.get("principals", [])
         if len(principals) != 1 or not principals[0].get("enabled", False):
@@ -62,18 +70,18 @@ def main(argv=None):
             control.preflight(reader.collect_preflight())
         elif args.action == "qualify":
             context = reader.collect_preflight()
-            qualification_started = datetime.now(UTC)
-            if not backend.qualify(tuple(CANONICAL_SCOPED_ENRICHMENTS)):
-                raise P3DControlRefused("QUALIFICATION_FAILED")
-            ledger = verify_qualification_ledger_batch(
-                db_engine, started_after=qualification_started,
-                pipeline_keys=CANONICAL_SCOPED_ENRICHMENTS,
-                candidate_sha=args.expected_sha, context=context,
+            proof = build_pre_rehearsal_qualification_proof(
+                candidate_sha=args.expected_sha,
+                rollback_source_sha=args.rollback_source_sha,
+                context=context,
+                unit_dir=unit_dir,
+                profile_dir=profile_dir,
             )
-            control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS},
-                            context=context, ledger=ledger)
+            control.qualify(proof, context=context)
         elif args.action == "activate":
             context = reader.collect_preflight()
+            if not current.is_symlink() or current.resolve() != args.release:
+                raise P3DControlRefused("CANDIDATE_NOT_PROMOTED")
             try:
                 backend.enable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
             except BaseException:
@@ -84,22 +92,30 @@ def main(argv=None):
         elif args.action == "verify":
             evidence = reader.collect_active_verify()
             control.verify(evidence)
-        elif args.action == "apply":
-            context = reader.collect_preflight()
-            control.preflight(context)
-            promote_release_atomically(current, args.release, args.expected_sha)
-            qualification_started = datetime.now(UTC)
-            if not backend.qualify(tuple(CANONICAL_SCOPED_ENRICHMENTS)):
-                raise P3DControlRefused("QUALIFICATION_FAILED")
+        elif args.action == "post-rehearsal-ledger":
+            reader.collect_active_verify()
+            started_after, context = control.runtime_ledger_boundary()
             ledger = verify_qualification_ledger_batch(
-                db_engine, started_after=qualification_started,
+                db_engine, started_after=started_after,
                 pipeline_keys=CANONICAL_SCOPED_ENRICHMENTS,
                 candidate_sha=args.expected_sha, context=context,
             )
-            control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS},
-                            context=context, ledger=ledger)
+            control.record_runtime_ledger(ledger)
+        elif args.action == "apply":
+            context = reader.collect_preflight()
+            control.preflight(context)
+            proof = build_pre_rehearsal_qualification_proof(
+                candidate_sha=args.expected_sha,
+                rollback_source_sha=args.rollback_source_sha,
+                context=context,
+                unit_dir=unit_dir,
+                profile_dir=profile_dir,
+            )
+            promote_release_atomically(current, args.release, args.expected_sha)
+            promoted_context = reader.collect_preflight()
+            control.qualify(proof, context=promoted_context)
             backend.enable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
-            control.activation_result(enabled=True, all_disabled=False, context=context)
+            control.activation_result(enabled=True, all_disabled=False, context=promoted_context)
         else:
             control.abort(all_disabled=backend.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS))
         print("P3D_CONTROL=PASS")

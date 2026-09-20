@@ -72,21 +72,57 @@ class RoutedPersonalDatabaseEvidenceReader:
                 )).one()
                 if null_scope != 0 or duplicate != 0 or tuple(sync_rows) != (2, 2, 2):
                     raise P3DControlRefused("PERSONAL_DB_INVARIANT_FAILED")
+                provider_mismatch = connection.scalar(text(
+                    "SELECT count(*) FROM asset_sources source "
+                    "JOIN observation_scopes scope ON scope.id=source.observation_scope_id "
+                    "JOIN provider_instances instance ON instance.id=scope.provider_instance_id "
+                    "WHERE source.provider <> instance.provider_type"
+                ))
+                source_providers = connection.execute(text(
+                    "SELECT provider, count(*) FROM asset_sources GROUP BY provider"
+                )).all()
+                if provider_mismatch != 0 or {row[0] for row in source_providers} != {
+                        "nextcloud", "immich", "gmail", "integration-test"}:
+                    raise P3DControlRefused("SOURCE_SCOPE_IDENTITY_MISMATCH")
             repository = PostgreSQLProviderIdentityRepository(self.engine)
             instances = repository.list_instances()
             expected = {"nextcloud": True, "immich": True, "gmail": False, "integration-test": False}
             actual = {}
+            identity_state = []
             for instance in instances:
                 if instance.provider_type in expected:
                     if instance.provider_type in actual:
                         raise P3DControlRefused("IDENTITY_DUPLICATE")
                     actual[instance.provider_type] = instance.enabled
+                    accounts = repository.list_accounts_for_instance(instance.id)
+                    scopes = repository.list_scopes_for_instance(instance.id)
+                    expected_account_count = 1 if instance.provider_type in {"nextcloud", "immich"} else 0
+                    if (len(accounts) != expected_account_count or len(scopes) != 1 or
+                            any(account.enabled is not True for account in accounts) or
+                            scopes[0].enabled is not expected[instance.provider_type]):
+                        raise P3DControlRefused("IDENTITY_STATE_MISMATCH")
+                    if expected_account_count and scopes[0].provider_account_id != accounts[0].id:
+                        raise P3DControlRefused("IDENTITY_ACCOUNT_SCOPE_MISMATCH")
+                    if not expected_account_count and scopes[0].provider_account_id is not None:
+                        raise P3DControlRefused("IDENTITY_ACCOUNT_SCOPE_MISMATCH")
+                    identity_state.append({
+                        "provider_type": instance.provider_type,
+                        "instance_id": str(instance.id),
+                        "instance_enabled": instance.enabled,
+                        "account_ids": sorted(str(account.id) for account in accounts),
+                        "scope_id": str(scopes[0].id),
+                        "scope_enabled": scopes[0].enabled,
+                    })
             if actual != expected:
                 raise P3DControlRefused("IDENTITY_STATE_MISMATCH")
             scope_ids = derive_enabled_scope_ids(self.engine)
             fingerprint = context_fingerprint({"principal": self.principal_ref,
                                                 "database_ref": binding.database_ref,
-                                                "scopes": sorted(map(str, scope_ids))})
+                                                "scopes": sorted(map(str, scope_ids)),
+                                                "identity_state": sorted(
+                                                    identity_state,
+                                                    key=lambda item: item["provider_type"],
+                                                )})
             return PersonalDatabaseEvidence(self.principal_ref, binding.database_ref,
                                             binding.database_url,
                                             frozenset(map(str, scope_ids)), fingerprint)

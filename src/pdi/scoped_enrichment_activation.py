@@ -45,7 +45,7 @@ class EnrichmentActivationRefused(RuntimeError):
 
 class EnrichmentActivationActions(Protocol):
     def preflight(self) -> bool: ...
-    def qualify(self, pipeline_keys: tuple[str, ...]) -> bool: ...
+    def pre_rehearsal_qualify(self, pipeline_keys: tuple[str, ...]) -> bool: ...
     def enable_scoped_enrichments(self, pipeline_keys: tuple[str, ...]) -> None: ...
     def disable_scoped_enrichments(self, pipeline_keys: tuple[str, ...]) -> bool | None: ...
 
@@ -67,7 +67,7 @@ class ScopedEnrichmentActivation:
     def qualify(self) -> None:
         if self.state is not ActivationState.PREFLIGHT_PASSED:
             raise EnrichmentActivationRefused("QUALIFICATION_ORDER_INVALID")
-        if not self.actions.qualify(CANONICAL_SCOPED_ENRICHMENTS):
+        if not self.actions.pre_rehearsal_qualify(CANONICAL_SCOPED_ENRICHMENTS):
             raise EnrichmentActivationRefused("QUALIFICATION_FAILED")
         self.state = ActivationState.QUALIFIED
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 import pytest
 
@@ -18,6 +19,8 @@ from pdi.scoped_enrichment_profiles import (
 )
 from pdi.production_ops.enrichment_cutover import (
     P3DControl, P3DControlRefused, P3D_TIMER_UNITS, SystemdScopedEnrichmentActions,
+    build_pre_rehearsal_qualification_proof,
+    context_fingerprint,
     validate_rollback_metadata,
     install_systemd_assets,
 )
@@ -39,7 +42,7 @@ class Actions:
         self.events.append("preflight")
         return self.preflight_result
 
-    def qualify(self, keys):
+    def pre_rehearsal_qualify(self, keys):
         self.events.append(("qualify", keys))
         return self.qualify_result
 
@@ -183,7 +186,7 @@ def test_p3d_control_requires_preflight_and_records_fail_closed_abort(tmp_path):
         "p3d_timers_off": True, "gmail_disabled": True, "rollback_qualified": True,
     }
     control.preflight(evidence)
-    control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS})
+    control.qualify(_proof(evidence))
     with pytest.raises(P3DControlRefused, match="ABORT_NOT_CONFIRMED"):
         control.abort(all_disabled=False)
     assert '"state": "ABORT_NOT_CONFIRMED"' in (tmp_path / "state.json").read_text()
@@ -230,7 +233,7 @@ def test_active_state_can_be_verified_with_active_context(tmp_path):
                "writers_healthy": True, "legacy_enrichment_disabled": True,
                "p3d_timers_off": True, "gmail_disabled": True, "rollback_qualified": True}
     control.preflight(context)
-    control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS}, context=context)
+    control.qualify(_proof(context), context=context)
     control.activation_result(enabled=True, all_disabled=False, context=context)
     control.verify({"p3c_healthy": True, "p3d_healthy": True})
     assert '"verified": true' in (tmp_path / "state.json").read_text()
@@ -251,6 +254,152 @@ def test_systemd_assets_install_without_activation(tmp_path):
     assert (units / "pdi-scoped-pipeline@.service").exists()
     assert len(list(profiles.glob("*.env"))) == 6
     assert calls and calls[0][0:2] == ("systemd-analyze", "verify")
+
+
+def _proof(context, *, sha="abc"):
+    return {
+        "proof_kind": "pre_rehearsal_static",
+        "candidate_sha": sha,
+        "context_fingerprint": context_fingerprint(context),
+        "pipeline_keys": CANONICAL_SCOPED_ENRICHMENTS,
+        "asset_fingerprint": "a" * 64,
+        "runtime_pipeline_coverage": "0/6",
+        "runtime_ledger_required_post_rehearsal": True,
+    }
+
+
+def _static_proof_fixture(tmp_path, *, candidate="c" * 40, rollback="r" * 40):
+    units = tmp_path / "units"
+    profiles = tmp_path / "profiles"
+    units.mkdir()
+    profiles.mkdir()
+    source = Path(__file__).parents[1] / "deployment/systemd"
+    for name in ("pdi-scoped-pipeline@.service", *P3D_TIMER_UNITS.values()):
+        shutil.copyfile(source / name, units / name)
+        (units / name).chmod(0o644)
+    principal = "synthetic-principal"
+    for key in CANONICAL_SCOPED_ENRICHMENTS:
+        profile = profiles / f"{key}.env"
+        profile.write_text(
+            f'PDI_PRINCIPAL_REF="{principal}"\n'
+            f'PDI_SCOPED_PIPELINE_KEY="{key}"\n'
+            'SYNTHETIC_DB_URL="postgresql://synthetic"\n'
+        )
+        profile.chmod(0o600)
+    context = {
+        "release_sha": candidate,
+        "release_path": str(tmp_path / "release"),
+        "p3c_pass": True,
+        "writers_healthy": True,
+        "legacy_enrichment_disabled": True,
+        "p3d_timers_off": True,
+        "gmail_disabled": True,
+        "rollback_qualified": True,
+        "principal_ref": principal,
+        "db_route": "synthetic-db",
+        "db_identity_fingerprint": "f" * 64,
+        "enabled_scope_ids": ["scope-a", "scope-b"],
+    }
+    return context, units, profiles, candidate, rollback
+
+
+def test_pre_rehearsal_proof_is_static_and_requires_all_canonical_assets(tmp_path):
+    context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
+    proof = build_pre_rehearsal_qualification_proof(
+        candidate_sha=candidate, rollback_source_sha=rollback,
+        context=context, unit_dir=units, profile_dir=profiles,
+    )
+    assert proof["proof_kind"] == "pre_rehearsal_static"
+    assert proof["runtime_pipeline_coverage"] == "0/6"
+    assert proof["pipeline_keys"] == CANONICAL_SCOPED_ENRICHMENTS
+    (profiles / "enrichment.immich_ocr.env").unlink()
+    with pytest.raises(P3DControlRefused, match="ASSET_INCOMPLETE"):
+        build_pre_rehearsal_qualification_proof(
+            candidate_sha=candidate, rollback_source_sha=rollback,
+            context=context, unit_dir=units, profile_dir=profiles,
+        )
+
+
+def test_pre_rehearsal_proof_rejects_candidate_rollback_identity_collision(tmp_path):
+    context, units, profiles, candidate, _rollback = _static_proof_fixture(tmp_path)
+    with pytest.raises(P3DControlRefused, match="IDENTITY_COLLISION"):
+        build_pre_rehearsal_qualification_proof(
+            candidate_sha=candidate, rollback_source_sha=candidate,
+            context=context, unit_dir=units, profile_dir=profiles,
+        )
+
+
+def test_pre_rehearsal_control_rejects_context_drift_and_needs_no_runtime_ledger(tmp_path):
+    context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
+    control = P3DControl(
+        tmp_path / "state.json", tmp_path / "journal", candidate,
+        tmp_path / "release", tmp_path / "lock",
+    )
+    control.preflight(context)
+    proof = build_pre_rehearsal_qualification_proof(
+        candidate_sha=candidate, rollback_source_sha=rollback,
+        context=context, unit_dir=units, profile_dir=profiles,
+    )
+    drifted = dict(context, db_route="other-db")
+    with pytest.raises(P3DControlRefused, match="CONTEXT_DRIFT"):
+        control.qualify(proof, context=drifted)
+    control.qualify(proof, context=context)
+    state = __import__("json").loads((tmp_path / "state.json").read_text())
+    assert state["state"] == "PRE_REHEARSAL_QUALIFIED"
+    assert "qualification_ledger" not in state
+
+
+def test_runtime_ledger_is_post_rehearsal_only_and_requires_bound_context(tmp_path):
+    context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
+    control = P3DControl(
+        tmp_path / "state.json", tmp_path / "journal", candidate,
+        tmp_path / "release", tmp_path / "lock",
+    )
+    control.preflight(context)
+    proof = build_pre_rehearsal_qualification_proof(
+        candidate_sha=candidate, rollback_source_sha=rollback,
+        context=context, unit_dir=units, profile_dir=profiles,
+    )
+    control.qualify(proof, context=context)
+    ledger = tuple({
+        "pipeline_key": key,
+        "run_id": f"run-{index}",
+        "candidate_sha": candidate,
+        "context_fingerprint": context_fingerprint(context),
+    } for index, key in enumerate(CANONICAL_SCOPED_ENRICHMENTS))
+    with pytest.raises(P3DControlRefused, match="RUNTIME_LEDGER_PHASE_INVALID"):
+        control.record_runtime_ledger(ledger)
+    control.activation_result(enabled=True, all_disabled=False, context=context)
+    control.verify({"p3c_healthy": True, "p3d_healthy": True})
+    control.record_runtime_ledger(ledger)
+    state = __import__("json").loads((tmp_path / "state.json").read_text())
+    assert len(state["post_rehearsal_runtime_ledger"]) == 6
+
+
+def test_runtime_ledger_rejects_partial_or_foreign_candidate(tmp_path):
+    context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
+    control = P3DControl(
+        tmp_path / "state.json", tmp_path / "journal", candidate,
+        tmp_path / "release", tmp_path / "lock",
+    )
+    control.preflight(context)
+    control.qualify(build_pre_rehearsal_qualification_proof(
+        candidate_sha=candidate, rollback_source_sha=rollback,
+        context=context, unit_dir=units, profile_dir=profiles,
+    ), context=context)
+    control.activation_result(enabled=True, all_disabled=False, context=context)
+    control.verify({"p3c_healthy": True, "p3d_healthy": True})
+    ledger = tuple({
+        "pipeline_key": key,
+        "run_id": f"run-{index}",
+        "candidate_sha": candidate,
+        "context_fingerprint": context_fingerprint(context),
+    } for index, key in enumerate(CANONICAL_SCOPED_ENRICHMENTS))
+    with pytest.raises(P3DControlRefused, match="COVERAGE"):
+        control.record_runtime_ledger(ledger[:-1])
+    foreign = tuple(dict(item, candidate_sha=rollback) for item in ledger)
+    with pytest.raises(P3DControlRefused, match="SHA_MISMATCH"):
+        control.record_runtime_ledger(foreign)
 
 
 def test_p3c_journal_rejects_missing_or_duplicate_proof(tmp_path):

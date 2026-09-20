@@ -12,7 +12,7 @@ import os
 import stat
 import tomllib
 import shutil
-from datetime import datetime
+from datetime import UTC, datetime
 from sqlalchemy import text
 
 from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
@@ -30,6 +30,91 @@ P3D_TIMER_UNITS = {
 P3D_UNIT_FILES = ("pdi-scoped-pipeline@.service",) + tuple(
     unit.removesuffix(".timer") + ".timer" for unit in P3D_TIMER_UNITS.values()
 )
+
+
+def build_pre_rehearsal_qualification_proof(*, candidate_sha: str,
+                                             rollback_source_sha: str,
+                                             context: dict[str, object],
+                                             unit_dir: Path,
+                                             profile_dir: Path) -> dict[str, object]:
+    """Build a static proof without invoking systemctl or a pipeline workload."""
+    if candidate_sha == rollback_source_sha:
+        raise P3DControlRefused("CANDIDATE_ROLLBACK_IDENTITY_COLLISION")
+    if context.get("release_sha") != candidate_sha:
+        raise P3DControlRefused("CANDIDATE_CONTEXT_MISMATCH")
+    pipeline_keys = tuple(CANONICAL_SCOPED_ENRICHMENTS)
+    if set(P3D_TIMER_UNITS) != set(pipeline_keys):
+        raise P3DControlRefused("CANONICAL_PIPELINE_SET_INVALID")
+    required_evidence = (
+        "p3c_pass", "writers_healthy", "legacy_enrichment_disabled",
+        "p3d_timers_off", "gmail_disabled", "rollback_qualified",
+    )
+    if any(context.get(key) is not True for key in required_evidence):
+        raise P3DControlRefused("PRE_REHEARSAL_EVIDENCE_INCOMPLETE")
+    principal_ref = context.get("principal_ref")
+    if not isinstance(principal_ref, str) or not principal_ref:
+        raise P3DControlRefused("PRE_REHEARSAL_PRINCIPAL_INVALID")
+    if not context.get("db_route") or not context.get("db_identity_fingerprint"):
+        raise P3DControlRefused("PRE_REHEARSAL_ROUTE_INVALID")
+    enabled_scope_ids = context.get("enabled_scope_ids")
+    if not isinstance(enabled_scope_ids, list) or not enabled_scope_ids:
+        raise P3DControlRefused("PRE_REHEARSAL_SCOPE_AUTHORITY_INVALID")
+
+    missing_units = [name for name in P3D_UNIT_FILES if not (unit_dir / name).is_file()]
+    missing_profiles = [key for key in pipeline_keys if not (profile_dir / f"{key}.env").is_file()]
+    if missing_units or missing_profiles:
+        raise P3DControlRefused("PRE_REHEARSAL_ASSET_INCOMPLETE")
+
+    service_text = (unit_dir / "pdi-scoped-pipeline@.service").read_text()
+    required_service_contract = (
+        "EnvironmentFile=/etc/pdi/scoped/units/%i.env",
+        "WorkingDirectory=/opt/pdi/current",
+        "ExecStart=/opt/pdi/current/.venv/bin/python -m pdi.production_ops.enrichment ",
+        "User=pdi", "Group=pdi", "TimeoutStartSec=infinity",
+    )
+    if any(item not in service_text for item in required_service_contract):
+        raise P3DControlRefused("PRE_REHEARSAL_SERVICE_CONTRACT_INVALID")
+
+    asset_hash = hashlib.sha256()
+    for name in P3D_UNIT_FILES:
+        path = unit_dir / name
+        if path.is_symlink() or path.stat().st_mode & 0o022:
+            raise P3DControlRefused("PRE_REHEARSAL_ASSET_UNTRUSTED")
+        payload = path.read_bytes()
+        asset_hash.update(name.encode())
+        asset_hash.update(payload)
+    for key in pipeline_keys:
+        timer_name = P3D_TIMER_UNITS[key]
+        timer_text = (unit_dir / timer_name).read_text()
+        if f"Unit=pdi-scoped-pipeline@{key}.service" not in timer_text:
+            raise P3DControlRefused("PRE_REHEARSAL_TIMER_BINDING_INVALID")
+        profile = profile_dir / f"{key}.env"
+        if profile.is_symlink() or profile.stat().st_mode & 0o077:
+            raise P3DControlRefused("PRE_REHEARSAL_PROFILE_UNTRUSTED")
+        profile_values: dict[str, str] = {}
+        for line in profile.read_text().splitlines():
+            name, separator, raw_value = line.partition("=")
+            if not separator:
+                raise P3DControlRefused("PRE_REHEARSAL_PROFILE_INVALID")
+            try:
+                profile_values[name] = json.loads(raw_value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise P3DControlRefused("PRE_REHEARSAL_PROFILE_INVALID") from None
+        if (profile_values.get("PDI_PRINCIPAL_REF") != principal_ref or
+                profile_values.get("PDI_SCOPED_PIPELINE_KEY") != key or
+                len(profile_values) < 3):
+            raise P3DControlRefused("PRE_REHEARSAL_PROFILE_BINDING_INVALID")
+        asset_hash.update(key.encode())
+        asset_hash.update(profile.read_bytes())
+    return {
+        "candidate_sha": candidate_sha,
+        "context_fingerprint": context_fingerprint(context),
+        "pipeline_keys": pipeline_keys,
+        "asset_fingerprint": asset_hash.hexdigest(),
+        "proof_kind": "pre_rehearsal_static",
+        "runtime_pipeline_coverage": "0/6",
+        "runtime_ledger_required_post_rehearsal": True,
+    }
 
 
 class SystemdScopedEnrichmentActions:
@@ -54,7 +139,8 @@ class SystemdScopedEnrichmentActions:
         return all(not self.is_enabled(key) and not self.is_active(key)
                    for key in CANONICAL_SCOPED_ENRICHMENTS)
 
-    def qualify(self, pipeline_keys: tuple[str, ...]) -> bool:
+    def run_rehearsal_services(self, pipeline_keys: tuple[str, ...]) -> bool:
+        """Run real workloads only after separate rehearsal authorization."""
         for key in pipeline_keys:
             service = f"pdi-scoped-pipeline@{key}.service"
             if not self._call("start", service):
@@ -277,7 +363,9 @@ class ProductionEvidenceReader:
                 "legacy_enrichment_disabled": True, "p3d_timers_off": True,
                 "gmail_disabled": True, "rollback_qualified": True,
                 "p3c_context": p3c_record.get("context_fingerprint"),
+                "principal_ref": db_evidence.principal_ref,
                 "db_route": db_evidence.database_ref,
+                "db_identity_fingerprint": db_evidence.identity_fingerprint,
                 "enabled_scope_ids": sorted(db_evidence.enabled_scope_ids)}
 
     def collect_active_verify(self) -> dict[str, object]:
@@ -387,31 +475,32 @@ class P3DControl:
         self._write(state)
         self._record("PREFLIGHT_PASSED", state)
 
-    def qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None,
-                ledger: tuple[dict[str, str], ...] | None = None) -> None:
+    def qualify(self, proof: dict[str, object], *,
+                context: dict[str, object] | None = None) -> None:
         with self.control_lock():
-            self._qualify(results, context=context, ledger=ledger)
+            self._qualify(proof, context=context)
 
-    def _qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None,
-                 ledger: tuple[dict[str, str], ...] | None = None) -> None:
+    def _qualify(self, proof: dict[str, object], *,
+                 context: dict[str, object] | None = None) -> None:
         state = self._read()
         if state.get("state") != "PREFLIGHT_PASSED":
             raise P3DControlRefused("QUALIFICATION_ORDER_INVALID")
         if context is not None and state.get("context_fingerprint") != context_fingerprint(context):
             raise P3DControlRefused("CONTEXT_DRIFT")
-        if set(results) != set(CANONICAL_SCOPED_ENRICHMENTS) or not all(results.values()):
-            raise P3DControlRefused("QUALIFICATION_FAILED")
-        if ledger is not None:
-            if {item.get("pipeline_key") for item in ledger} != set(CANONICAL_SCOPED_ENRICHMENTS):
-                raise P3DControlRefused("QUALIFICATION_LEDGER_COVERAGE")
-            if any(item.get("candidate_sha") != self.expected_sha for item in ledger):
-                raise P3DControlRefused("QUALIFICATION_LEDGER_SHA_MISMATCH")
-        state["state"] = "QUALIFIED"
-        state["qualification"] = {key: True for key in CANONICAL_SCOPED_ENRICHMENTS}
-        if ledger is not None:
-            state["qualification_ledger"] = list(ledger)
+        expected_context = state.get("context_fingerprint")
+        if (proof.get("proof_kind") != "pre_rehearsal_static" or
+                proof.get("candidate_sha") != self.expected_sha or
+                proof.get("context_fingerprint") != expected_context or
+                tuple(proof.get("pipeline_keys", ())) != tuple(CANONICAL_SCOPED_ENRICHMENTS) or
+                proof.get("runtime_pipeline_coverage") != "0/6" or
+                proof.get("runtime_ledger_required_post_rehearsal") is not True or
+                not isinstance(proof.get("asset_fingerprint"), str) or
+                len(proof["asset_fingerprint"]) != 64):
+            raise P3DControlRefused("PRE_REHEARSAL_QUALIFICATION_INVALID")
+        state["state"] = "PRE_REHEARSAL_QUALIFIED"
+        state["pre_rehearsal_qualification"] = proof
         self._write(state)
-        self._record("QUALIFIED", state)
+        self._record("PRE_REHEARSAL_QUALIFIED", state)
 
     def activation_result(self, *, enabled: bool, all_disabled: bool,
                           context: dict[str, object] | None = None) -> None:
@@ -421,7 +510,7 @@ class P3DControl:
     def _activation_result(self, *, enabled: bool, all_disabled: bool,
                            context: dict[str, object] | None = None) -> None:
         state = self._read()
-        if state.get("state") != "QUALIFIED":
+        if state.get("state") != "PRE_REHEARSAL_QUALIFIED":
             raise P3DControlRefused("ACTIVATION_ORDER_INVALID")
         if context is not None and state.get("context_fingerprint") != context_fingerprint(context):
             raise P3DControlRefused("CONTEXT_DRIFT")
@@ -435,6 +524,7 @@ class P3DControl:
             self._record("ABORTED", state)
             raise P3DControlRefused("ACTIVATION_FAILED")
         state["state"] = "ACTIVE"
+        state["activated_at"] = datetime.now(UTC).isoformat()
         self._write(state)
         self._record("ACTIVE", state)
 
@@ -458,7 +548,7 @@ class P3DControl:
 
     def _abort(self, *, all_disabled: bool) -> None:
         state = self._read()
-        if state.get("state") not in {"PREFLIGHT_PASSED", "QUALIFIED", "ACTIVE", "ABORTED", "ABORT_NOT_CONFIRMED"}:
+        if state.get("state") not in {"PREFLIGHT_PASSED", "PRE_REHEARSAL_QUALIFIED", "ACTIVE", "ABORTED", "ABORT_NOT_CONFIRMED"}:
             raise P3DControlRefused("ABORT_ORDER_INVALID")
         if not all_disabled:
             state["state"] = "ABORT_NOT_CONFIRMED"
@@ -468,3 +558,40 @@ class P3DControl:
         state["state"] = "ABORTED"
         self._write(state)
         self._record("ABORTED", state)
+
+    def record_runtime_ledger(self, ledger: tuple[dict[str, str], ...]) -> None:
+        """Post-rehearsal only: persist exact six-run proof after ACTIVE."""
+        with self.control_lock():
+            state = self._read()
+            if state.get("state") != "ACTIVE" or not state.get("verified"):
+                raise P3DControlRefused("RUNTIME_LEDGER_PHASE_INVALID")
+            if len(ledger) != len(CANONICAL_SCOPED_ENRICHMENTS) or {
+                    item.get("pipeline_key") for item in ledger
+            } != set(CANONICAL_SCOPED_ENRICHMENTS):
+                raise P3DControlRefused("QUALIFICATION_LEDGER_COVERAGE")
+            if any(item.get("candidate_sha") != self.expected_sha for item in ledger):
+                raise P3DControlRefused("QUALIFICATION_LEDGER_SHA_MISMATCH")
+            expected_context = state.get("context_fingerprint")
+            if any(item.get("context_fingerprint") != expected_context for item in ledger):
+                raise P3DControlRefused("QUALIFICATION_LEDGER_CONTEXT_MISMATCH")
+            run_ids = [item.get("run_id") for item in ledger]
+            if None in run_ids or len(set(run_ids)) != len(run_ids):
+                raise P3DControlRefused("QUALIFICATION_LEDGER_RUN_ID_INVALID")
+            state["post_rehearsal_runtime_ledger"] = list(ledger)
+            self._write(state)
+            self._record("POST_REHEARSAL_RUNTIME_LEDGER_PASS", state)
+
+    def runtime_ledger_boundary(self) -> tuple[datetime, dict[str, object]]:
+        """Expose the protected post-activation boundary for ledger verification."""
+        with self.control_lock():
+            state = self._read()
+            if state.get("state") != "ACTIVE" or not state.get("verified"):
+                raise P3DControlRefused("RUNTIME_LEDGER_PHASE_INVALID")
+            try:
+                boundary = datetime.fromisoformat(state["activated_at"])
+            except (KeyError, TypeError, ValueError):
+                raise P3DControlRefused("RUNTIME_LEDGER_BOUNDARY_INVALID") from None
+            evidence = state.get("evidence")
+            if not isinstance(evidence, dict):
+                raise P3DControlRefused("RUNTIME_LEDGER_CONTEXT_INVALID")
+            return boundary, evidence
