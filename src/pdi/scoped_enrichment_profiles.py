@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+from uuid import UUID
 
 from .scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 
@@ -100,7 +101,13 @@ def render_environment_file(values: Mapping[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_trusted_enrichment_profile(configuration, principal_ref: str, pipeline_key: str) -> dict[str, str]:
+def build_trusted_enrichment_profile(
+    configuration,
+    principal_ref: str,
+    pipeline_key: str,
+    *,
+    enabled_scope_ids: set[UUID],
+) -> dict[str, str]:
     """Derive DB and per-Scope secret refs from trusted configuration."""
     if pipeline_key not in CANONICAL_SCOPED_ENRICHMENTS:
         raise ValueError("UNKNOWN_ENRICHMENT_PIPELINE")
@@ -118,8 +125,9 @@ def build_trusted_enrichment_profile(configuration, principal_ref: str, pipeline
         if not values[db_env]:
             raise ValueError("DATABASE_BINDING_MISSING")
         return values
-    selected = [binding for (principal, _), binding in configuration.bindings.items()
-                if str(principal) == principal_ref and binding.provider_type == provider]
+    selected = [binding for (principal, scope_id), binding in configuration.bindings.items()
+                if str(principal) == principal_ref and scope_id in enabled_scope_ids
+                and binding.provider_type == provider]
     if not selected:
         raise ValueError("REQUIRED_SCOPE_BINDING_MISSING")
     for binding in selected:
