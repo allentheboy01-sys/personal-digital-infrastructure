@@ -90,6 +90,16 @@ class FormalPipelineSpec:
     provider_type: str | None
 
 
+ENRICHMENT_BATCH_SIZES: Mapping[str, int] = {
+    "enrichment.nextcloud_text": 100,
+    "enrichment.nextcloud_documents": 100,
+    "enrichment.file_metadata": 20000,
+    "enrichment.immich_geo": 20000,
+    "enrichment.immich_metadata": 20000,
+    "enrichment.immich_ocr": 20000,
+}
+
+
 SCOPED_FORMAL_PIPELINES: Mapping[str, FormalPipelineSpec] = {
     **{
         f"provider.{provider}.{suffix}": FormalPipelineSpec(
@@ -105,16 +115,22 @@ SCOPED_FORMAL_PIPELINES: Mapping[str, FormalPipelineSpec] = {
         "relation.immich.sync", PipelineKind.PROVIDER_SYNC, "immich"
     ),
     "enrichment.immich_ocr": FormalPipelineSpec(
-        "enrichment.immich_ocr", PipelineKind.ENRICHMENT, None
+        "enrichment.immich_ocr", PipelineKind.ENRICHMENT, "immich"
     ),
     "enrichment.nextcloud_text": FormalPipelineSpec(
-        "enrichment.nextcloud_text", PipelineKind.ENRICHMENT, None
+        "enrichment.nextcloud_text", PipelineKind.ENRICHMENT, "nextcloud"
     ),
     "enrichment.nextcloud_documents": FormalPipelineSpec(
-        "enrichment.nextcloud_documents", PipelineKind.ENRICHMENT, None
+        "enrichment.nextcloud_documents", PipelineKind.ENRICHMENT, "nextcloud"
     ),
-    "enrichment.local": FormalPipelineSpec(
-        "enrichment.local", PipelineKind.ENRICHMENT, None
+    "enrichment.file_metadata": FormalPipelineSpec(
+        "enrichment.file_metadata", PipelineKind.ENRICHMENT, None
+    ),
+    "enrichment.immich_geo": FormalPipelineSpec(
+        "enrichment.immich_geo", PipelineKind.ENRICHMENT, None
+    ),
+    "enrichment.immich_metadata": FormalPipelineSpec(
+        "enrichment.immich_metadata", PipelineKind.ENRICHMENT, None
     ),
 }
 
@@ -466,12 +482,14 @@ class ExecutableEnrichmentOperation:
         if target is None:
             raise ScopedFormalPipelineError("Enrichment requires Principal")
         repository = PostgreSQLObservationRepository(engine)
-        if self._pipeline_key == "enrichment.local":
+        if self._pipeline_key == "enrichment.file_metadata":
             extractors = (
                 (FileMetadataExtractor(), FileMetadataExtractor.discovery_providers),
-                (ImmichMetadataExtractor(), "immich"),
-                (ImmichGeoExtractor(), "immich"),
             )
+        elif self._pipeline_key == "enrichment.immich_geo":
+            extractors = ((ImmichGeoExtractor(), "immich"),)
+        elif self._pipeline_key == "enrichment.immich_metadata":
+            extractors = ((ImmichMetadataExtractor(), "immich"),)
         else:
             resolver = _enrichment_resolver(
                 self._configuration, engine, target.principal_id
@@ -492,11 +510,15 @@ class ExecutableEnrichmentOperation:
                 )
             else:
                 raise ScopedFormalPipelineError("Unknown enrichment operation")
+        try:
+            batch_size = ENRICHMENT_BATCH_SIZES[self._pipeline_key]
+        except KeyError as error:
+            raise ScopedFormalPipelineError("Unknown enrichment operation") from error
         failures = 0
         for extractor, provider in extractors:
             result = EnrichmentWorker(
                 repository, extractor, provider=provider
-            ).run_once(batch_size=100)
+            ).run_once(batch_size=batch_size)
             failures += result.failed
         if failures:
             raise ScopedFormalPipelineError("Enrichment operation failed")
@@ -527,7 +549,9 @@ def build_executable_scoped_runner(
         configuration
     )
     for key in (
-        "enrichment.local",
+        "enrichment.file_metadata",
+        "enrichment.immich_geo",
+        "enrichment.immich_metadata",
         "enrichment.immich_ocr",
         "enrichment.nextcloud_text",
         "enrichment.nextcloud_documents",
