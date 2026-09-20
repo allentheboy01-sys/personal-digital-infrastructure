@@ -97,6 +97,7 @@ class ScopedEnrichmentActivation:
             ActivationState.ACTIVATING,
             ActivationState.ACTIVE,
             ActivationState.ABORTED,
+            ActivationState.ABORT_NOT_CONFIRMED,
         }:
             try:
                 confirmed = self.actions.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)

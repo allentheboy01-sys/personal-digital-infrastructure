@@ -1,7 +1,11 @@
 """Topology-neutral EnvironmentFile profiles for scoped enrichment units."""
 
 from collections.abc import Mapping
+import os
+from pathlib import Path
 import re
+import stat
+import tempfile
 
 from .scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 
@@ -94,3 +98,62 @@ def render_environment_file(values: Mapping[str, str]) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         lines.append(f'{key}="{escaped}"')
     return "\n".join(lines) + "\n"
+
+
+def build_trusted_enrichment_profile(configuration, principal_ref: str, pipeline_key: str) -> dict[str, str]:
+    """Derive DB and per-Scope secret refs from trusted configuration."""
+    if pipeline_key not in CANONICAL_SCOPED_ENRICHMENTS:
+        raise ValueError("UNKNOWN_ENRICHMENT_PIPELINE")
+    db_env = configuration.router.database_environment_key(principal_ref)
+    environment = configuration.environment
+    values = {
+        "PDI_PRINCIPAL_REF": principal_ref,
+        "PDI_SCOPED_PIPELINE_KEY": pipeline_key,
+        db_env: environment.get(db_env, ""),
+    }
+    provider = "nextcloud" if pipeline_key.startswith("enrichment.nextcloud_") else (
+        "immich" if pipeline_key == "enrichment.immich_ocr" else None
+    )
+    if provider is None:
+        if not values[db_env]:
+            raise ValueError("DATABASE_BINDING_MISSING")
+        return values
+    selected = [binding for (principal, _), binding in configuration.bindings.items()
+                if str(principal) == principal_ref and binding.provider_type == provider]
+    if not selected:
+        raise ValueError("REQUIRED_SCOPE_BINDING_MISSING")
+    for binding in selected:
+        if not binding.secret_env or not environment.get(binding.secret_env):
+            raise ValueError("REQUIRED_SCOPE_SECRET_MISSING")
+        if binding.secret_env in values and values[binding.secret_env] != environment[binding.secret_env]:
+            raise ValueError("CONFLICTING_SECRET_REF")
+        values[binding.secret_env] = environment[binding.secret_env]
+    return values
+
+
+def install_environment_file(path: Path, values: Mapping[str, str]) -> str:
+    """Atomically install a root-controlled 0600 EnvironmentFile and verify it."""
+    if path.is_symlink() or not path.parent.is_dir():
+        raise ValueError("ENVFILE_PATH_UNTRUSTED")
+    for parent in (path.parent, *path.parent.parents):
+        info = parent.stat()
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("ENVFILE_PARENT_UNTRUSTED")
+    content = render_environment_file(values)
+    fd, temp_name = tempfile.mkstemp(prefix=".pdi-env-", dir=path.parent)
+    try:
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+        installed = path.lstat()
+        if (stat.S_ISLNK(installed.st_mode) or installed.st_uid != 0 or
+                installed.st_gid != 0 or stat.S_IMODE(installed.st_mode) != 0o600 or
+                path.read_text() != content):
+            raise ValueError("ENVFILE_VERIFY_FAILED")
+    finally:
+        Path(temp_name).unlink(missing_ok=True)
+    return content

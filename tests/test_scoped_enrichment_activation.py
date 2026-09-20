@@ -165,7 +165,7 @@ def test_cleanup_failure_is_not_reported_as_aborted():
 
 
 def test_p3d_control_requires_preflight_and_records_fail_closed_abort(tmp_path):
-    control = P3DControl(tmp_path / "state.json", tmp_path / "journal", "abc", tmp_path / "release")
+    control = P3DControl(tmp_path / "state.json", tmp_path / "journal", "abc", tmp_path / "release", tmp_path / "cutover.lock")
     with pytest.raises(P3DControlRefused, match="QUALIFICATION_ORDER_INVALID"):
         control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS})
     evidence = {

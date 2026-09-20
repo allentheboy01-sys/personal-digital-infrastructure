@@ -50,6 +50,17 @@ class PrincipalDatabaseRouter:
             )
         return binding
 
+    def database_environment_key(self, principal_id: PrincipalId | str) -> str:
+        """Resolve only the database secret reference for profile generation."""
+        parsed = principal_id if isinstance(principal_id, PrincipalId) else PrincipalId(principal_id)
+        principal = self._principals.get(parsed)
+        if principal is None:
+            raise UnknownPrincipalError("Principal is unknown")
+        key = self._databases.url_env(principal.database_ref)
+        if key is None:
+            raise UnknownDatabaseBindingError("database binding is unknown")
+        return key
+
     @classmethod
     def explicit_single_user(
         cls,
