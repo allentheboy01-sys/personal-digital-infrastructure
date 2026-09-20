@@ -31,7 +31,9 @@ ENRICHMENT_SCHEDULES = {
 
 class ActivationState(StrEnum):
     PRECHECK = "precheck"
+    PREFLIGHT_PASSED = "preflight_passed"
     QUALIFIED = "qualified"
+    ACTIVATING = "activating"
     ACTIVE = "active"
     ABORTED = "aborted"
 
@@ -59,9 +61,10 @@ class ScopedEnrichmentActivation:
             raise EnrichmentActivationRefused("PRECHECK_ALREADY_CONSUMED")
         if not self.actions.preflight():
             raise EnrichmentActivationRefused("PREFLIGHT_FAILED")
+        self.state = ActivationState.PREFLIGHT_PASSED
 
     def qualify(self) -> None:
-        if self.state is not ActivationState.PRECHECK:
+        if self.state is not ActivationState.PREFLIGHT_PASSED:
             raise EnrichmentActivationRefused("QUALIFICATION_ORDER_INVALID")
         if not self.actions.qualify(CANONICAL_SCOPED_ENRICHMENTS):
             raise EnrichmentActivationRefused("QUALIFICATION_FAILED")
@@ -70,11 +73,25 @@ class ScopedEnrichmentActivation:
     def activate(self) -> None:
         if self.state is not ActivationState.QUALIFIED:
             raise EnrichmentActivationRefused("ACTIVATION_REQUIRES_QUALIFICATION")
-        self.actions.enable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
+        self.state = ActivationState.ACTIVATING
+        try:
+            self.actions.enable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
+        except BaseException as error:
+            try:
+                self.actions.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
+            finally:
+                self.state = ActivationState.ABORTED
+            raise EnrichmentActivationRefused("ACTIVATION_FAILED") from error
         self.state = ActivationState.ACTIVE
 
     def abort(self) -> None:
-        if self.state is ActivationState.ACTIVE:
+        if self.state in {
+            ActivationState.PREFLIGHT_PASSED,
+            ActivationState.QUALIFIED,
+            ActivationState.ACTIVATING,
+            ActivationState.ACTIVE,
+            ActivationState.ABORTED,
+        }:
             self.actions.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
         self.state = ActivationState.ABORTED
 
