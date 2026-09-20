@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from contextlib import contextmanager
 import fcntl
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -66,10 +67,12 @@ class SystemdScopedEnrichmentActions:
     def disable_scoped_enrichments(self, pipeline_keys: tuple[str, ...]) -> bool:
         if set(pipeline_keys) != set(CANONICAL_SCOPED_ENRICHMENTS):
             return False
+        command_failed = False
         for key in CANONICAL_SCOPED_ENRICHMENTS:
             if not self._call("disable", "--now", P3D_TIMER_UNITS[key]):
-                return False
-        return self.preflight()
+                command_failed = True
+        verified = self.preflight()
+        return not command_failed and verified
 
 
 class P3DControlRefused(RuntimeError):
@@ -93,7 +96,7 @@ def verify_release(path: Path, expected_sha: str, *, runner=subprocess.run) -> b
         return False
 
 
-def validate_rollback_metadata(metadata: dict[str, str], *, expected_sha: str) -> bool:
+def validate_rollback_metadata(metadata: dict[str, str], *, rollback_source_sha: str) -> bool:
     """Validate a fresh, post-soak rollback record without trusting booleans."""
     required = {
         "SNAPSHOT_ID", "SOURCE_SHA", "ALEMBIC", "POSTGRES_MAJOR", "P3C_PRODUCTION_ENABLED",
@@ -104,12 +107,17 @@ def validate_rollback_metadata(metadata: dict[str, str], *, expected_sha: str) -
         return False
     return (
         bool(metadata["SNAPSHOT_ID"]) and len(metadata["SOURCE_SHA"]) == 40 and
-        metadata["SOURCE_SHA"] == expected_sha and metadata["ALEMBIC"] == "e5a7b9d1f324" and
+        metadata["SOURCE_SHA"] == rollback_source_sha and metadata["ALEMBIC"] == "e5a7b9d1f324" and
         metadata["POSTGRES_MAJOR"] == "16" and metadata["P3C_PRODUCTION_ENABLED"] == "YES" and
         metadata["P3C_SOAK"] == "PASS" and metadata["RESTORE_TESTED"] == "YES" and
         metadata["RESTORED_COUNTS_MATCH"] == "YES" and bool(metadata["BACKUP_FS_UUID"]) and
         bool(metadata["RESTIC_REPOSITORY"])
     )
+
+
+def context_fingerprint(context: dict[str, object]) -> str:
+    payload = json.dumps(context, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def promote_release_atomically(current: Path, release: Path, expected_sha: str) -> str:
@@ -150,8 +158,11 @@ class ProductionEvidenceReader:
 
     def __init__(self, *, release: Path, expected_sha: str, current: Path = Path("/opt/pdi/current"),
                  rollback_metadata: Path = Path("/etc/pdi-backup-recovery/pdi-core/p3d-pre-enrichment.env"),
-                 config: Path = Path("/etc/pdi/scoped/registry.toml"), runner=subprocess.run):
+                 config: Path = Path("/etc/pdi/scoped/registry.toml"), runner=subprocess.run,
+                 previous_sha: str | None = None, rollback_source_sha: str | None = None):
         self.release, self.expected_sha, self.current = release, expected_sha, current
+        self.previous_sha = previous_sha
+        self.rollback_source_sha = rollback_source_sha or previous_sha or expected_sha
         self.rollback_metadata, self.config, self.runner = rollback_metadata, config, runner
 
     def _unit_ok(self, unit: str, enabled: bool) -> bool:
@@ -161,10 +172,13 @@ class ProductionEvidenceReader:
             return result.returncode == 0
         return check("is-enabled") == enabled and check("is-active") == enabled
 
-    def collect(self) -> dict[str, object]:
+    def collect_preflight(self) -> dict[str, object]:
         if not verify_release(self.release, self.expected_sha, runner=self.runner):
             raise P3DControlRefused("RELEASE_VERIFICATION_FAILED")
-        if not self.current.is_symlink() or self.current.resolve() != self.release:
+        if not self.current.is_symlink():
+            raise P3DControlRefused("CURRENT_RELEASE_CONTEXT_MISMATCH")
+        current_name = self.current.resolve().name
+        if current_name not in {self.expected_sha, self.previous_sha} - {None}:
             raise P3DControlRefused("CURRENT_RELEASE_CONTEXT_MISMATCH")
         if any(not self._unit_ok(unit, True) for unit in self.P3C_TIMERS):
             raise P3DControlRefused("P3C_WRITER_UNHEALTHY")
@@ -180,7 +194,7 @@ class ProductionEvidenceReader:
             key, sep, value = line.partition("=")
             if sep:
                 raw[key] = value
-        if not validate_rollback_metadata(raw, expected_sha=self.expected_sha):
+        if not validate_rollback_metadata(raw, rollback_source_sha=self.rollback_source_sha):
             raise P3DControlRefused("ROLLBACK_METADATA_INVALID")
         try:
             data = tomllib.loads(self.config.read_text())
@@ -192,6 +206,25 @@ class ProductionEvidenceReader:
                 "p3c_pass": True, "writers_healthy": True,
                 "legacy_enrichment_disabled": True, "p3d_timers_off": True,
                 "gmail_disabled": True, "rollback_qualified": True}
+
+    def collect_active_verify(self) -> dict[str, object]:
+        if not verify_release(self.release, self.expected_sha, runner=self.runner):
+            raise P3DControlRefused("RELEASE_VERIFICATION_FAILED")
+        if not self.current.is_symlink() or self.current.resolve() != self.release:
+            raise P3DControlRefused("CURRENT_RELEASE_CONTEXT_MISMATCH")
+        if any(not self._unit_ok(unit, True) for unit in self.P3C_TIMERS):
+            raise P3DControlRefused("P3C_WRITER_UNHEALTHY")
+        if any(not self._unit_ok(unit, False) for unit in self.LEGACY_TIMERS):
+            raise P3DControlRefused("LEGACY_TIMER_NOT_QUIET")
+        backend = SystemdScopedEnrichmentActions(self.runner)
+        if not all(backend.is_enabled(key) and backend.is_active(key)
+                   for key in CANONICAL_SCOPED_ENRICHMENTS):
+            raise P3DControlRefused("P3D_TIMER_NOT_ACTIVE")
+        return {"release_sha": self.expected_sha, "release_path": str(self.release),
+                "p3c_healthy": True, "p3d_healthy": True}
+
+    # Compatibility alias for callers still using the pre-activation name.
+    collect = collect_preflight
 
 
 @dataclass
@@ -277,17 +310,20 @@ class P3DControl:
             raise P3DControlRefused("PREFLIGHT_EVIDENCE_INCOMPLETE")
         state = {"state": "PREFLIGHT_PASSED", "release_sha": self.expected_sha,
                  "release_path": str(self.release_path), "evidence": evidence}
+        state["context_fingerprint"] = context_fingerprint(evidence)
         self._write(state)
         self._record("PREFLIGHT_PASSED", state)
 
-    def qualify(self, results: dict[str, bool]) -> None:
+    def qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None) -> None:
         with self.control_lock():
-            self._qualify(results)
+            self._qualify(results, context=context)
 
-    def _qualify(self, results: dict[str, bool]) -> None:
+    def _qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None) -> None:
         state = self._read()
         if state.get("state") != "PREFLIGHT_PASSED":
             raise P3DControlRefused("QUALIFICATION_ORDER_INVALID")
+        if context is not None and state.get("context_fingerprint") != context_fingerprint(context):
+            raise P3DControlRefused("CONTEXT_DRIFT")
         if set(results) != set(CANONICAL_SCOPED_ENRICHMENTS) or not all(results.values()):
             raise P3DControlRefused("QUALIFICATION_FAILED")
         state["state"] = "QUALIFIED"
@@ -295,14 +331,18 @@ class P3DControl:
         self._write(state)
         self._record("QUALIFIED", state)
 
-    def activation_result(self, *, enabled: bool, all_disabled: bool) -> None:
+    def activation_result(self, *, enabled: bool, all_disabled: bool,
+                          context: dict[str, object] | None = None) -> None:
         with self.control_lock():
-            self._activation_result(enabled=enabled, all_disabled=all_disabled)
+            self._activation_result(enabled=enabled, all_disabled=all_disabled, context=context)
 
-    def _activation_result(self, *, enabled: bool, all_disabled: bool) -> None:
+    def _activation_result(self, *, enabled: bool, all_disabled: bool,
+                           context: dict[str, object] | None = None) -> None:
         state = self._read()
         if state.get("state") != "QUALIFIED":
             raise P3DControlRefused("ACTIVATION_ORDER_INVALID")
+        if context is not None and state.get("context_fingerprint") != context_fingerprint(context):
+            raise P3DControlRefused("CONTEXT_DRIFT")
         if not enabled:
             if not all_disabled:
                 state["state"] = "ABORT_NOT_CONFIRMED"

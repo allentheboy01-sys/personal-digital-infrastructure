@@ -16,7 +16,10 @@ from pdi.scoped_enrichment_profiles import (
     profile_keys,
     render_environment_file,
 )
-from pdi.production_ops.enrichment_cutover import P3DControl, P3DControlRefused
+from pdi.production_ops.enrichment_cutover import (
+    P3DControl, P3DControlRefused, P3D_TIMER_UNITS, SystemdScopedEnrichmentActions,
+    validate_rollback_metadata,
+)
 
 
 class Actions:
@@ -178,6 +181,53 @@ def test_p3d_control_requires_preflight_and_records_fail_closed_abort(tmp_path):
     with pytest.raises(P3DControlRefused, match="ABORT_NOT_CONFIRMED"):
         control.abort(all_disabled=False)
     assert '"state": "ABORT_NOT_CONFIRMED"' in (tmp_path / "state.json").read_text()
+
+
+@pytest.mark.parametrize("failure_index", (0, 2, 5))
+def test_systemd_cleanup_attempts_all_timers_after_any_disable_failure(failure_index):
+    calls = []
+    disabled = set()
+    units = tuple(P3D_TIMER_UNITS.values())
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        action, unit = argv[1], argv[-1]
+        if action == "disable":
+            index = units.index(unit)
+            if index == failure_index:
+                return type("R", (), {"returncode": 1})()
+            disabled.add(unit)
+            return type("R", (), {"returncode": 0})()
+        if action == "is-enabled":
+            return type("R", (), {"returncode": 0 if unit not in disabled else 1})()
+        if action == "is-active":
+            return type("R", (), {"returncode": 0 if unit not in disabled else 1})()
+        return type("R", (), {"returncode": 0})()
+    backend = SystemdScopedEnrichmentActions(runner)
+    assert backend.disable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS) is False
+    attempted = [call[-1] for call in calls if call[1] == "disable"]
+    assert attempted == list(units)
+
+
+def test_rollback_source_sha_is_separate_from_candidate():
+    assert validate_rollback_metadata({
+        "SNAPSHOT_ID": "snapshot", "SOURCE_SHA": "a" * 40,
+        "ALEMBIC": "e5a7b9d1f324", "POSTGRES_MAJOR": "16",
+        "P3C_PRODUCTION_ENABLED": "YES", "P3C_SOAK": "PASS",
+        "RESTORE_TESTED": "YES", "RESTORED_COUNTS_MATCH": "YES",
+        "BACKUP_FS_UUID": "uuid", "RESTIC_REPOSITORY": "repo",
+    }, rollback_source_sha="a" * 40)
+
+
+def test_active_state_can_be_verified_with_active_context(tmp_path):
+    control = P3DControl(tmp_path / "state.json", tmp_path / "journal", "abc", tmp_path / "release", tmp_path / "lock")
+    context = {"release_sha": "abc", "release_path": str(tmp_path / "release"), "p3c_pass": True,
+               "writers_healthy": True, "legacy_enrichment_disabled": True,
+               "p3d_timers_off": True, "gmail_disabled": True, "rollback_qualified": True}
+    control.preflight(context)
+    control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS}, context=context)
+    control.activation_result(enabled=True, all_disabled=False, context=context)
+    control.verify({"p3c_healthy": True, "p3d_healthy": True})
+    assert '"verified": true' in (tmp_path / "state.json").read_text()
 
 
 def test_abort_is_idempotent_from_qualified_state():
