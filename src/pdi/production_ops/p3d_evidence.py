@@ -1,0 +1,118 @@
+"""Fail-closed P3D evidence readers for protected journals and routed DBs."""
+
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import stat
+from datetime import datetime
+
+from sqlalchemy import text
+
+from pdi.provider_identity import PostgreSQLProviderIdentityRepository
+from pdi.scoped_enrichment_profiles import derive_enabled_scope_ids
+from .enrichment_cutover import P3DControlRefused, context_fingerprint
+
+
+def read_p3c_journal(path: Path, *, expected_sha: str, expected_context: str) -> dict:
+    """Read exactly one current PASS record from a protected JSONL journal."""
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise P3DControlRefused("P3C_JOURNAL_UNTRUSTED")
+        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except (OSError, ValueError, json.JSONDecodeError):
+        raise P3DControlRefused("P3C_JOURNAL_UNREADABLE") from None
+    matching = [record for record in records if isinstance(record, dict)
+                and record.get("phase") == "PASS"
+                and record.get("release_sha") == expected_sha
+                and record.get("context_fingerprint") == expected_context]
+    if len(matching) != 1:
+        raise P3DControlRefused("P3C_JOURNAL_EVIDENCE_INVALID")
+    if any(record.get("phase") == "PASS" and record is not matching[0] for record in records):
+        raise P3DControlRefused("P3C_JOURNAL_DUPLICATE")
+    return matching[0]
+
+
+@dataclass(frozen=True)
+class PersonalDatabaseEvidence:
+    principal_ref: str
+    database_ref: str
+    database_url: str
+    enabled_scope_ids: frozenset[str]
+    identity_fingerprint: str
+
+
+class RoutedPersonalDatabaseEvidenceReader:
+    """Read-only checks through the trusted PrincipalDatabaseRouter."""
+
+    def __init__(self, router, engine, *, principal_ref: str):
+        self.router = router
+        self.engine = engine
+        self.principal_ref = principal_ref
+
+    def collect(self) -> PersonalDatabaseEvidence:
+        try:
+            binding = self.router.resolve(self.principal_ref)
+            if binding.database_url != str(self.engine.url):
+                raise P3DControlRefused("ROUTE_TARGET_MISMATCH")
+            with self.engine.connect() as connection:
+                revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+                if revision != "e5a7b9d1f324":
+                    raise P3DControlRefused("ALEMBIC_MISMATCH")
+                null_scope = connection.scalar(text(
+                    "SELECT count(*) FROM asset_sources WHERE observation_scope_id IS NULL"))
+                duplicate = connection.scalar(text(
+                    "SELECT count(*) FROM (SELECT observation_scope_id, external_id "
+                    "FROM asset_sources GROUP BY observation_scope_id, external_id HAVING count(*) > 1) d"))
+                sync_rows = connection.execute(text(
+                    "SELECT count(*), count(*) FILTER (WHERE checkpoint IS NOT NULL), "
+                    "count(*) FILTER (WHERE NOT reconciliation_required) FROM observation_scope_sync_state"
+                )).one()
+                if null_scope != 0 or duplicate != 0 or tuple(sync_rows) != (2, 2, 2):
+                    raise P3DControlRefused("PERSONAL_DB_INVARIANT_FAILED")
+            repository = PostgreSQLProviderIdentityRepository(self.engine)
+            instances = repository.list_instances()
+            expected = {"nextcloud": True, "immich": True, "gmail": False, "integration-test": False}
+            actual = {}
+            for instance in instances:
+                if instance.provider_type in expected:
+                    if instance.provider_type in actual:
+                        raise P3DControlRefused("IDENTITY_DUPLICATE")
+                    actual[instance.provider_type] = instance.enabled
+            if actual != expected:
+                raise P3DControlRefused("IDENTITY_STATE_MISMATCH")
+            scope_ids = derive_enabled_scope_ids(self.engine)
+            fingerprint = context_fingerprint({"principal": self.principal_ref,
+                                                "database_ref": binding.database_ref,
+                                                "scopes": sorted(map(str, scope_ids))})
+            return PersonalDatabaseEvidence(self.principal_ref, binding.database_ref,
+                                            binding.database_url,
+                                            frozenset(map(str, scope_ids)), fingerprint)
+        except P3DControlRefused:
+            raise
+        except Exception:
+            raise P3DControlRefused("PERSONAL_DB_UNAVAILABLE") from None
+
+
+def verify_qualification_ledger_batch(engine, *, started_after: datetime,
+                                      pipeline_keys: tuple[str, ...],
+                                      candidate_sha: str,
+                                      context: dict[str, object]) -> tuple[dict[str, str], ...]:
+    """Require exactly one completed, fresh run for every canonical key."""
+    expected_context = context_fingerprint(context)
+    results = []
+    with engine.connect() as connection:
+        for key in pipeline_keys:
+            rows = connection.execute(text(
+                "SELECT id, status, finished_at, error_code FROM pipeline_runs "
+                "WHERE pipeline_key=:key AND started_at > :after ORDER BY started_at"
+            ), {"key": key, "after": started_after}).all()
+            if len(rows) != 1:
+                raise P3DControlRefused("QUALIFICATION_LEDGER_COVERAGE")
+            run_id, status, finished_at, error_code = rows[0]
+            if status != "completed" or finished_at is None or error_code is not None:
+                raise P3DControlRefused("QUALIFICATION_LEDGER_FAILED")
+            results.append({"pipeline_key": key, "run_id": str(run_id),
+                            "candidate_sha": candidate_sha,
+                            "context_fingerprint": expected_context})
+    return tuple(results)

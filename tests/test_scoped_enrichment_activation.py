@@ -21,6 +21,7 @@ from pdi.production_ops.enrichment_cutover import (
     validate_rollback_metadata,
     install_systemd_assets,
 )
+from pdi.production_ops.p3d_evidence import RoutedPersonalDatabaseEvidenceReader, read_p3c_journal
 
 
 class Actions:
@@ -246,6 +247,23 @@ def test_systemd_assets_install_without_activation(tmp_path):
     assert (units / "pdi-scoped-pipeline@.service").exists()
     assert len(list(profiles.glob("*.env"))) == 6
     assert calls and calls[0][0:2] == ("systemd-analyze", "verify")
+
+
+def test_p3c_journal_rejects_missing_or_duplicate_proof(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    path.write_text('{"phase":"PASS","release_sha":"candidate","context_fingerprint":"ctx"}\n')
+    with pytest.raises(Exception):
+        read_p3c_journal(path, expected_sha="candidate", expected_context="ctx")
+
+
+def test_routed_db_reader_fails_closed_when_route_is_unavailable():
+    class Router:
+        def resolve(self, _principal):
+            raise RuntimeError("unavailable")
+    class Engine:
+        url = "postgresql://synthetic"
+    with pytest.raises(Exception):
+        RoutedPersonalDatabaseEvidenceReader(Router(), Engine(), principal_ref="primary").collect()
 
 
 def test_abort_is_idempotent_from_qualified_state():

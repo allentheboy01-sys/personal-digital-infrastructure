@@ -35,8 +35,9 @@ P3D_UNIT_FILES = ("pdi-scoped-pipeline@.service",) + tuple(
 class SystemdScopedEnrichmentActions:
     """Allow-listed systemd backend; P3C writer units are unreachable here."""
 
-    def __init__(self, runner=subprocess.run):
+    def __init__(self, runner=subprocess.run, ledger_verifier=None):
         self._runner = runner
+        self._ledger_verifier = ledger_verifier
 
     def _call(self, *args: str) -> bool:
         result = self._runner(("systemctl", *args), capture_output=True, text=True,
@@ -57,6 +58,8 @@ class SystemdScopedEnrichmentActions:
         for key in pipeline_keys:
             service = f"pdi-scoped-pipeline@{key}.service"
             if not self._call("start", service):
+                return False
+            if self._ledger_verifier is not None and not self._ledger_verifier(key):
                 return False
         return self.preflight()
 
