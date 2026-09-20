@@ -219,11 +219,14 @@ class ProductionEvidenceReader:
     def __init__(self, *, release: Path, expected_sha: str, current: Path = Path("/opt/pdi/current"),
                  rollback_metadata: Path = Path("/etc/pdi-backup-recovery/pdi-core/p3d-pre-enrichment.env"),
                  config: Path = Path("/etc/pdi/scoped/registry.toml"), runner=subprocess.run,
-                 previous_sha: str | None = None, rollback_source_sha: str | None = None):
+                 previous_sha: str | None = None, rollback_source_sha: str | None = None,
+                 p3c_journal: Path = Path("/var/lib/pdi-p3c/journal.jsonl"),
+                 personal_db_reader=None):
         self.release, self.expected_sha, self.current = release, expected_sha, current
         self.previous_sha = previous_sha
         self.rollback_source_sha = rollback_source_sha or previous_sha or expected_sha
         self.rollback_metadata, self.config, self.runner = rollback_metadata, config, runner
+        self.p3c_journal, self.personal_db_reader = p3c_journal, personal_db_reader
 
     def _unit_ok(self, unit: str, enabled: bool) -> bool:
         def check(action):
@@ -233,6 +236,7 @@ class ProductionEvidenceReader:
         return check("is-enabled") == enabled and check("is-active") == enabled
 
     def collect_preflight(self) -> dict[str, object]:
+        from .p3d_evidence import read_p3c_journal
         if not verify_release(self.release, self.expected_sha, runner=self.runner):
             raise P3DControlRefused("RELEASE_VERIFICATION_FAILED")
         if not self.current.is_symlink():
@@ -244,6 +248,9 @@ class ProductionEvidenceReader:
             raise P3DControlRefused("P3C_WRITER_UNHEALTHY")
         if any(not self._unit_ok(unit, False) for unit in self.LEGACY_TIMERS):
             raise P3DControlRefused("LEGACY_TIMER_NOT_QUIET")
+        if self.previous_sha is None:
+            raise P3DControlRefused("P3C_SOURCE_SHA_MISSING")
+        p3c_record = read_p3c_journal(self.p3c_journal, expected_sha=self.previous_sha)
         backend = SystemdScopedEnrichmentActions(self.runner)
         if not backend.preflight():
             raise P3DControlRefused("P3D_TIMER_NOT_OFF")
@@ -256,6 +263,9 @@ class ProductionEvidenceReader:
                 raw[key] = value
         if not validate_rollback_metadata(raw, rollback_source_sha=self.rollback_source_sha):
             raise P3DControlRefused("ROLLBACK_METADATA_INVALID")
+        if self.personal_db_reader is None:
+            raise P3DControlRefused("PERSONAL_DB_READER_MISSING")
+        db_evidence = self.personal_db_reader.collect()
         try:
             data = tomllib.loads(self.config.read_text())
         except (OSError, tomllib.TOMLDecodeError):
@@ -265,7 +275,10 @@ class ProductionEvidenceReader:
         return {"release_sha": self.expected_sha, "release_path": str(self.release),
                 "p3c_pass": True, "writers_healthy": True,
                 "legacy_enrichment_disabled": True, "p3d_timers_off": True,
-                "gmail_disabled": True, "rollback_qualified": True}
+                "gmail_disabled": True, "rollback_qualified": True,
+                "p3c_context": p3c_record.get("context_fingerprint"),
+                "db_route": db_evidence.database_ref,
+                "enabled_scope_ids": sorted(db_evidence.enabled_scope_ids)}
 
     def collect_active_verify(self) -> dict[str, object]:
         if not verify_release(self.release, self.expected_sha, runner=self.runner):
@@ -374,11 +387,13 @@ class P3DControl:
         self._write(state)
         self._record("PREFLIGHT_PASSED", state)
 
-    def qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None) -> None:
+    def qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None,
+                ledger: tuple[dict[str, str], ...] | None = None) -> None:
         with self.control_lock():
-            self._qualify(results, context=context)
+            self._qualify(results, context=context, ledger=ledger)
 
-    def _qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None) -> None:
+    def _qualify(self, results: dict[str, bool], *, context: dict[str, object] | None = None,
+                 ledger: tuple[dict[str, str], ...] | None = None) -> None:
         state = self._read()
         if state.get("state") != "PREFLIGHT_PASSED":
             raise P3DControlRefused("QUALIFICATION_ORDER_INVALID")
@@ -386,8 +401,15 @@ class P3DControl:
             raise P3DControlRefused("CONTEXT_DRIFT")
         if set(results) != set(CANONICAL_SCOPED_ENRICHMENTS) or not all(results.values()):
             raise P3DControlRefused("QUALIFICATION_FAILED")
+        if ledger is not None:
+            if {item.get("pipeline_key") for item in ledger} != set(CANONICAL_SCOPED_ENRICHMENTS):
+                raise P3DControlRefused("QUALIFICATION_LEDGER_COVERAGE")
+            if any(item.get("candidate_sha") != self.expected_sha for item in ledger):
+                raise P3DControlRefused("QUALIFICATION_LEDGER_SHA_MISMATCH")
         state["state"] = "QUALIFIED"
         state["qualification"] = {key: True for key in CANONICAL_SCOPED_ENRICHMENTS}
+        if ledger is not None:
+            state["qualification_ledger"] = list(ledger)
         self._write(state)
         self._record("QUALIFIED", state)
 

@@ -9,11 +9,12 @@ from datetime import datetime
 from sqlalchemy import text
 
 from pdi.provider_identity import PostgreSQLProviderIdentityRepository
+from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 from pdi.scoped_enrichment_profiles import derive_enabled_scope_ids
 from .enrichment_cutover import P3DControlRefused, context_fingerprint
 
 
-def read_p3c_journal(path: Path, *, expected_sha: str, expected_context: str) -> dict:
+def read_p3c_journal(path: Path, *, expected_sha: str, expected_context: str | None = None) -> dict:
     """Read exactly one current PASS record from a protected JSONL journal."""
     try:
         info = path.lstat()
@@ -25,7 +26,8 @@ def read_p3c_journal(path: Path, *, expected_sha: str, expected_context: str) ->
     matching = [record for record in records if isinstance(record, dict)
                 and record.get("phase") == "PASS"
                 and record.get("release_sha") == expected_sha
-                and record.get("context_fingerprint") == expected_context]
+                and record.get("context_fingerprint")
+                and (expected_context is None or record.get("context_fingerprint") == expected_context)]
     if len(matching) != 1:
         raise P3DControlRefused("P3C_JOURNAL_EVIDENCE_INVALID")
     if any(record.get("phase") == "PASS" and record is not matching[0] for record in records):
@@ -99,6 +101,8 @@ def verify_qualification_ledger_batch(engine, *, started_after: datetime,
                                       candidate_sha: str,
                                       context: dict[str, object]) -> tuple[dict[str, str], ...]:
     """Require exactly one completed, fresh run for every canonical key."""
+    if set(pipeline_keys) != set(CANONICAL_SCOPED_ENRICHMENTS):
+        raise P3DControlRefused("QUALIFICATION_LEDGER_COVERAGE")
     expected_context = context_fingerprint(context)
     results = []
     with engine.connect() as connection:

@@ -1,11 +1,18 @@
 """P3D operator cutover; production facts come from protected backends."""
 import argparse
+import os
+import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pdi.production_ops.enrichment_cutover import (
     P3DControl, P3DControlRefused, ProductionEvidenceReader,
     SystemdScopedEnrichmentActions, promote_release_atomically,
 )
+from pdi.database import create_postgres_engine
+from pdi.scoped_operator_config import load_scoped_operator_configuration
+from pdi.production_ops.p3d_evidence import RoutedPersonalDatabaseEvidenceReader
+from pdi.production_ops.p3d_evidence import verify_qualification_ledger_batch
 from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 
 
@@ -33,20 +40,38 @@ def main(argv=None):
             current = Path("/opt/pdi/current")
             rollback = Path("/etc/pdi-backup-recovery/pdi-core/p3d-pre-enrichment.env")
             config = Path("/etc/pdi/scoped/registry.toml")
+        raw_config = tomllib.loads(config.read_text())
+        principals = raw_config.get("principals", [])
+        if len(principals) != 1 or not principals[0].get("enabled", False):
+            raise P3DControlRefused("PRINCIPAL_INVARIANT_FAILED")
+        principal_ref = principals[0]["id"]
+        operator_config = load_scoped_operator_configuration(config, environment=os.environ)
+        routed = operator_config.router.resolve(principal_ref)
+        db_engine = create_postgres_engine(routed.database_url)
+        personal_db_reader = RoutedPersonalDatabaseEvidenceReader(
+            operator_config.router, db_engine, principal_ref=principal_ref
+        )
         control = P3DControl(state, journal, args.expected_sha, args.release, lock)
         reader = ProductionEvidenceReader(
             release=args.release, expected_sha=args.expected_sha, current=current,
             rollback_metadata=rollback, config=config, previous_sha=args.rollback_source_sha,
-            rollback_source_sha=args.rollback_source_sha,
+            rollback_source_sha=args.rollback_source_sha, personal_db_reader=personal_db_reader,
         )
         backend = SystemdScopedEnrichmentActions()
         if args.action == "preflight":
             control.preflight(reader.collect_preflight())
         elif args.action == "qualify":
             context = reader.collect_preflight()
+            qualification_started = datetime.now(UTC)
             if not backend.qualify(tuple(CANONICAL_SCOPED_ENRICHMENTS)):
                 raise P3DControlRefused("QUALIFICATION_FAILED")
-            control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS}, context=context)
+            ledger = verify_qualification_ledger_batch(
+                db_engine, started_after=qualification_started,
+                pipeline_keys=CANONICAL_SCOPED_ENRICHMENTS,
+                candidate_sha=args.expected_sha, context=context,
+            )
+            control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS},
+                            context=context, ledger=ledger)
         elif args.action == "activate":
             context = reader.collect_preflight()
             try:
@@ -63,9 +88,16 @@ def main(argv=None):
             context = reader.collect_preflight()
             control.preflight(context)
             promote_release_atomically(current, args.release, args.expected_sha)
+            qualification_started = datetime.now(UTC)
             if not backend.qualify(tuple(CANONICAL_SCOPED_ENRICHMENTS)):
                 raise P3DControlRefused("QUALIFICATION_FAILED")
-            control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS}, context=context)
+            ledger = verify_qualification_ledger_batch(
+                db_engine, started_after=qualification_started,
+                pipeline_keys=CANONICAL_SCOPED_ENRICHMENTS,
+                candidate_sha=args.expected_sha, context=context,
+            )
+            control.qualify({key: True for key in CANONICAL_SCOPED_ENRICHMENTS},
+                            context=context, ledger=ledger)
             backend.enable_scoped_enrichments(CANONICAL_SCOPED_ENRICHMENTS)
             control.activation_result(enabled=True, all_disabled=False, context=context)
         else:

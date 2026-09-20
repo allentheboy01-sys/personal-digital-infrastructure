@@ -21,7 +21,11 @@ from pdi.production_ops.enrichment_cutover import (
     validate_rollback_metadata,
     install_systemd_assets,
 )
-from pdi.production_ops.p3d_evidence import RoutedPersonalDatabaseEvidenceReader, read_p3c_journal
+from pdi.production_ops.p3d_evidence import (
+    RoutedPersonalDatabaseEvidenceReader,
+    read_p3c_journal,
+    verify_qualification_ledger_batch,
+)
 
 
 class Actions:
@@ -264,6 +268,23 @@ def test_routed_db_reader_fails_closed_when_route_is_unavailable():
         url = "postgresql://synthetic"
     with pytest.raises(Exception):
         RoutedPersonalDatabaseEvidenceReader(Router(), Engine(), principal_ref="primary").collect()
+
+
+def test_qualification_ledger_requires_all_six_keys():
+    class Connection:
+        def execute(self, *_args, **_kwargs):
+            return type("Rows", (), {"all": lambda self: [("run", "completed", "finished", None)]})()
+    class Engine:
+        def connect(self):
+            class Context:
+                def __enter__(self): return Connection()
+                def __exit__(self, *args): return False
+            return Context()
+    with pytest.raises(Exception):
+        verify_qualification_ledger_batch(
+            Engine(), started_after=__import__("datetime").datetime.now(__import__("datetime").UTC),
+            pipeline_keys=CANONICAL_SCOPED_ENRICHMENTS[:-1], candidate_sha="candidate", context={},
+        )
 
 
 def test_abort_is_idempotent_from_qualified_state():
