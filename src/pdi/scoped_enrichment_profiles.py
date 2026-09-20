@@ -139,18 +139,42 @@ def build_trusted_enrichment_profile(
     return values
 
 
-def install_environment_file(path: Path, values: Mapping[str, str]) -> str:
+def derive_enabled_scope_ids(engine, *, provider_types: tuple[str, ...] = ("nextcloud", "immich")) -> set[UUID]:
+    """Derive enabled Scope authority from the routed Personal DB only."""
+    from pdi.provider_identity import PostgreSQLProviderIdentityRepository
+
+    repository = PostgreSQLProviderIdentityRepository(engine)
+    enabled: set[UUID] = set()
+    for instance in repository.list_instances():
+        if instance.provider_type not in provider_types or not instance.enabled:
+            continue
+        accounts = repository.list_accounts_for_instance(instance.id)
+        for scope in repository.list_scopes_for_instance(instance.id):
+            if not scope.enabled:
+                continue
+            if scope.provider_account_id is None:
+                raise ValueError("ENABLED_SCOPE_ACCOUNT_MISSING")
+            account = next((item for item in accounts if item.id == scope.provider_account_id), None)
+            if account is None or not account.enabled:
+                raise ValueError("ENABLED_SCOPE_ACCOUNT_DISABLED")
+            enabled.add(scope.id)
+    return enabled
+
+
+def install_environment_file(path: Path, values: Mapping[str, str], *, allow_test_root: bool = False) -> str:
     """Atomically install a root-controlled 0600 EnvironmentFile and verify it."""
     if path.is_symlink() or not path.parent.is_dir():
         raise ValueError("ENVFILE_PATH_UNTRUSTED")
-    for parent in (path.parent, *path.parent.parents):
+    parents = (path.parent,) if allow_test_root else (path.parent, *path.parent.parents)
+    for parent in parents:
         info = parent.stat()
-        if info.st_uid != 0 or info.st_mode & 0o022:
+        if (not allow_test_root and info.st_uid != 0) or info.st_mode & 0o022:
             raise ValueError("ENVFILE_PARENT_UNTRUSTED")
     content = render_environment_file(values)
     fd, temp_name = tempfile.mkstemp(prefix=".pdi-env-", dir=path.parent)
     try:
-        os.fchown(fd, 0, 0)
+        if not allow_test_root:
+            os.fchown(fd, 0, 0)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
@@ -158,8 +182,9 @@ def install_environment_file(path: Path, values: Mapping[str, str]) -> str:
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
         installed = path.lstat()
-        if (stat.S_ISLNK(installed.st_mode) or installed.st_uid != 0 or
-                installed.st_gid != 0 or stat.S_IMODE(installed.st_mode) != 0o600 or
+        if (stat.S_ISLNK(installed.st_mode) or
+                ((not allow_test_root) and (installed.st_uid != 0 or installed.st_gid != 0)) or
+                stat.S_IMODE(installed.st_mode) != 0o600 or
                 path.read_text() != content):
             raise ValueError("ENVFILE_VERIFY_FAILED")
     finally:

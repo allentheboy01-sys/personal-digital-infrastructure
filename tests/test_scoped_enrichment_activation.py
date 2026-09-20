@@ -19,6 +19,7 @@ from pdi.scoped_enrichment_profiles import (
 from pdi.production_ops.enrichment_cutover import (
     P3DControl, P3DControlRefused, P3D_TIMER_UNITS, SystemdScopedEnrichmentActions,
     validate_rollback_metadata,
+    install_systemd_assets,
 )
 
 
@@ -228,6 +229,23 @@ def test_active_state_can_be_verified_with_active_context(tmp_path):
     control.activation_result(enabled=True, all_disabled=False, context=context)
     control.verify({"p3c_healthy": True, "p3d_healthy": True})
     assert '"verified": true' in (tmp_path / "state.json").read_text()
+
+
+def test_systemd_assets_install_without_activation(tmp_path):
+    source = Path(__file__).parents[1] / "deployment/systemd"
+    units = tmp_path / "units"
+    profiles = tmp_path / "profiles"
+    values = {key: {"PDI_PRINCIPAL_REF": "primary", "PDI_SCOPED_PIPELINE_KEY": key,
+                    "DATABASE__URL": "postgresql://synthetic"}
+              for key in CANONICAL_SCOPED_ENRICHMENTS}
+    calls = []
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        return type("R", (), {"returncode": 0})()
+    assert install_systemd_assets(source, units, profiles, values, runner=runner, allow_test_root=True)
+    assert (units / "pdi-scoped-pipeline@.service").exists()
+    assert len(list(profiles.glob("*.env"))) == 6
+    assert calls and calls[0][0:2] == ("systemd-analyze", "verify")
 
 
 def test_abort_is_idempotent_from_qualified_state():

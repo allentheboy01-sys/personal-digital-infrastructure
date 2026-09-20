@@ -11,8 +11,12 @@ import tempfile
 import os
 import stat
 import tomllib
+import shutil
+from datetime import datetime
+from sqlalchemy import text
 
 from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
+from pdi.scoped_enrichment_profiles import install_environment_file
 
 
 P3D_TIMER_UNITS = {
@@ -23,6 +27,9 @@ P3D_TIMER_UNITS = {
     "enrichment.immich_metadata": "pdi-scoped-enrichment-immich-metadata.timer",
     "enrichment.immich_ocr": "pdi-scoped-enrichment-immich-ocr.timer",
 }
+P3D_UNIT_FILES = ("pdi-scoped-pipeline@.service",) + tuple(
+    unit.removesuffix(".timer") + ".timer" for unit in P3D_TIMER_UNITS.values()
+)
 
 
 class SystemdScopedEnrichmentActions:
@@ -139,6 +146,56 @@ def promote_release_atomically(current: Path, release: Path, expected_sha: str) 
     if current.resolve() != release:
         raise P3DControlRefused("CURRENT_PROMOTION_VERIFY_FAILED")
     return previous
+
+
+def install_systemd_assets(source_dir: Path, unit_dir: Path, profile_dir: Path,
+                           profiles: dict[str, dict[str, str]], *, runner=subprocess.run,
+                           allow_test_root: bool = False) -> bool:
+    """Install exact candidate units/profiles without enabling or starting anything."""
+    if set(profiles) != set(CANONICAL_SCOPED_ENRICHMENTS):
+        raise P3DControlRefused("PROFILE_SET_INVALID")
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (unit_dir, profile_dir):
+        if os.geteuid() == 0:
+            os.chown(directory, 0, 0)
+        os.chmod(directory, 0o700 if directory == profile_dir else 0o755)
+    names = list(P3D_UNIT_FILES)
+    for name in names:
+        source = source_dir / name
+        if not source.is_file() or source.is_symlink():
+            raise P3DControlRefused("SYSTEMD_ASSET_MISSING")
+        target = unit_dir / name
+        temporary = target.with_name(f".{target.name}.p3d-new")
+        shutil.copyfile(source, temporary)
+        if os.geteuid() == 0:
+            os.chown(temporary, 0, 0)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, target)
+    for pipeline, values in profiles.items():
+        install_environment_file(profile_dir / f"{pipeline}.env", values, allow_test_root=allow_test_root)
+    verify = runner(("systemd-analyze", "verify", *(str(unit_dir / name) for name in names)),
+                    capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    if verify.returncode != 0:
+        raise P3DControlRefused("SYSTEMD_ANALYZE_VERIFY_FAILED")
+    return True
+
+
+def verify_qualification_ledger(engine, pipeline_key: str, started_after: datetime,
+                                *, candidate_sha: str, context: dict[str, object]) -> dict[str, str]:
+    """Require exactly one new successful Personal-DB-local PipelineRun."""
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT id, status, finished_at, error_code FROM pipeline_runs "
+            "WHERE pipeline_key=:key AND started_at > :after ORDER BY started_at"
+        ), {"key": pipeline_key, "after": started_after}).all()
+    if len(rows) != 1:
+        raise P3DControlRefused("QUALIFICATION_LEDGER_CARDINALITY")
+    run_id, status, finished_at, error_code = rows[0]
+    if status != "completed" or finished_at is None or error_code is not None:
+        raise P3DControlRefused("QUALIFICATION_LEDGER_FAILED")
+    return {"pipeline_key": pipeline_key, "run_id": str(run_id),
+            "candidate_sha": candidate_sha, "context_fingerprint": context_fingerprint(context)}
 
 
 class ProductionEvidenceReader:
