@@ -1,8 +1,10 @@
 from pathlib import Path
 import shutil
+import stat
 
 import pytest
 
+import pdi.production_ops.enrichment_cutover as enrichment_cutover
 from pdi.scoped_enrichment_activation import (
     ActivationState,
     CANONICAL_SCOPED_ENRICHMENTS,
@@ -268,6 +270,30 @@ def _proof(context, *, sha="abc"):
     }
 
 
+def _test_trusted_path(path, *, expected_kind=None, exact_mode=None,
+                       private=False, require_root_group=False):
+    """Test-only metadata adapter; production always uses real root ownership."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(info.st_mode):
+        return False
+    if expected_kind == "file" and not stat.S_ISREG(info.st_mode):
+        return False
+    if expected_kind == "directory" and not stat.S_ISDIR(info.st_mode):
+        return False
+    if exact_mode is not None and stat.S_IMODE(info.st_mode) != exact_mode:
+        return False
+    return not private or not info.st_mode & 0o007
+
+
+@pytest.fixture
+def static_proof_test_root(monkeypatch):
+    """Allow user-owned tmp assets only inside these unit tests."""
+    monkeypatch.setattr(enrichment_cutover, "trusted_path", _test_trusted_path)
+
+
 def _static_proof_fixture(tmp_path, *, candidate="c" * 40, rollback="r" * 40):
     units = tmp_path / "units"
     profiles = tmp_path / "profiles"
@@ -304,7 +330,8 @@ def _static_proof_fixture(tmp_path, *, candidate="c" * 40, rollback="r" * 40):
     return context, units, profiles, candidate, rollback
 
 
-def test_pre_rehearsal_proof_is_static_and_requires_all_canonical_assets(tmp_path):
+def test_pre_rehearsal_proof_is_static_and_requires_all_canonical_assets(
+        tmp_path, static_proof_test_root):
     context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
     proof = build_pre_rehearsal_qualification_proof(
         candidate_sha=candidate, rollback_source_sha=rollback,
@@ -314,14 +341,15 @@ def test_pre_rehearsal_proof_is_static_and_requires_all_canonical_assets(tmp_pat
     assert proof["runtime_pipeline_coverage"] == "0/6"
     assert proof["pipeline_keys"] == CANONICAL_SCOPED_ENRICHMENTS
     (profiles / "enrichment.immich_ocr.env").unlink()
-    with pytest.raises(P3DControlRefused, match="ASSET_INCOMPLETE"):
+    with pytest.raises(P3DControlRefused, match="PROFILE_UNTRUSTED"):
         build_pre_rehearsal_qualification_proof(
             candidate_sha=candidate, rollback_source_sha=rollback,
             context=context, unit_dir=units, profile_dir=profiles,
         )
 
 
-def test_pre_rehearsal_proof_rejects_candidate_rollback_identity_collision(tmp_path):
+def test_pre_rehearsal_proof_rejects_candidate_rollback_identity_collision(
+        tmp_path, static_proof_test_root):
     context, units, profiles, candidate, _rollback = _static_proof_fixture(tmp_path)
     with pytest.raises(P3DControlRefused, match="IDENTITY_COLLISION"):
         build_pre_rehearsal_qualification_proof(
@@ -330,7 +358,8 @@ def test_pre_rehearsal_proof_rejects_candidate_rollback_identity_collision(tmp_p
         )
 
 
-def test_pre_rehearsal_control_rejects_context_drift_and_needs_no_runtime_ledger(tmp_path):
+def test_pre_rehearsal_control_rejects_context_drift_and_needs_no_runtime_ledger(
+        tmp_path, static_proof_test_root):
     context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
     control = P3DControl(
         tmp_path / "state.json", tmp_path / "journal", candidate,
@@ -350,7 +379,8 @@ def test_pre_rehearsal_control_rejects_context_drift_and_needs_no_runtime_ledger
     assert "qualification_ledger" not in state
 
 
-def test_runtime_ledger_is_post_rehearsal_only_and_requires_bound_context(tmp_path):
+def test_runtime_ledger_is_post_rehearsal_only_and_requires_bound_context(
+        tmp_path, static_proof_test_root):
     context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
     control = P3DControl(
         tmp_path / "state.json", tmp_path / "journal", candidate,
@@ -377,7 +407,8 @@ def test_runtime_ledger_is_post_rehearsal_only_and_requires_bound_context(tmp_pa
     assert len(state["post_rehearsal_runtime_ledger"]) == 6
 
 
-def test_runtime_ledger_rejects_partial_or_foreign_candidate(tmp_path):
+def test_runtime_ledger_rejects_partial_or_foreign_candidate(
+        tmp_path, static_proof_test_root):
     context, units, profiles, candidate, rollback = _static_proof_fixture(tmp_path)
     control = P3DControl(
         tmp_path / "state.json", tmp_path / "journal", candidate,

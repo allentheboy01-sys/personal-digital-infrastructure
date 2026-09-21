@@ -44,12 +44,41 @@ class Paths:
     sync: Path = Path('/run/lock/pdi-sync.lock')
 
 
+def trusted_path(path, *, expected_kind=None, exact_mode=None, private=False,
+                 require_root_group=False, stat_reader=None):
+    """Validate a root-controlled path and every ancestor without following links."""
+    path = Path(path)
+    if not path.is_absolute():
+        return False
+    stat_reader = stat_reader or (lambda item: item.lstat())
+    try:
+        entries = [path, *path.parents]
+        metadata = [stat_reader(item) for item in entries]
+    except OSError:
+        return False
+    for index, info in enumerate(metadata):
+        if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or
+                (require_root_group and info.st_gid != 0) or info.st_mode & 0o022):
+            return False
+        if index > 0 and not stat.S_ISDIR(info.st_mode):
+            return False
+    leaf = metadata[0]
+    if expected_kind == 'file' and not stat.S_ISREG(leaf.st_mode):
+        return False
+    if expected_kind == 'directory' and not stat.S_ISDIR(leaf.st_mode):
+        return False
+    if exact_mode is not None and stat.S_IMODE(leaf.st_mode) != exact_mode:
+        return False
+    if private and leaf.st_mode & 0o007:
+        return False
+    return True
+
+
 def secure_file(path, *, exact_mode=None, private=True):
     """Refuse symlinks, non-root owners and writable ancestors before reading."""
+    path = Path(path)
     require(path.is_absolute(), 'PATH_NOT_ABSOLUTE')
-    for item in [path, *path.parents]:
-        s = item.lstat()
-        require(not stat.S_ISLNK(s.st_mode) and s.st_uid == 0 and not s.st_mode & 0o022, 'UNTRUSTED_PATH')
+    require(trusted_path(path), 'UNTRUSTED_PATH')
     s = path.stat()
     require(stat.S_ISREG(s.st_mode) and (not private or not s.st_mode & 0o007), 'UNPROTECTED_INPUT')
     if exact_mode is not None:

@@ -17,6 +17,7 @@ from sqlalchemy import text
 
 from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 from pdi.scoped_enrichment_profiles import install_environment_file
+from pdi.production_ops.cutover import trusted_path
 
 
 P3D_TIMER_UNITS = {
@@ -61,10 +62,16 @@ def build_pre_rehearsal_qualification_proof(*, candidate_sha: str,
     if not isinstance(enabled_scope_ids, list) or not enabled_scope_ids:
         raise P3DControlRefused("PRE_REHEARSAL_SCOPE_AUTHORITY_INVALID")
 
-    missing_units = [name for name in P3D_UNIT_FILES if not (unit_dir / name).is_file()]
-    missing_profiles = [key for key in pipeline_keys if not (profile_dir / f"{key}.env").is_file()]
-    if missing_units or missing_profiles:
-        raise P3DControlRefused("PRE_REHEARSAL_ASSET_INCOMPLETE")
+    for name in P3D_UNIT_FILES:
+        if not trusted_path(
+                unit_dir / name, expected_kind="file", exact_mode=0o644,
+                require_root_group=True):
+            raise P3DControlRefused("PRE_REHEARSAL_ASSET_UNTRUSTED")
+    for key in pipeline_keys:
+        if not trusted_path(
+                profile_dir / f"{key}.env", expected_kind="file",
+                exact_mode=0o600, private=True, require_root_group=True):
+            raise P3DControlRefused("PRE_REHEARSAL_PROFILE_UNTRUSTED")
 
     service_text = (unit_dir / "pdi-scoped-pipeline@.service").read_text()
     required_service_contract = (
@@ -79,8 +86,6 @@ def build_pre_rehearsal_qualification_proof(*, candidate_sha: str,
     asset_hash = hashlib.sha256()
     for name in P3D_UNIT_FILES:
         path = unit_dir / name
-        if path.is_symlink() or path.stat().st_mode & 0o022:
-            raise P3DControlRefused("PRE_REHEARSAL_ASSET_UNTRUSTED")
         payload = path.read_bytes()
         asset_hash.update(name.encode())
         asset_hash.update(payload)
@@ -90,8 +95,6 @@ def build_pre_rehearsal_qualification_proof(*, candidate_sha: str,
         if f"Unit=pdi-scoped-pipeline@{key}.service" not in timer_text:
             raise P3DControlRefused("PRE_REHEARSAL_TIMER_BINDING_INVALID")
         profile = profile_dir / f"{key}.env"
-        if profile.is_symlink() or profile.stat().st_mode & 0o077:
-            raise P3DControlRefused("PRE_REHEARSAL_PROFILE_UNTRUSTED")
         profile_values: dict[str, str] = {}
         for line in profile.read_text().splitlines():
             name, separator, raw_value = line.partition("=")
@@ -176,19 +179,83 @@ class P3DControlRefused(RuntimeError):
     pass
 
 
-def verify_release(path: Path, expected_sha: str, *, runner=subprocess.run) -> bool:
-    """Verify an immutable release directly; caller claims are ignored."""
+def _release_entry_trusted(info: os.stat_result) -> bool:
+    return (
+        info.st_uid == 0 and info.st_gid == 0 and not info.st_mode & 0o022 and
+        (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode))
+    )
+
+
+def verify_release_immutability(path: Path, expected_sha: str, *,
+                                releases_root: Path = Path("/opt/pdi/releases"),
+                                stat_reader=None, tree_entries=None,
+                                resolver=None) -> bool:
+    """Verify all runtime bytes are root-controlled; allow only trusted Python links."""
+    stat_reader = stat_reader or (lambda item: item.lstat())
+    resolver = resolver or (lambda item: item.resolve(strict=True))
     try:
-        info = path.stat()
-        if not path.is_dir() or info.st_uid != 0 or info.st_mode & 0o022:
+        if path != releases_root / expected_sha:
             return False
+        if not trusted_path(
+                releases_root, expected_kind="directory", require_root_group=True,
+                stat_reader=stat_reader):
+            return False
+        if not trusted_path(
+                path, expected_kind="directory", require_root_group=True,
+                stat_reader=stat_reader):
+            return False
+        entries = tree_entries(path) if tree_entries is not None else path.rglob("*")
+        for entry in entries:
+            info = stat_reader(entry)
+            if stat.S_ISLNK(info.st_mode):
+                if info.st_uid != 0 or info.st_gid != 0:
+                    return False
+                target = resolver(entry)
+                internal = target == path or path in target.parents
+                interpreter_link = (
+                    entry.parent == path / ".venv/bin" and
+                    (entry.name == "python" or entry.name.startswith("python3")) and
+                    any(target == root or root in target.parents for root in (
+                        Path("/usr/bin"), Path("/usr/local/bin"), Path("/bin")
+                    ))
+                )
+                if not (internal or interpreter_link):
+                    return False
+                target_info = stat_reader(target)
+                target_kind = "directory" if stat.S_ISDIR(target_info.st_mode) else "file"
+                if not trusted_path(
+                        target, expected_kind=target_kind, require_root_group=True,
+                        stat_reader=stat_reader):
+                    return False
+            elif not _release_entry_trusted(info):
+                return False
+        required = (
+            path / "src/pdi/scoped_operational.py",
+            path / "src/pdi/production_ops/enrichment.py",
+            path / "scripts/mu13_p3d_cutover.py",
+            path / ".venv/bin/python",
+        )
+        return all(stat.S_ISREG(stat_reader(resolver(item)).st_mode) for item in required)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def verify_release(path: Path, expected_sha: str, *, runner=subprocess.run,
+                   releases_root: Path = Path("/opt/pdi/releases"),
+                   immutability_verifier=verify_release_immutability) -> bool:
+    """Verify exact Git identity, clean source and immutable runtime bytes."""
+    if not immutability_verifier(path, expected_sha, releases_root=releases_root):
+        return False
+    try:
         result = runner(("git", "-C", str(path), "rev-parse", "HEAD"),
                         capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
-        actual = result.stdout.strip()
-        if result.returncode != 0 or actual != expected_sha:
+        if result.returncode != 0 or result.stdout.strip() != expected_sha:
             return False
-        required = (path / "src/pdi/scoped_operational.py", path / ".venv/bin/python")
-        return all(item.exists() and not item.is_symlink() for item in required)
+        status_result = runner(
+            ("git", "-C", str(path), "status", "--porcelain", "--untracked-files=all"),
+            capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"},
+        )
+        return status_result.returncode == 0 and not status_result.stdout.strip()
     except OSError:
         return False
 
