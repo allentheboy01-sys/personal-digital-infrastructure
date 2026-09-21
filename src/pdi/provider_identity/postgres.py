@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Engine, select
+from sqlalchemy import Connection, Engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -29,7 +29,7 @@ from .models import (
 
 
 class PostgreSQLProviderIdentityRepository:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine | Connection) -> None:
         self._session_factory = sessionmaker(
             bind=engine,
             class_=Session,

@@ -48,6 +48,7 @@ def build_pre_rehearsal_qualification_proof(*, candidate_sha: str,
     required_evidence = (
         "p3c_pass", "writers_healthy", "legacy_enrichment_disabled",
         "p3d_timers_off", "gmail_disabled", "rollback_qualified",
+        "read_only_db_guarantee",
     )
     if any(context.get(key) is not True for key in required_evidence):
         raise P3DControlRefused("PRE_REHEARSAL_EVIDENCE_INCOMPLETE")
@@ -366,7 +367,8 @@ class ProductionEvidenceReader:
                 "principal_ref": db_evidence.principal_ref,
                 "db_route": db_evidence.database_ref,
                 "db_identity_fingerprint": db_evidence.identity_fingerprint,
-                "enabled_scope_ids": sorted(db_evidence.enabled_scope_ids)}
+                "enabled_scope_ids": sorted(db_evidence.enabled_scope_ids),
+                "read_only_db_guarantee": db_evidence.transaction_read_only}
 
     def collect_active_verify(self) -> dict[str, object]:
         if not verify_release(self.release, self.expected_sha, runner=self.runner):

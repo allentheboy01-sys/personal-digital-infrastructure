@@ -1,5 +1,6 @@
 """Fail-closed P3D evidence readers for protected journals and routed DBs."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -7,11 +8,28 @@ import stat
 from datetime import datetime
 
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 
 from pdi.provider_identity import PostgreSQLProviderIdentityRepository
 from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 from pdi.scoped_enrichment_profiles import derive_enabled_scope_ids
 from .enrichment_cutover import P3DControlRefused, context_fingerprint
+
+
+@contextmanager
+def postgresql_read_only_transaction(engine):
+    """Yield one verified PostgreSQL READ ONLY connection, then roll it back."""
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        try:
+            connection.execute(text("SET TRANSACTION READ ONLY"))
+            read_only = connection.scalar(text("SHOW transaction_read_only"))
+            if str(read_only).lower() != "on":
+                raise P3DControlRefused("READ_ONLY_TRANSACTION_REQUIRED")
+            yield connection
+        finally:
+            if transaction.is_active:
+                transaction.rollback()
 
 
 def read_p3c_journal(path: Path, *, expected_sha: str, expected_context: str | None = None) -> dict:
@@ -42,22 +60,27 @@ class PersonalDatabaseEvidence:
     database_url: str
     enabled_scope_ids: frozenset[str]
     identity_fingerprint: str
+    transaction_read_only: bool
 
 
 class RoutedPersonalDatabaseEvidenceReader:
     """Read-only checks through the trusted PrincipalDatabaseRouter."""
 
-    def __init__(self, router, engine, *, principal_ref: str):
+    def __init__(self, router, engine, *, principal_ref: str,
+                 identity_repository_factory=PostgreSQLProviderIdentityRepository,
+                 scope_id_deriver=derive_enabled_scope_ids):
         self.router = router
         self.engine = engine
         self.principal_ref = principal_ref
+        self.identity_repository_factory = identity_repository_factory
+        self.scope_id_deriver = scope_id_deriver
 
     def collect(self) -> PersonalDatabaseEvidence:
         try:
             binding = self.router.resolve(self.principal_ref)
-            if binding.database_url != str(self.engine.url):
+            if make_url(binding.database_url) != make_url(self.engine.url):
                 raise P3DControlRefused("ROUTE_TARGET_MISMATCH")
-            with self.engine.connect() as connection:
+            with postgresql_read_only_transaction(self.engine) as connection:
                 revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
                 if revision != "e5a7b9d1f324":
                     raise P3DControlRefused("ALEMBIC_MISMATCH")
@@ -84,48 +107,58 @@ class RoutedPersonalDatabaseEvidenceReader:
                 if provider_mismatch != 0 or {row[0] for row in source_providers} != {
                         "nextcloud", "immich", "gmail", "integration-test"}:
                     raise P3DControlRefused("SOURCE_SCOPE_IDENTITY_MISMATCH")
-            repository = PostgreSQLProviderIdentityRepository(self.engine)
-            instances = repository.list_instances()
-            expected = {"nextcloud": True, "immich": True, "gmail": False, "integration-test": False}
-            actual = {}
-            identity_state = []
-            for instance in instances:
-                if instance.provider_type in expected:
-                    if instance.provider_type in actual:
-                        raise P3DControlRefused("IDENTITY_DUPLICATE")
-                    actual[instance.provider_type] = instance.enabled
-                    accounts = repository.list_accounts_for_instance(instance.id)
-                    scopes = repository.list_scopes_for_instance(instance.id)
-                    expected_account_count = 1 if instance.provider_type in {"nextcloud", "immich"} else 0
-                    if (len(accounts) != expected_account_count or len(scopes) != 1 or
-                            any(account.enabled is not True for account in accounts) or
-                            scopes[0].enabled is not expected[instance.provider_type]):
-                        raise P3DControlRefused("IDENTITY_STATE_MISMATCH")
-                    if expected_account_count and scopes[0].provider_account_id != accounts[0].id:
-                        raise P3DControlRefused("IDENTITY_ACCOUNT_SCOPE_MISMATCH")
-                    if not expected_account_count and scopes[0].provider_account_id is not None:
-                        raise P3DControlRefused("IDENTITY_ACCOUNT_SCOPE_MISMATCH")
-                    identity_state.append({
-                        "provider_type": instance.provider_type,
-                        "instance_id": str(instance.id),
-                        "instance_enabled": instance.enabled,
-                        "account_ids": sorted(str(account.id) for account in accounts),
-                        "scope_id": str(scopes[0].id),
-                        "scope_enabled": scopes[0].enabled,
-                    })
-            if actual != expected:
-                raise P3DControlRefused("IDENTITY_STATE_MISMATCH")
-            scope_ids = derive_enabled_scope_ids(self.engine)
-            fingerprint = context_fingerprint({"principal": self.principal_ref,
-                                                "database_ref": binding.database_ref,
-                                                "scopes": sorted(map(str, scope_ids)),
-                                                "identity_state": sorted(
-                                                    identity_state,
-                                                    key=lambda item: item["provider_type"],
-                                                )})
-            return PersonalDatabaseEvidence(self.principal_ref, binding.database_ref,
-                                            binding.database_url,
-                                            frozenset(map(str, scope_ids)), fingerprint)
+                repository = self.identity_repository_factory(connection)
+                instances = repository.list_instances()
+                expected = {"nextcloud": True, "immich": True, "gmail": False,
+                            "integration-test": False}
+                actual = {}
+                identity_state = []
+                for instance in instances:
+                    if instance.provider_type in expected:
+                        if instance.provider_type in actual:
+                            raise P3DControlRefused("IDENTITY_DUPLICATE")
+                        actual[instance.provider_type] = instance.enabled
+                        accounts = repository.list_accounts_for_instance(instance.id)
+                        scopes = repository.list_scopes_for_instance(instance.id)
+                        expected_account_count = (
+                            1 if instance.provider_type in {"nextcloud", "immich"} else 0
+                        )
+                        if (len(accounts) != expected_account_count or len(scopes) != 1 or
+                                any(account.enabled is not True for account in accounts) or
+                                scopes[0].enabled is not expected[instance.provider_type]):
+                            raise P3DControlRefused("IDENTITY_STATE_MISMATCH")
+                        if expected_account_count and scopes[0].provider_account_id != accounts[0].id:
+                            raise P3DControlRefused("IDENTITY_ACCOUNT_SCOPE_MISMATCH")
+                        if not expected_account_count and scopes[0].provider_account_id is not None:
+                            raise P3DControlRefused("IDENTITY_ACCOUNT_SCOPE_MISMATCH")
+                        identity_state.append({
+                            "provider_type": instance.provider_type,
+                            "instance_id": str(instance.id),
+                            "instance_enabled": instance.enabled,
+                            "account_ids": sorted(str(account.id) for account in accounts),
+                            "scope_id": str(scopes[0].id),
+                            "scope_enabled": scopes[0].enabled,
+                        })
+                if actual != expected:
+                    raise P3DControlRefused("IDENTITY_STATE_MISMATCH")
+                scope_ids = self.scope_id_deriver(connection)
+                fingerprint = context_fingerprint({
+                    "principal": self.principal_ref,
+                    "database_ref": binding.database_ref,
+                    "scopes": sorted(map(str, scope_ids)),
+                    "identity_state": sorted(
+                        identity_state,
+                        key=lambda item: item["provider_type"],
+                    ),
+                })
+                return PersonalDatabaseEvidence(
+                    self.principal_ref,
+                    binding.database_ref,
+                    binding.database_url,
+                    frozenset(map(str, scope_ids)),
+                    fingerprint,
+                    True,
+                )
         except P3DControlRefused:
             raise
         except Exception:

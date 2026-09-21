@@ -295,6 +295,7 @@ def _static_proof_fixture(tmp_path, *, candidate="c" * 40, rollback="r" * 40):
         "p3d_timers_off": True,
         "gmail_disabled": True,
         "rollback_qualified": True,
+        "read_only_db_guarantee": True,
         "principal_ref": principal,
         "db_route": "synthetic-db",
         "db_identity_fingerprint": "f" * 64,
