@@ -31,6 +31,11 @@ P3D_TIMER_UNITS = {
 P3D_UNIT_FILES = ("pdi-scoped-pipeline@.service",) + tuple(
     unit.removesuffix(".timer") + ".timer" for unit in P3D_TIMER_UNITS.values()
 )
+GIT_READ_ONLY_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
 
 
 def build_pre_rehearsal_qualification_proof(*, candidate_sha: str,
@@ -248,12 +253,12 @@ def verify_release(path: Path, expected_sha: str, *, runner=subprocess.run,
         return False
     try:
         result = runner(("git", "-C", str(path), "rev-parse", "HEAD"),
-                        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"})
+                        capture_output=True, text=True, env=dict(GIT_READ_ONLY_ENV))
         if result.returncode != 0 or result.stdout.strip() != expected_sha:
             return False
         status_result = runner(
             ("git", "-C", str(path), "status", "--porcelain", "--untracked-files=all"),
-            capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True, env=dict(GIT_READ_ONLY_ENV),
         )
         return status_result.returncode == 0 and not status_result.stdout.strip()
     except OSError:

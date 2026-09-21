@@ -6,6 +6,7 @@ import pytest
 
 from pdi.production_ops.cutover import trusted_path
 from pdi.production_ops.enrichment_cutover import (
+    GIT_READ_ONLY_ENV,
     P3DControlRefused,
     build_pre_rehearsal_qualification_proof,
     verify_release,
@@ -308,8 +309,10 @@ def test_release_path_must_be_exact_sha_directory():
 
 def test_verify_release_requires_exact_git_sha_and_clean_source():
     tree = _release_tree()
+    calls = []
 
-    def runner(argv, **_kwargs):
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
         if argv[3:5] == ("rev-parse", "HEAD"):
             return SimpleNamespace(returncode=0, stdout=tree.sha + "\n")
         if argv[3] == "status":
@@ -323,6 +326,11 @@ def test_verify_release_requires_exact_git_sha_and_clean_source():
         releases_root=tree.releases_root,
         immutability_verifier=lambda *_args, **_kwargs: True,
     )
+    assert [call[0][3:] for call in calls] == [
+        ("rev-parse", "HEAD"),
+        ("status", "--porcelain", "--untracked-files=all"),
+    ]
+    assert all(call[1]["env"] == GIT_READ_ONLY_ENV for call in calls)
 
     def wrong_sha_runner(argv, **_kwargs):
         return SimpleNamespace(returncode=0, stdout="f" * 40 + "\n")
@@ -334,6 +342,37 @@ def test_verify_release_requires_exact_git_sha_and_clean_source():
         releases_root=tree.releases_root,
         immutability_verifier=lambda *_args, **_kwargs: True,
     )
+
+
+def test_verify_release_git_environment_is_allowlisted(monkeypatch):
+    tree = _release_tree()
+    for name, value in {
+        "GIT_OPTIONAL_LOCKS": "1",
+        "GIT_INDEX_FILE": "/tmp/evil-index",
+        "GIT_DIR": "/tmp/evil-git",
+        "GIT_WORK_TREE": "/tmp/evil-worktree",
+    }.items():
+        monkeypatch.setenv(name, value)
+    environments = []
+
+    def runner(argv, **kwargs):
+        environments.append(kwargs["env"])
+        output = tree.sha + "\n" if argv[3] == "rev-parse" else ""
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    assert verify_release(
+        tree.release,
+        tree.sha,
+        runner=runner,
+        releases_root=tree.releases_root,
+        immutability_verifier=lambda *_args, **_kwargs: True,
+    )
+    assert environments == [GIT_READ_ONLY_ENV, GIT_READ_ONLY_ENV]
+    assert set(environments[0]) == {"PATH", "LC_ALL", "GIT_OPTIONAL_LOCKS"}
+
+
+def test_verify_release_rejects_dirty_worktree():
+    tree = _release_tree()
 
     def dirty_runner(argv, **_kwargs):
         if argv[3:5] == ("rev-parse", "HEAD"):
