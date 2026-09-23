@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -35,6 +37,7 @@ from pdi.production_ops.p3d_rollback_qualification import (
     QualificationContext,
     ReleaseFilesystemFacts,
     ResticBackupAdapter,
+    RootControlledReleaseFactsReader,
     RestoreQualificationResult,
     RestoredInvariantsEvidenceV1,
     RollbackBaselineEvidenceV1,
@@ -363,6 +366,77 @@ def test_source_runtime_qualification_binds_actual_facts() -> None:
     assert evidence.source_sha == SOURCE
     assert evidence.source_release_fingerprint != evidence.source_runtime_fingerprint
     evidence.validate()
+
+
+def test_root_controlled_release_reader_scans_runtime_with_fixed_environments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = tmp_path / "opt/pdi/releases" / SOURCE
+    for relative in (
+        "scripts", "src/pdi", ".venv/bin", ".venv/lib/python3.13/site-packages/demo.dist-info",
+        "migrations/versions", ".git",
+    ):
+        (release / relative).mkdir(parents=True, exist_ok=True)
+    for relative in (
+        "pyproject.toml", "alembic.ini", "scripts/mu13_p3c_cutover.py",
+        "src/pdi/__init__.py", "src/pdi/scoped_operational.py", "migrations/versions/a.py",
+    ):
+        (release / relative).write_text("synthetic\n", encoding="utf-8")
+    (release / ".git/ignored-authority").write_text("unstable\n", encoding="utf-8")
+    dist_info = release / ".venv/lib/python3.13/site-packages/demo.dist-info"
+    (dist_info / "METADATA").write_text("Name: Demo_Package\nVersion: 1.2.3\n", encoding="utf-8")
+    (dist_info / "RECORD").write_text("demo.py,,\n", encoding="utf-8")
+    (release / ".venv/bin/python").symlink_to(Path(sys.executable).resolve())
+    release.chmod(0o755)
+    for path in release.rglob("*"):
+        if not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() else 0o644)
+    current = tmp_path / "opt/pdi/current"
+    current.symlink_to(release)
+
+    original_lstat = Path.lstat
+
+    def root_owned_lstat(path: Path):
+        value = original_lstat(path)
+        try:
+            path.relative_to(tmp_path)
+        except ValueError:
+            return value
+        return SimpleNamespace(st_mode=value.st_mode, st_uid=0, st_gid=0)
+
+    monkeypatch.setattr(Path, "lstat", root_owned_lstat)
+    monkeypatch.setattr(
+        RootControlledReleaseFactsReader,
+        "_root_controlled",
+        staticmethod(lambda _path, *, stop: True),
+    )
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if "rev-parse" in argv:
+            stdout = SOURCE + "\n"
+        elif "status" in argv:
+            stdout = ""
+        else:
+            stdout = json.dumps({
+                "version": "3.13.7",
+                "abi": "cpython-313",
+                "implementation": "CPython",
+                "platform": "linux",
+            }) + "\n"
+        return subprocess.CompletedProcess(argv, 0, stdout, "")
+
+    facts = RootControlledReleaseFactsReader(current_path=current, runner=runner).read(release)
+    assert facts.git_head == SOURCE
+    assert facts.git_clean is True
+    assert all(not entry.relative_path.startswith(".git") for entry in facts.entries)
+    assert any(entry.relative_path == ".venv/bin/python" for entry in facts.entries)
+    git_calls = [call for call in calls if call[0][0] == "/usr/bin/git"]
+    assert all(call[1]["env"] == {
+        "PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0",
+    } for call in git_calls)
+    assert facts.distributions[0].name == "demo-package"
 
 
 @pytest.mark.parametrize(
