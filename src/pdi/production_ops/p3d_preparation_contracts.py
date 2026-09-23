@@ -440,6 +440,12 @@ class OSRuntimeManifestV1:
         python_path = _safe_text(value["SYSTEM_PYTHON_PATH"])
         if not PurePosixPath(python_path).is_absolute() or ".." in PurePosixPath(python_path).parts:
             _fail()
+        native_packages = _sorted_unique(
+            value["NATIVE_LIBRARY_PACKAGE_SET"],
+            lambda item: _safe_text(item, pattern=PACKAGE_NAME),
+        )
+        if not set(native_packages).issubset({item.name for item in packages}):
+            _fail(FailureCode.RELEASE_OS_RUNTIME_MISMATCH)
         return cls(
             _safe_text(value["OS_ID"], pattern=SAFE_NAME),
             _safe_text(value["OS_VERSION_ID"], pattern=SAFE_NAME),
@@ -450,10 +456,7 @@ class OSRuntimeManifestV1:
             _safe_text(value["PYTHON_VERSION"], pattern=SAFE_NAME),
             _safe_text(value["PYTHON_ABI"], pattern=SAFE_NAME),
             _sha256(value["SYSTEM_RUNTIME_FILE_SHA256"]),
-            _sorted_unique(
-                value["NATIVE_LIBRARY_PACKAGE_SET"],
-                lambda item: _safe_text(item, pattern=PACKAGE_NAME),
-            ),
+            native_packages,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -815,6 +818,71 @@ PHASE_TYPES = {
     PreparationGate.INERT_ASSET_INSTALL: GateCPhase,
 }
 
+GATE_TOOL_ROLES = {
+    PreparationGate.ROLLBACK_QUALIFICATION: frozenset({
+        ToolName.BACKUP_EXPORT,
+        ToolName.RESTORE_QUALIFY,
+    }),
+    PreparationGate.RELEASE_STAGING: frozenset({ToolName.RELEASE_BOOTSTRAP}),
+    PreparationGate.INERT_ASSET_INSTALL: frozenset({ToolName.INERT_ASSET_INSTALL}),
+}
+
+GATE_A_TARGET_TOOL_ROLES = {
+    "SOURCE_VERIFIED": frozenset({ToolName.BACKUP_EXPORT}),
+    "SNAPSHOT_EXPORTED": frozenset({ToolName.BACKUP_EXPORT}),
+    "DUMP_COMPLETED": frozenset({ToolName.BACKUP_EXPORT}),
+    "BACKUP_SNAPSHOT_CREATED": frozenset({ToolName.BACKUP_EXPORT}),
+    "RESTORE_STARTED": frozenset({ToolName.RESTORE_QUALIFY}),
+    "RESTORE_COMPLETED": frozenset({ToolName.RESTORE_QUALIFY}),
+    "RESTORE_QUALIFIED": frozenset({ToolName.RESTORE_QUALIFY}),
+    "RUNTIME_QUALIFIED": frozenset({ToolName.RESTORE_QUALIFY}),
+    "DB_RUNTIME_COMPATIBLE": frozenset({ToolName.RESTORE_QUALIFY}),
+    "SOURCE_RELEASE_PINNED": frozenset({ToolName.RESTORE_QUALIFY}),
+    "METADATA_COMMITTED": frozenset({ToolName.RESTORE_QUALIFY}),
+    "COMPLETE": frozenset({ToolName.RESTORE_QUALIFY}),
+    "FAILED": GATE_TOOL_ROLES[PreparationGate.ROLLBACK_QUALIFICATION],
+}
+
+
+def validate_gate_tool_authority(
+    gate: PreparationGate,
+    tool_identities: Sequence[OperatorToolIdentity],
+    candidate_sha: str,
+) -> tuple[OperatorToolIdentity, ...]:
+    """Validate the complete, gate-specific operator authority set."""
+
+    candidate = _git_sha(candidate_sha)
+    if not isinstance(tool_identities, (list, tuple)) or not tool_identities:
+        _fail(FailureCode.CONTRACT_VALUE_INVALID)
+    tools = tuple(sorted(tool_identities, key=lambda item: item.tool_name.value))
+    roles = tuple(item.tool_name for item in tools)
+    if len(set(roles)) != len(roles) or frozenset(roles) != GATE_TOOL_ROLES[gate]:
+        _fail(FailureCode.CONTRACT_VALUE_INVALID)
+    if (gate is PreparationGate.INERT_ASSET_INSTALL and
+            any(item.tool_source_sha != candidate for item in tools)):
+        _fail(FailureCode.CONTRACT_CANDIDATE_MISMATCH)
+    return tools
+
+
+def validate_journal_event_tool_authority(
+    gate: PreparationGate,
+    target_phase: str,
+    tool_identity: OperatorToolIdentity,
+    candidate_sha: str,
+) -> None:
+    """Bind one transition to its exact reviewed tool role."""
+
+    target = _phase(gate, target_phase)
+    if gate is PreparationGate.ROLLBACK_QUALIFICATION:
+        allowed = GATE_A_TARGET_TOOL_ROLES[target]
+    else:
+        allowed = GATE_TOOL_ROLES[gate]
+    if tool_identity.tool_name not in allowed:
+        _fail(FailureCode.CONTRACT_VALUE_INVALID)
+    if (gate is PreparationGate.INERT_ASSET_INSTALL and
+            tool_identity.tool_source_sha != _git_sha(candidate_sha)):
+        _fail(FailureCode.CONTRACT_CANDIDATE_MISMATCH)
+
 
 def _linear_transitions(enum_type) -> dict[str, set[str]]:
     phases = list(enum_type)
@@ -861,13 +929,13 @@ class PreparationOperationStateV1:
     phase: str
     started_at: str
     updated_at: str
-    tool_identity: OperatorToolIdentity
+    operator_tool_identities: tuple[OperatorToolIdentity, ...]
     evidence_fingerprint: str | None = None
     failure_code: FailureCode | None = None
 
     FIELDS = {
         "version", "operation_id", "gate", "candidate_sha", "phase",
-        "started_at", "updated_at", "tool_identity", "evidence_fingerprint",
+        "started_at", "updated_at", "operator_tool_identities", "evidence_fingerprint",
         "failure_code",
     }
 
@@ -893,10 +961,17 @@ class PreparationOperationStateV1:
         evidence = value["evidence_fingerprint"]
         started = _utc_timestamp(value["started_at"])
         updated = _utc_timestamp(value["updated_at"])
-        tool = OperatorToolIdentity.from_mapping(value["tool_identity"])
         candidate = _git_sha(value["candidate_sha"])
-        if updated < started or tool.tool_source_sha != candidate:
-            _fail(FailureCode.CONTRACT_CANDIDATE_MISMATCH)
+        raw_tools = value["operator_tool_identities"]
+        if not isinstance(raw_tools, (list, tuple)):
+            _fail(FailureCode.CONTRACT_VALUE_INVALID)
+        tools = validate_gate_tool_authority(
+            gate,
+            tuple(OperatorToolIdentity.from_mapping(item) for item in raw_tools),
+            candidate,
+        )
+        if updated < started:
+            _fail(FailureCode.CONTRACT_VALUE_INVALID)
         if failure is not None:
             _validate_gate_failure_code(gate, failure)
         return cls(
@@ -906,7 +981,7 @@ class PreparationOperationStateV1:
             phase,
             started,
             updated,
-            tool,
+            tools,
             None if evidence is None else _sha256(evidence),
             failure,
         )
@@ -920,7 +995,7 @@ class PreparationOperationStateV1:
             "phase": self.phase,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
-            "tool_identity": self.tool_identity.to_mapping(),
+            "operator_tool_identities": [item.to_mapping() for item in self.operator_tool_identities],
             "evidence_fingerprint": self.evidence_fingerprint,
             "failure_code": None if self.failure_code is None else self.failure_code.value,
         }
@@ -980,8 +1055,7 @@ class PreparationJournalEventV1:
             _fail()
         tool = OperatorToolIdentity.from_mapping(value["tool_identity"])
         candidate = _git_sha(value["candidate_sha"])
-        if tool.tool_source_sha != candidate:
-            _fail(FailureCode.CONTRACT_CANDIDATE_MISMATCH)
+        validate_journal_event_tool_authority(gate, target, tool, candidate)
         if failure is not None:
             _validate_gate_failure_code(gate, failure)
         return cls(
@@ -1065,6 +1139,87 @@ def transition_preparation_state(
     )
 
 
+def preparation_journal_fingerprint(
+    events: Sequence[PreparationJournalEventV1],
+) -> str:
+    if not isinstance(events, (list, tuple)) or not events:
+        _fail(FailureCode.CONTRACT_VALUE_INVALID)
+    normalized = tuple(
+        PreparationJournalEventV1.from_mapping(event.to_mapping()) for event in events
+    )
+    return contract_fingerprint({"events": [event.to_mapping() for event in normalized]})
+
+
+def validate_preparation_journal_chain(
+    events: Sequence[PreparationJournalEventV1],
+    persisted_state: PreparationOperationStateV1,
+) -> bool:
+    """Validate a complete journal prefix and bind it to persisted state.
+
+    Equal timestamps are valid because contract timestamps have one-second
+    precision. A timestamp may never move backward.
+    """
+
+    if not isinstance(events, (list, tuple)) or not events:
+        _fail(FailureCode.CONTRACT_VALUE_INVALID)
+    normalized = tuple(
+        PreparationJournalEventV1.from_mapping(event.to_mapping()) for event in events
+    )
+    state = PreparationOperationStateV1.from_mapping(persisted_state.to_mapping())
+    first = normalized[0]
+    if first.sequence != 1 or first.from_state != "NEW" or state.started_at > first.timestamp:
+        _fail(FailureCode.CONTRACT_VALUE_INVALID)
+    authority = frozenset(state.operator_tool_identities)
+    previous: PreparationJournalEventV1 | None = None
+    for expected_sequence, event in enumerate(normalized, start=1):
+        if (event.sequence != expected_sequence or
+                event.operation_id != state.operation_id or
+                event.gate is not state.gate or
+                event.candidate_sha != state.candidate_sha or
+                event.tool_identity not in authority):
+            _fail(FailureCode.CONTRACT_VALUE_INVALID)
+        if previous is not None:
+            if (previous.to_state in TERMINAL_PHASES or
+                    event.from_state != previous.to_state or
+                    event.timestamp < previous.timestamp):
+                _fail(FailureCode.CONTRACT_TRANSITION_INVALID)
+        previous = event
+    final = normalized[-1]
+    if (final.to_state != state.phase or
+            final.timestamp != state.updated_at or
+            final.failure_code is not state.failure_code or
+            state.evidence_fingerprint != preparation_journal_fingerprint(normalized)):
+        _fail(FailureCode.CONTRACT_FINGERPRINT_MISMATCH)
+    return True
+
+
+CANONICAL_P3D_PIPELINE_KEYS = (
+    "enrichment.nextcloud_text",
+    "enrichment.nextcloud_documents",
+    "enrichment.file_metadata",
+    "enrichment.immich_geo",
+    "enrichment.immich_metadata",
+    "enrichment.immich_ocr",
+)
+CANONICAL_P3D_SYSTEMD_PATHS = frozenset({
+    "/etc/systemd/system/pdi-scoped-pipeline@.service",
+    "/etc/systemd/system/pdi-scoped-enrichment-nextcloud-text.timer",
+    "/etc/systemd/system/pdi-scoped-enrichment-nextcloud-documents.timer",
+    "/etc/systemd/system/pdi-scoped-enrichment-file-metadata.timer",
+    "/etc/systemd/system/pdi-scoped-enrichment-immich-geo.timer",
+    "/etc/systemd/system/pdi-scoped-enrichment-immich-metadata.timer",
+    "/etc/systemd/system/pdi-scoped-enrichment-immich-ocr.timer",
+})
+CANONICAL_P3D_PROFILE_PATHS = frozenset(
+    f"/etc/pdi/scoped/units/{key}.env" for key in CANONICAL_P3D_PIPELINE_KEYS
+)
+CANONICAL_P3D_INSTALL_PATH_MODES = {
+    **{path: "0644" for path in CANONICAL_P3D_SYSTEMD_PATHS},
+    **{path: "0600" for path in CANONICAL_P3D_PROFILE_PATHS},
+}
+CANONICAL_P3D_INSTALL_PATHS = frozenset(CANONICAL_P3D_INSTALL_PATH_MODES)
+
+
 @dataclass(frozen=True, order=True)
 class InstalledFileEntryV1:
     path: str
@@ -1084,7 +1239,9 @@ class InstalledFileEntryV1:
                 value["owner_uid"] != 0 or value["owner_gid"] != 0):
             _fail()
         mode = _safe_text(value["mode"], pattern=MODE)
-        if mode not in {"0600", "0644"}:
+        if path not in CANONICAL_P3D_INSTALL_PATHS:
+            _fail(FailureCode.ASSET_FILE_CONFLICT)
+        if mode != CANONICAL_P3D_INSTALL_PATH_MODES[path]:
             _fail()
         return cls(path, _sha256(value["sha256"]), 0, 0, mode)
 
@@ -1099,9 +1256,12 @@ class InstalledFileEntryV1:
 
 
 def asset_installation_fingerprint(entries: Sequence[InstalledFileEntryV1]) -> str:
-    ordered = sorted(entries)
-    if not ordered or len({entry.path for entry in ordered}) != len(ordered):
-        _fail()
+    normalized = tuple(InstalledFileEntryV1.from_mapping(entry.to_mapping()) for entry in entries)
+    ordered = sorted(normalized)
+    paths = [entry.path for entry in ordered]
+    if (len(paths) != len(set(paths)) or
+            frozenset(paths) != CANONICAL_P3D_INSTALL_PATHS):
+        _fail(FailureCode.ASSET_FILE_CONFLICT)
     return contract_fingerprint({"installed_files": [entry.to_mapping() for entry in ordered]})
 
 
@@ -1153,10 +1313,13 @@ class P3DAssetInstallationCompleteV1:
         after = _safe_text(value["current_symlink_after"])
         p3c_before = _sha256(value["p3c_systemd_state_before_fingerprint"])
         p3c_after = _sha256(value["p3c_systemd_state_after_fingerprint"])
-        if before != after or p3c_before != p3c_after or value["p3d_timer_state"] != "DISABLED_INACTIVE":
-            _fail(FailureCode.CONTRACT_FINGERPRINT_MISMATCH)
         candidate = _git_sha(value["candidate_sha"])
         rollback_source = _git_sha(value["rollback_source_sha"])
+        expected_current = f"/opt/pdi/releases/{rollback_source}"
+        if (before != expected_current or after != expected_current or
+                p3c_before != p3c_after or
+                value["p3d_timer_state"] != "DISABLED_INACTIVE"):
+            _fail(FailureCode.CONTRACT_FINGERPRINT_MISMATCH)
         gate_tool = OperatorToolIdentity.from_mapping(value["gate_c_tool_identity"])
         if (candidate == rollback_source or
                 gate_tool.tool_name is not ToolName.INERT_ASSET_INSTALL or
@@ -1415,6 +1578,14 @@ def _existing_equivalent(path: Path, content: bytes, policy: AtomicCreatePolicyV
         return False
 
 
+def _fsync_parent_directory(path: Path) -> None:
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def atomic_create_no_replace(
     path: Path,
     content: bytes,
@@ -1428,6 +1599,10 @@ def atomic_create_no_replace(
         _fail(FailureCode.CONTRACT_PERSISTENCE_UNTRUSTED)
     if path.exists() or path.is_symlink():
         if _existing_equivalent(path, content, policy):
+            try:
+                _fsync_parent_directory(path)
+            except OSError:
+                _fail(FailureCode.CONTRACT_PERSISTENCE_UNTRUSTED)
             return AtomicCreateResult.IDEMPOTENT
         _fail(FailureCode.CONTRACT_PERSISTENCE_CONFLICT)
     descriptor = -1
@@ -1449,15 +1624,12 @@ def atomic_create_no_replace(
             os.link(temporary, path, follow_symlinks=False)
         except FileExistsError:
             if _existing_equivalent(path, content, policy):
+                _fsync_parent_directory(path)
                 return AtomicCreateResult.IDEMPOTENT
             _fail(FailureCode.CONTRACT_PERSISTENCE_CONFLICT)
         if not _existing_equivalent(path, content, policy):
             _fail(FailureCode.CONTRACT_PERSISTENCE_UNTRUSTED)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        _fsync_parent_directory(path)
         return AtomicCreateResult.CREATED
     except PreparationContractError:
         raise

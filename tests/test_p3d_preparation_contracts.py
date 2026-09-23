@@ -3,8 +3,10 @@ from __future__ import annotations
 import ast
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
+import stat
 
 import pytest
 
@@ -12,6 +14,8 @@ from pdi.production_ops.p3d_preparation_contracts import (
     ALLOWED_TRANSITIONS,
     AtomicCreatePolicyV1,
     AtomicCreateResult,
+    CANONICAL_P3D_INSTALL_PATH_MODES,
+    CANONICAL_P3D_INSTALL_PATHS,
     FailureCode,
     GateAPhase,
     GateBPhase,
@@ -38,12 +42,15 @@ from pdi.production_ops.p3d_preparation_contracts import (
     canonical_json_bytes,
     contract_fingerprint,
     os_runtime_manifest_fingerprint,
+    preparation_journal_fingerprint,
     release_bundle_fingerprint,
     release_pin_fingerprint,
     rollback_metadata_fingerprint,
     source_release_fingerprint,
     source_runtime_fingerprint,
     transition_preparation_state,
+    validate_gate_tool_authority,
+    validate_preparation_journal_chain,
     validate_complete_marker_authorities,
     validate_pre_rehearsal_preparation_contract,
     validate_rollback_release_pin,
@@ -54,6 +61,10 @@ from pdi.production_ops.p3d_preparation_contracts import (
 
 CANDIDATE = "a" * 40
 ROLLBACK_SOURCE = "b" * 40
+BACKUP_TOOL_SOURCE = "c" * 40
+RESTORE_TOOL_SOURCE = "d" * 40
+BOOTSTRAP_TOOL_SOURCE = "e" * 40
+FOREIGN_TOOL_SOURCE = "f" * 40
 H1 = "1" * 64
 H2 = "2" * 64
 H3 = "3" * 64
@@ -96,8 +107,8 @@ def rollback_mapping() -> dict[str, object]:
         "QUALIFIED_AT_UTC": WHEN,
     }
     for prefix, identity in (
-        ("EXPORT", tool_mapping(ToolName.BACKUP_EXPORT)),
-        ("RESTORE", tool_mapping(ToolName.RESTORE_QUALIFY)),
+        ("EXPORT", tool_mapping(ToolName.BACKUP_EXPORT, BACKUP_TOOL_SOURCE)),
+        ("RESTORE", tool_mapping(ToolName.RESTORE_QUALIFY, RESTORE_TOOL_SOURCE)),
     ):
         value.update({f"{prefix}_{key}": item for key, item in identity.items()})
     return value
@@ -190,11 +201,18 @@ def release_pin_mapping() -> dict[str, str]:
     }
 
 
-def tool_for_gate(gate: PreparationGate) -> ToolName:
+def tools_for_gate(gate: PreparationGate) -> list[dict[str, str]]:
     return {
-        PreparationGate.ROLLBACK_QUALIFICATION: ToolName.BACKUP_EXPORT,
-        PreparationGate.RELEASE_STAGING: ToolName.RELEASE_BOOTSTRAP,
-        PreparationGate.INERT_ASSET_INSTALL: ToolName.INERT_ASSET_INSTALL,
+        PreparationGate.ROLLBACK_QUALIFICATION: [
+            tool_mapping(ToolName.BACKUP_EXPORT, BACKUP_TOOL_SOURCE),
+            tool_mapping(ToolName.RESTORE_QUALIFY, RESTORE_TOOL_SOURCE),
+        ],
+        PreparationGate.RELEASE_STAGING: [
+            tool_mapping(ToolName.RELEASE_BOOTSTRAP, BOOTSTRAP_TOOL_SOURCE),
+        ],
+        PreparationGate.INERT_ASSET_INSTALL: [
+            tool_mapping(ToolName.INERT_ASSET_INSTALL),
+        ],
     }[gate]
 
 
@@ -207,28 +225,63 @@ def state_for(gate: PreparationGate, phase: str = "NEW") -> PreparationOperation
         "phase": phase,
         "started_at": WHEN,
         "updated_at": WHEN,
-        "tool_identity": tool_mapping(tool_for_gate(gate)),
+        "operator_tool_identities": tools_for_gate(gate),
         "evidence_fingerprint": None,
         "failure_code": None,
     })
 
 
+def journal_event(
+    *,
+    gate: PreparationGate = PreparationGate.RELEASE_STAGING,
+    sequence: int,
+    from_state: str,
+    to_state: str,
+    timestamp: str = WHEN,
+    operation_id: str = OPERATION_ID,
+    candidate_sha: str = CANDIDATE,
+    tool_name: ToolName = ToolName.RELEASE_BOOTSTRAP,
+    tool_source_sha: str = BOOTSTRAP_TOOL_SOURCE,
+    failure_code: FailureCode | None = None,
+) -> PreparationJournalEventV1:
+    return PreparationJournalEventV1.from_mapping({
+        "version": 1,
+        "sequence": sequence,
+        "operation_id": operation_id,
+        "gate": gate.value,
+        "candidate_sha": candidate_sha,
+        "from_state": from_state,
+        "to_state": to_state,
+        "timestamp": timestamp,
+        "tool_identity": tool_mapping(tool_name, tool_source_sha),
+        "evidence_fingerprints": [H2, H1],
+        "failure_code": None if failure_code is None else failure_code.value,
+    })
+
+
+def state_bound_to_journal(
+    events: tuple[PreparationJournalEventV1, ...],
+) -> PreparationOperationStateV1:
+    last = events[-1]
+    state = state_for(last.gate, last.to_state)
+    return replace(
+        state,
+        updated_at=last.timestamp,
+        evidence_fingerprint=preparation_journal_fingerprint(events),
+        failure_code=last.failure_code,
+    )
+
+
 def installed_files() -> tuple[InstalledFileEntryV1, ...]:
-    return (
+    return tuple(
         InstalledFileEntryV1.from_mapping({
-            "path": "/etc/pdi/scoped/units/enrichment.file-metadata.env",
-            "sha256": H1,
+            "path": path,
+            "sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
             "owner_uid": 0,
             "owner_gid": 0,
-            "mode": "0600",
-        }),
-        InstalledFileEntryV1.from_mapping({
-            "path": "/etc/systemd/system/pdi-enrichment-file-metadata.timer",
-            "sha256": H2,
-            "owner_uid": 0,
-            "owner_gid": 0,
-            "mode": "0644",
-        }),
+            "mode": mode,
+        })
+        for path, mode in sorted(CANONICAL_P3D_INSTALL_PATH_MODES.items())
     )
 
 
@@ -245,8 +298,8 @@ def complete_marker_mapping() -> dict[str, object]:
         "enabled_scope_fingerprint": H5,
         "unit_profile_asset_fingerprint": asset_installation_fingerprint(files),
         "installed_file_manifest": [item.to_mapping() for item in files],
-        "current_symlink_before": "/opt/pdi/releases/previous-release",
-        "current_symlink_after": "/opt/pdi/releases/previous-release",
+        "current_symlink_before": f"/opt/pdi/releases/{ROLLBACK_SOURCE}",
+        "current_symlink_after": f"/opt/pdi/releases/{ROLLBACK_SOURCE}",
         "p3c_systemd_state_before_fingerprint": H5,
         "p3c_systemd_state_after_fingerprint": H5,
         "p3d_timer_state": "DISABLED_INACTIVE",
@@ -317,6 +370,17 @@ def test_os_runtime_manifest_is_deterministic_and_strict() -> None:
     invalid["MANIFEST_VERSION"] = "2"
     with pytest.raises(PreparationContractError):
         OSRuntimeManifestV1.from_mapping(invalid)
+
+
+def test_native_library_packages_are_nonempty_approved_subset() -> None:
+    valid = os_manifest_mapping()
+    valid["NATIVE_LIBRARY_PACKAGE_SET"] = ["libbeta"]
+    assert OSRuntimeManifestV1.from_mapping(valid).native_library_package_set == ("libbeta",)
+    for native in ([], ["libgamma"], ["libalpha", "libalpha"]):
+        invalid = os_manifest_mapping()
+        invalid["NATIVE_LIBRARY_PACKAGE_SET"] = native
+        with pytest.raises(PreparationContractError):
+            OSRuntimeManifestV1.from_mapping(invalid)
 
 
 def test_wheelhouse_manifest_roundtrip_and_fingerprint() -> None:
@@ -518,15 +582,46 @@ def test_gate_failure_codes_are_namespace_bound() -> None:
         )
 
 
-def test_state_rejects_time_regression_and_foreign_tool_source() -> None:
+def test_state_rejects_time_regression_but_allows_external_bootstrap_source() -> None:
     state = state_for(PreparationGate.RELEASE_STAGING).to_mapping()
     state["updated_at"] = "2026-09-21T01:02:02Z"
     with pytest.raises(PreparationContractError):
         PreparationOperationStateV1.from_mapping(state)
-    state = state_for(PreparationGate.RELEASE_STAGING).to_mapping()
-    state["tool_identity"] = tool_mapping(ToolName.RELEASE_BOOTSTRAP, ROLLBACK_SOURCE)
+    assert state_for(
+        PreparationGate.RELEASE_STAGING,
+    ).operator_tool_identities[0].tool_source_sha == BOOTSTRAP_TOOL_SOURCE
+
+
+def test_gate_specific_tool_authority_accepts_external_gate_a_and_b_tools() -> None:
+    gate_a = state_for(PreparationGate.ROLLBACK_QUALIFICATION)
+    assert {item.tool_source_sha for item in gate_a.operator_tool_identities} == {
+        BACKUP_TOOL_SOURCE, RESTORE_TOOL_SOURCE,
+    }
+    gate_b = state_for(PreparationGate.RELEASE_STAGING)
+    assert gate_b.operator_tool_identities[0].tool_source_sha == BOOTSTRAP_TOOL_SOURCE
+    assert validate_gate_tool_authority(
+        gate_a.gate, gate_a.operator_tool_identities, CANDIDATE,
+    ) == gate_a.operator_tool_identities
+
+
+@pytest.mark.parametrize(
+    ("gate", "tools"),
+    [
+        (PreparationGate.ROLLBACK_QUALIFICATION, [tool_mapping(ToolName.BACKUP_EXPORT)]),
+        (PreparationGate.RELEASE_STAGING, [tool_mapping(ToolName.BACKUP_EXPORT)]),
+        (PreparationGate.INERT_ASSET_INSTALL, [
+            tool_mapping(ToolName.INERT_ASSET_INSTALL, FOREIGN_TOOL_SOURCE),
+        ]),
+    ],
+)
+def test_gate_specific_tool_authority_rejects_missing_wrong_or_foreign_tools(
+    gate: PreparationGate,
+    tools: list[dict[str, str]],
+) -> None:
+    mapping = state_for(gate).to_mapping()
+    mapping["operator_tool_identities"] = tools
     with pytest.raises(PreparationContractError):
-        PreparationOperationStateV1.from_mapping(state)
+        PreparationOperationStateV1.from_mapping(mapping)
 
 
 def test_gate_b_final_rename_requires_immutability_and_has_no_promotion() -> None:
@@ -587,32 +682,219 @@ def test_gate_c_complete_marker_requires_static_and_quiet_phases() -> None:
     ]["REGISTRY_VERIFIED"]
 
 
-def test_preparation_state_and_journal_envelopes_are_candidate_bound() -> None:
+def test_preparation_state_and_journal_envelopes_bind_candidate_and_tool_authority() -> None:
     state = state_for(PreparationGate.RELEASE_STAGING)
     assert PreparationOperationStateV1.from_mapping(state.to_mapping()) == state
-    event = PreparationJournalEventV1.from_mapping({
-        "version": 1,
-        "sequence": 1,
-        "operation_id": OPERATION_ID,
-        "gate": PreparationGate.RELEASE_STAGING.value,
-        "candidate_sha": CANDIDATE,
-        "from_state": "NEW",
-        "to_state": "ARTIFACT_VERIFIED",
-        "timestamp": WHEN,
-        "tool_identity": tool_mapping(ToolName.RELEASE_BOOTSTRAP),
-        "evidence_fingerprints": [H2, H1],
-        "failure_code": None,
-    })
+    event = journal_event(sequence=1, from_state="NEW", to_state="ARTIFACT_VERIFIED")
     assert event.evidence_fingerprints == (H1, H2)
-    foreign = event.to_mapping()
-    foreign["tool_identity"] = tool_mapping(ToolName.RELEASE_BOOTSTRAP, ROLLBACK_SOURCE)
+    assert event.tool_identity.tool_source_sha == BOOTSTRAP_TOOL_SOURCE
+    wrong_role = event.to_mapping()
+    wrong_role["tool_identity"] = tool_mapping(ToolName.BACKUP_EXPORT, BACKUP_TOOL_SOURCE)
     with pytest.raises(PreparationContractError):
-        PreparationJournalEventV1.from_mapping(foreign)
+        PreparationJournalEventV1.from_mapping(wrong_role)
+
+
+def test_gate_a_journal_phase_requires_matching_external_tool_role() -> None:
+    export = journal_event(
+        gate=PreparationGate.ROLLBACK_QUALIFICATION,
+        sequence=1,
+        from_state="NEW",
+        to_state="SOURCE_VERIFIED",
+        tool_name=ToolName.BACKUP_EXPORT,
+        tool_source_sha=BACKUP_TOOL_SOURCE,
+    )
+    restore = journal_event(
+        gate=PreparationGate.ROLLBACK_QUALIFICATION,
+        sequence=5,
+        from_state="BACKUP_SNAPSHOT_CREATED",
+        to_state="RESTORE_STARTED",
+        tool_name=ToolName.RESTORE_QUALIFY,
+        tool_source_sha=RESTORE_TOOL_SOURCE,
+    )
+    assert export.tool_identity.tool_source_sha != CANDIDATE
+    assert restore.tool_identity.tool_source_sha != CANDIDATE
+    invalid = export.to_mapping()
+    invalid["tool_identity"] = tool_mapping(ToolName.RESTORE_QUALIFY, RESTORE_TOOL_SOURCE)
+    with pytest.raises(PreparationContractError):
+        PreparationJournalEventV1.from_mapping(invalid)
+
+
+def test_gate_c_journal_tool_must_be_candidate_bound() -> None:
+    valid = journal_event(
+        gate=PreparationGate.INERT_ASSET_INSTALL,
+        sequence=1,
+        from_state="NEW",
+        to_state="PREREQUISITES_VERIFIED",
+        tool_name=ToolName.INERT_ASSET_INSTALL,
+        tool_source_sha=CANDIDATE,
+    )
+    invalid = valid.to_mapping()
+    invalid["tool_identity"] = tool_mapping(
+        ToolName.INERT_ASSET_INSTALL, FOREIGN_TOOL_SOURCE,
+    )
+    with pytest.raises(PreparationContractError):
+        PreparationJournalEventV1.from_mapping(invalid)
+
+
+def test_preparation_journal_chain_accepts_equal_timestamps_and_binds_state() -> None:
+    events = (
+        journal_event(sequence=1, from_state="NEW", to_state="ARTIFACT_VERIFIED"),
+        journal_event(
+            sequence=2,
+            from_state="ARTIFACT_VERIFIED",
+            to_state="OS_RUNTIME_VERIFIED",
+        ),
+    )
+    state = state_bound_to_journal(events)
+    assert validate_preparation_journal_chain(events, state)
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        lambda events: (replace(events[0], sequence=2), events[1]),
+        lambda events: (events[0], replace(events[1], sequence=3)),
+        lambda events: (events[0], replace(events[1], sequence=1)),
+        lambda events: (events[0], replace(events[1], operation_id="22222222-2222-4222-8222-222222222222")),
+        lambda events: (events[0], replace(events[1], candidate_sha=ROLLBACK_SOURCE)),
+        lambda events: (events[0], replace(events[1], from_state="NEW")),
+        lambda events: (events[0], replace(events[1], timestamp="2026-09-21T01:02:02Z")),
+    ],
+)
+def test_preparation_journal_chain_rejects_sequence_identity_continuity_and_time_drift(
+    mutator,
+) -> None:
+    events = (
+        journal_event(sequence=1, from_state="NEW", to_state="ARTIFACT_VERIFIED"),
+        journal_event(
+            sequence=2,
+            from_state="ARTIFACT_VERIFIED",
+            to_state="OS_RUNTIME_VERIFIED",
+        ),
+    )
+    with pytest.raises(PreparationContractError):
+        validate_preparation_journal_chain(mutator(events), state_bound_to_journal(events))
+
+
+def test_preparation_journal_chain_rejects_event_after_terminal() -> None:
+    phases = [item.value for item in GateBPhase if item.value != "FAILED"]
+    complete_chain = tuple(
+        journal_event(
+            sequence=index,
+            from_state=source,
+            to_state=target,
+        )
+        for index, (source, target) in enumerate(zip(phases, phases[1:]), start=1)
+    )
+    following = journal_event(
+        sequence=len(complete_chain) + 1,
+        from_state="FINAL_VERIFIED",
+        to_state="COMPLETE",
+    )
+    with pytest.raises(PreparationContractError):
+        validate_preparation_journal_chain(
+            (*complete_chain, following),
+            state_bound_to_journal(complete_chain),
+        )
+
+
+def test_preparation_journal_chain_binds_terminal_failure_to_state() -> None:
+    events = (
+        journal_event(
+            sequence=1,
+            from_state="NEW",
+            to_state="FAILED",
+            failure_code=FailureCode.RELEASE_ARTIFACT_INVALID,
+        ),
+    )
+    raw_state = state_for(PreparationGate.RELEASE_STAGING).to_mapping()
+    raw_state.update({
+        "phase": "FAILED",
+        "updated_at": WHEN,
+        "evidence_fingerprint": preparation_journal_fingerprint(events),
+        "failure_code": FailureCode.RELEASE_ARTIFACT_INVALID.value,
+    })
+    state = PreparationOperationStateV1.from_mapping(raw_state)
+    assert validate_preparation_journal_chain(events, state)
+    with pytest.raises(PreparationContractError):
+        validate_preparation_journal_chain(
+            events,
+            replace(state, failure_code=FailureCode.RELEASE_FINAL_CONFLICT),
+        )
+
+
+@pytest.mark.parametrize(
+    "state_mutator",
+    [
+        lambda state: replace(state, phase="ARTIFACT_VERIFIED"),
+        lambda state: replace(state, updated_at="2026-09-21T01:02:04Z"),
+        lambda state: replace(state, evidence_fingerprint=H6),
+        lambda state: replace(
+            state,
+            operator_tool_identities=(OperatorToolIdentity.from_mapping(
+                tool_mapping(ToolName.RELEASE_BOOTSTRAP, FOREIGN_TOOL_SOURCE),
+            ),),
+        ),
+    ],
+)
+def test_preparation_journal_chain_rejects_persisted_state_drift(state_mutator) -> None:
+    events = (
+        journal_event(sequence=1, from_state="NEW", to_state="ARTIFACT_VERIFIED"),
+        journal_event(
+            sequence=2,
+            from_state="ARTIFACT_VERIFIED",
+            to_state="OS_RUNTIME_VERIFIED",
+        ),
+    )
+    with pytest.raises(PreparationContractError):
+        validate_preparation_journal_chain(events, state_mutator(state_bound_to_journal(events)))
 
 
 def test_complete_marker_and_live_prerequisite_contract() -> None:
     marker = P3DAssetInstallationCompleteV1.from_mapping(complete_marker_mapping())
+    assert len(marker.installed_file_manifest) == 13
+    assert {item.path for item in marker.installed_file_manifest} == CANONICAL_P3D_INSTALL_PATHS
     assert validate_pre_rehearsal_preparation_contract(marker, live_prerequisite(marker))
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "extra", "wrong_timer", "wrong_profile"])
+def test_complete_marker_requires_exact_canonical_13_file_set(mutation: str) -> None:
+    mapping = complete_marker_mapping()
+    manifest = mapping["installed_file_manifest"]
+    assert isinstance(manifest, list)
+    if mutation == "missing":
+        manifest.pop()
+    elif mutation == "duplicate":
+        manifest[-1] = dict(manifest[0])
+    else:
+        replacement = dict(manifest[-1])
+        replacement["path"] = {
+            "extra": "/etc/shadow",
+            "wrong_timer": "/etc/systemd/system/pdi-scoped-enrichment-wrong.timer",
+            "wrong_profile": "/etc/pdi/scoped/units/enrichment.local.env",
+        }[mutation]
+        manifest[-1] = replacement
+    mapping["unit_profile_asset_fingerprint"] = H6
+    with pytest.raises(PreparationContractError):
+        P3DAssetInstallationCompleteV1.from_mapping(mapping)
+
+
+@pytest.mark.parametrize(
+    ("path", "mode"),
+    [
+        ("/etc/systemd/system/pdi-scoped-pipeline@.service", "0600"),
+        ("/etc/pdi/scoped/units/enrichment.file_metadata.env", "0644"),
+    ],
+)
+def test_installed_asset_modes_are_class_specific(path: str, mode: str) -> None:
+    with pytest.raises(PreparationContractError):
+        InstalledFileEntryV1.from_mapping({
+            "path": path,
+            "sha256": H1,
+            "owner_uid": 0,
+            "owner_gid": 0,
+            "mode": mode,
+        })
 
 
 def test_complete_marker_must_match_exact_rollback_metadata() -> None:
@@ -633,7 +915,10 @@ def test_complete_marker_must_match_exact_rollback_metadata() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("current_symlink_after", "/opt/pdi/releases/unexpected"),
+        ("current_symlink_before", "/tmp/foo"),
+        ("current_symlink_before", f"/opt/pdi/releases/{CANDIDATE}"),
+        ("current_symlink_after", f"/opt/pdi/releases/{FOREIGN_TOOL_SOURCE}"),
+        ("current_symlink_after", f"/opt/pdi/releases/{CANDIDATE}"),
         ("p3c_systemd_state_after_fingerprint", H6),
         ("p3d_timer_state", "ACTIVE"),
         ("rollback_source_sha", CANDIDATE),
@@ -726,6 +1011,67 @@ def test_atomic_create_no_replace_is_durable_idempotent_and_conflict_safe(tmp_pa
     assert target.stat().st_mode & 0o777 == 0o600
     with pytest.raises(PreparationContractError, match=FailureCode.CONTRACT_PERSISTENCE_CONFLICT.value):
         atomic_create_no_replace(target, b'{"version":2}', policy=policy)
+
+
+def test_atomic_retry_repeats_parent_fsync_after_first_durability_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir(mode=0o700)
+    policy = AtomicCreatePolicyV1(
+        owner_uid=os.getuid(), owner_gid=os.getgid(), mode=0o600, trust_root=trusted,
+    )
+    target = trusted / "authority.json"
+    original_fsync = os.fsync
+    failed = False
+
+    def fail_first_directory_fsync(descriptor: int) -> None:
+        nonlocal failed
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not failed:
+            failed = True
+            raise OSError("injected parent fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_first_directory_fsync)
+    with pytest.raises(
+        PreparationContractError,
+        match=FailureCode.CONTRACT_PERSISTENCE_UNTRUSTED.value,
+    ):
+        atomic_create_no_replace(target, b'{"version":1}', policy=policy)
+    assert target.read_bytes() == b'{"version":1}'
+
+    monkeypatch.setattr(os, "fsync", original_fsync)
+    assert atomic_create_no_replace(
+        target, b'{"version":1}', policy=policy,
+    ) is AtomicCreateResult.IDEMPOTENT
+    assert target.read_bytes() == b'{"version":1}'
+
+
+def test_atomic_existing_equivalent_fails_if_parent_fsync_still_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trusted = tmp_path / "trusted"
+    trusted.mkdir(mode=0o700)
+    policy = AtomicCreatePolicyV1(
+        owner_uid=os.getuid(), owner_gid=os.getgid(), mode=0o600, trust_root=trusted,
+    )
+    target = trusted / "authority.json"
+    assert atomic_create_no_replace(target, b"{}", policy=policy) is AtomicCreateResult.CREATED
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected repeated parent fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    with pytest.raises(
+        PreparationContractError,
+        match=FailureCode.CONTRACT_PERSISTENCE_UNTRUSTED.value,
+    ):
+        atomic_create_no_replace(target, b"{}", policy=policy)
 
 
 def test_atomic_create_rejects_untrusted_parent_and_symlink(tmp_path: Path) -> None:

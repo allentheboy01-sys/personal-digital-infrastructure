@@ -56,8 +56,12 @@ are pinned values rather than comparison expressions.
 Artifact and source identities are never interchangeable. The allowlist covers
 backup export, restore qualification, release bundle build, release bootstrap,
 and inert asset installation. Rollback metadata also checks the expected tool
-role for export and restore. Release bundle and Gate C marker tools must be
-built from the exact candidate SHA.
+role for export and restore. Candidate identity and operator-tool identity are
+separate authorities bound by the preparation contract: Gate A requires the
+complete external `BACKUP_EXPORT` plus `RESTORE_QUALIFY` authority set, Gate B
+requires the external `RELEASE_BOOTSTRAP` authority, and Gate C requires only
+`INERT_ASSET_INSTALL`, whose source SHA must equal the candidate. Release bundle
+builder and Gate C marker tools remain exact-candidate-bound.
 
 ## Gate A: rollback qualification
 
@@ -90,7 +94,9 @@ is no implicit garbage collection, automatic deletion, or implicit retirement.
 
 `OSRuntimeManifestV1` is a deterministic, exact inventory of the approved OS,
 architecture, package versions, system Python/ABI, native packages, and runtime
-file fingerprint. `WheelhouseManifestV1` binds the OS manifest and a sorted,
+file fingerprint. The native-package set is nonempty, duplicate-free, and a
+subset of the exact approved package-name/version authority. `WheelhouseManifestV1`
+binds the OS manifest and a sorted,
 duplicate-free wheel inventory containing exact package versions, filenames,
 hashes, and compatibility tags.
 
@@ -133,11 +139,19 @@ and systemd quietness have all been recorded. Failures use only
 enabled Scope, installed unit/profile assets, operation and tool identity. It
 requires:
 
-- active symlink before equals active symlink after;
+- active symlink before and after both equal
+  `/opt/pdi/releases/<rollback_source_sha>`;
 - P3C systemd fingerprint before equals fingerprint after;
 - P3D timers are `DISABLED_INACTIVE`;
-- installed assets are root-owned and have an exact `0600` or `0644` mode;
+- the installed manifest is the exact canonical 13-file set: the generic
+  scoped-pipeline service, six canonical enrichment timers, and six canonical
+  pipeline profiles, with no missing, duplicate, extra, or arbitrary paths;
+- service/timer assets are root-owned `0644`, while profiles are root-owned
+  `0600`;
 - candidate and rollback source identities differ.
+
+The asset fingerprint covers that complete canonical manifest, so a self-consistent
+subset is not an installation authority.
 
 ## Preparation prerequisite for collect-evidence
 
@@ -173,19 +187,33 @@ The following functions SHA-256 that canonical representation:
 - `source_release_fingerprint`
 - `source_runtime_fingerprint`
 - `asset_installation_fingerprint`
+- `preparation_journal_fingerprint`
 
 Ordering changes do not change a fingerprint; semantic changes do.
 
 ## State and journal envelope
 
 `PreparationOperationStateV1` binds one operation, preparation gate, candidate,
-phase, timestamps, tool, evidence fingerprint, and optional fixed failure code.
-The tool source SHA must equal the candidate and time cannot move backward.
+phase, timestamps, the complete gate-specific operator-tool authority set,
+evidence fingerprint, and optional fixed failure code. Gate A records both
+external export and restore tools; Gate B records its external bootstrap tool;
+only Gate C requires its operator source SHA to equal the candidate. Time cannot
+move backward.
 
 `PreparationJournalEventV1` adds a positive sequence, from/to phases, sorted
-unique evidence fingerprints, and a gate-specific failure code. A journal
+unique evidence fingerprints, a phase-compatible operator-tool identity, and a
+gate-specific failure code. Gate A export phases require `BACKUP_EXPORT`, its
+restore/qualification phases require `RESTORE_QUALIFY`, Gate B permits only
+`RELEASE_BOOTSTRAP`, and Gate C permits only its candidate-bound installer. A journal
 writer in a later package must append events and persist current state using
 the atomic contract. Raw exceptions are never journal values.
+
+`validate_preparation_journal_chain()` is a pure whole-chain validator. Sequence
+starts at 1 and advances by one; operation, gate, and candidate remain fixed;
+phase transitions are continuous; timestamps may be equal at second precision
+but never regress; and no event follows `COMPLETE` or `FAILED`. The final event
+must match persisted phase, failure, timestamp, tool authority, and the persisted
+full-journal evidence fingerprint.
 
 Nonterminal states describe crash recovery points. `COMPLETE` and `FAILED` are
 terminal; a failed operation cannot continue magically. A separately reviewed
@@ -217,7 +245,9 @@ chain; writes an exact-mode temporary file; applies owner/mode; flushes and
 fsyncs it; rereads the bytes and metadata; links it into place without replace;
 revalidates the result; and fsyncs the parent directory.
 
-An existing exact equivalent is idempotent success. Any non-equivalent object,
+An existing exact equivalent is idempotent success only after the parent
+directory is fsynced again. This closes the retry case where the first link
+succeeded but its parent fsync failed. Any non-equivalent object,
 symlink, weak parent, wrong owner/mode, or race is a fixed conflict/refusal.
 There is no silent overwrite. Tests use an injected temporary trust root and
 current test UID/GID; production defaults are not weakened.
