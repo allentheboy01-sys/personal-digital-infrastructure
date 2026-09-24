@@ -386,7 +386,8 @@ def test_root_controlled_release_reader_scans_runtime_with_fixed_environments(
     dist_info = release / ".venv/lib/python3.13/site-packages/demo.dist-info"
     (dist_info / "METADATA").write_text("Name: Demo_Package\nVersion: 1.2.3\n", encoding="utf-8")
     (dist_info / "RECORD").write_text("demo.py,,\n", encoding="utf-8")
-    (release / ".venv/bin/python").symlink_to(Path(sys.executable).resolve())
+    python_target = Path(sys.executable).resolve()
+    (release / ".venv/bin/python").symlink_to(python_target)
     release.chmod(0o755)
     for path in release.rglob("*"):
         if not path.is_symlink():
@@ -427,7 +428,18 @@ def test_root_controlled_release_reader_scans_runtime_with_fixed_environments(
             }) + "\n"
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
-    facts = RootControlledReleaseFactsReader(current_path=current, runner=runner).read(release)
+    with pytest.raises(RollbackQualificationError, match=FailureCode.ROLLBACK_SOURCE_INVALID.value):
+        RootControlledReleaseFactsReader(
+            current_path=current,
+            approved_external_symlink_roots=(tmp_path / "unapproved-external-root",),
+            runner=runner,
+        ).read(release)
+
+    facts = RootControlledReleaseFactsReader(
+        current_path=current,
+        approved_external_symlink_roots=(python_target.parent,),
+        runner=runner,
+    ).read(release)
     assert facts.git_head == SOURCE
     assert facts.git_clean is True
     assert all(not entry.relative_path.startswith(".git") for entry in facts.entries)

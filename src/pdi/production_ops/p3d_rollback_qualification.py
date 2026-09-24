@@ -1643,8 +1643,9 @@ class Postgres16RestoreQualificationAdapter:
         try:
             with psycopg.connect(self.admin_target.conninfo(database=admin_database), autocommit=True) as connection:
                 connection.execute(
-                    sql.SQL("CREATE ROLE {} LOGIN PASSWORD %s").format(sql.Identifier(role)),
-                    (password,),
+                    sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                        sql.Identifier(role), sql.Literal(password),
+                    ),
                 )
                 connection.execute(
                     sql.SQL("CREATE DATABASE {} OWNER {}").format(

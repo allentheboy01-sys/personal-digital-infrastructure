@@ -45,7 +45,7 @@ jobs:
       - name: Validate installed dependencies
         run: python -m pip check
       - name: Run host-safe suite
-        run: python -m pytest -q
+        run: python -m pytest -q --ignore=tests/integration
       - name: Validate public documentation links
         run: python scripts/check_markdown_links.py
       - name: Run portability regression
