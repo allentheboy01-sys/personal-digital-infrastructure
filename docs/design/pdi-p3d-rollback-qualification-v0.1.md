@@ -38,10 +38,21 @@ The release fingerprint covers relative runtime paths, type, mode, root uid/gid,
 file SHA-256 and approved symlink targets. It excludes unstable mtime, inode,
 absolute staging paths, and Git administrative files. Symlinks may resolve only
 inside the immutable release or an explicitly approved root-controlled external
-runtime root. The runtime fingerprint additionally binds Python version/ABI,
-implementation/platform, Python binary hash, migration tree, and a canonical
-installed-distribution inventory whose names are normalized and whose RECORD
-files are hashed.
+runtime root. The source release's Alembic graph is read with its own immutable
+Python environment and must have exactly one head equal to the expected schema
+revision; no database command or migration is executed. The runtime fingerprint
+additionally binds Python version/ABI, the migration tree and discovered head,
+and a canonical installed-distribution inventory whose names are normalized and
+whose RECORD files are hashed.
+
+The system-runtime fingerprint is a separate deterministic authority. It binds
+the OS ID/version, Debian architecture, resolved system Python, and the shared
+library closure reported by fixed-path `ldd` for Python and every native
+extension in the immutable environment. Every system file is root-controlled,
+not group/other writable, content-hashed, and mapped through fixed-path
+`dpkg-query` to one exact package/version. Missing, ambiguous, unowned, or
+untrusted dependencies fail closed. No mtime, inode, PID, or temporary path is
+included.
 
 ## One exported snapshot
 
@@ -88,13 +99,16 @@ snapshot. Direct use of the source staging dump is forbidden. The recovered
 file set, dump hash, baseline fingerprint and exported-evidence fingerprint
 must match before `pg_restore` runs.
 
-The restore adapter creates a unique loopback `*_test` database and a unique
-temporary login/owner credential, restores with PostgreSQL 16 tools, and runs
-all validation in a repeatable-read read-only transaction. Counts, Provider
+The restore adapter creates a unique loopback `*_test` database owned by a
+unique `NOLOGIN` role. It creates no temporary password: the already injected,
+approved disposable admin identity performs `pg_restore` and qualification.
+All validation runs in a repeatable-read read-only transaction. Counts, Provider
 identity state, Source/Scope hygiene, sync state and constraints must equal the
-exported baseline. A representative read-only query and the source migration/
-runtime evidence form the DB/runtime compatibility fingerprint. Cleanup drops
-both database and temporary role; cleanup failure fails the Gate.
+exported baseline, and the restored Alembic revision must equal the head
+discovered from the source release. A representative read-only query and the
+source migration/runtime evidence form the DB/runtime compatibility fingerprint.
+Cleanup drops both database and `NOLOGIN` owner role; cleanup failure fails the
+Gate.
 
 ## Backup adapters
 
@@ -110,8 +124,11 @@ qualified context; neither can be supplied as a success assertion.
 
 The orchestrator follows every frozen Gate A transition and tool role. It
 persists immutable sequence-numbered state and journal records, validates the
-whole WP1 chain, and exposes only fixed failure codes. The two operator tool
-source identities must equal the target candidate SHA.
+whole WP1 chain, and exposes only fixed failure codes. The Gate A export and
+restore tools are independent stable operator artifacts. Their exact names,
+versions, artifact hashes, and source SHAs form the state's authority set, and
+every journal event must use one exact recorded identity. Their source SHAs are
+not rebound to the target candidate SHA.
 
 After restore/runtime compatibility succeeds, disposable dump and restore
 directories are removed *before* authority artifacts are created. The active
@@ -125,8 +142,8 @@ Only then can Gate A reach `METADATA_COMMITTED` and `COMPLETE`.
 Every known failure becomes a fixed `P3D_ROLLBACK_*` code and a terminal
 `FAILED` journal state. No metadata or release pin is produced before its
 prerequisites. A backend snapshot already created is retained as unqualified;
-WP2 never prunes it. Temporary dumps, restored files, databases and credentials
-are cleaned without touching the source.
+WP2 never prunes it. Temporary dumps, restored files, databases and `NOLOGIN`
+owner roles are cleaned without touching the source.
 
 Only `NEW` and `SOURCE_VERIFIED` are retryable. The immutable loader validates
 state/journal cardinality and the complete chain before returning either phase.
@@ -146,6 +163,6 @@ The PostgreSQL integration test uses an explicit isolated
 `PDI_TEST_DATABASE_URL`, creates a unique synthetic source database, mutates the
 source after export, and proves both baseline and restored dump retain the old
 snapshot. It uses real PostgreSQL 16 `pg_dump`/`pg_restore`, a disposable real
-Restic repository, a unique restore database/credential, and deletes all
+Restic repository, a unique restore database/`NOLOGIN` owner, and deletes all
 disposable database resources. CI treats missing PostgreSQL or Restic clients
 as a failure; a developer host without them skips only that integration test.

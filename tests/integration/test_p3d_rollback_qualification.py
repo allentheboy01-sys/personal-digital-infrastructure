@@ -16,11 +16,18 @@ from pdi.production_ops.p3d_rollback_qualification import (
     PostgresBaselineCollector,
     PostgresCommandAdapter,
     PostgresTarget,
+    QualificationContext,
     ResticBackupAdapter,
+    RollbackQualificationOrchestrator,
     SourceRuntimeEvidenceV1,
     baseline_counts_fingerprint,
 )
-from pdi.production_ops.p3d_preparation_contracts import canonical_json_bytes
+from pdi.production_ops.p3d_preparation_contracts import (
+    AtomicCreatePolicyV1,
+    OperatorToolIdentity,
+    ToolName,
+    canonical_json_bytes,
+)
 from tests.integration.database_guard import require_safe_test_database_url
 
 
@@ -154,6 +161,24 @@ def _source_runtime() -> SourceRuntimeEvidenceV1:
     )
 
 
+class _QualifiedSyntheticSource:
+    def qualify(self, expected_source_sha: str) -> SourceRuntimeEvidenceV1:
+        evidence = _source_runtime()
+        assert expected_source_sha == evidence.source_sha
+        return evidence
+
+
+def _operator_tool(name: ToolName, source_sha: str) -> OperatorToolIdentity:
+    return OperatorToolIdentity.from_mapping({
+        "TOOL_NAME": name.value,
+        "TOOL_VERSION": "1.0.0",
+        "TOOL_ARTIFACT_SHA256": (
+            "5" * 64 if name is ToolName.BACKUP_EXPORT else "6" * 64
+        ),
+        "TOOL_SOURCE_SHA": source_sha,
+    })
+
+
 def test_real_postgresql16_same_snapshot_dump_backup_restore_and_read_only_compatibility(
     tmp_path: Path,
 ) -> None:
@@ -233,13 +258,88 @@ def test_real_postgresql16_same_snapshot_dump_backup_restore_and_read_only_compa
             dump_adapter=tool_adapter,
             baseline_collector=PostgresBaselineCollector(),
         )
+        with psycopg.connect(admin.conninfo(database="postgres")) as connection:
+            disposable_before = connection.execute(
+                "SELECT "
+                "(SELECT count(*) FROM pg_database WHERE datname LIKE 'pdi_p3d_restore_%_test'), "
+                "(SELECT count(*) FROM pg_roles WHERE rolname LIKE "
+                "'pdi_p3d_restore_owner_%_test')"
+            ).fetchone()
         qualified = restore_adapter.qualify(
             recovered_dump=recovered[0],
             baseline=export_result.baseline,
             source_runtime=_source_runtime(),
         )
+        with psycopg.connect(admin.conninfo(database="postgres")) as connection:
+            disposable_after = connection.execute(
+                "SELECT "
+                "(SELECT count(*) FROM pg_database WHERE datname LIKE 'pdi_p3d_restore_%_test'), "
+                "(SELECT count(*) FROM pg_roles WHERE rolname LIKE "
+                "'pdi_p3d_restore_owner_%_test')"
+            ).fetchone()
         assert qualified.restored_invariants.counts_match is True
         assert qualified.restored_invariants.invariants_match is True
+        assert disposable_after == disposable_before
         assert baseline_counts_fingerprint(export_result.baseline)
+
+        candidate_sha = "a" * 40
+        source_sha = "b" * 40
+        export_tool_source_sha = "c" * 40
+        restore_tool_source_sha = "d" * 40
+        export_tool = _operator_tool(ToolName.BACKUP_EXPORT, export_tool_source_sha)
+        restore_tool = _operator_tool(ToolName.RESTORE_QUALIFY, restore_tool_source_sha)
+        orchestrated_backup = ResticBackupAdapter(
+            tmp_path / "orchestrated-restic-repository",
+            password_file,
+            disposable_root=tmp_path,
+            backup_fs_uuid=str(UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+            restic_path=restic,
+        )
+        orchestrated_backup.initialize_disposable()
+
+        def coordinator_factory(_lifecycle):
+            return ExportedSnapshotCoordinator(
+                connect=lambda: psycopg.connect(source.conninfo()),
+                baseline_collector=PostgresBaselineCollector(),
+                dump_adapter=tool_adapter,
+            )
+
+        orchestrator = RollbackQualificationOrchestrator(
+            disposable_root=tmp_path,
+            source_qualifier=_QualifiedSyntheticSource(),
+            snapshot_coordinator_factory=coordinator_factory,
+            backup_adapter=orchestrated_backup,
+            restore_adapter=restore_adapter,
+            export_tool=export_tool,
+            restore_tool=restore_tool,
+            persistence_policy=AtomicCreatePolicyV1(
+                owner_uid=os.getuid(), owner_gid=os.getgid(), mode=0o600,
+                trust_root=tmp_path,
+            ),
+        )
+        orchestrated = orchestrator.run(QualificationContext(
+            candidate_sha,
+            source_sha,
+            "7" * 64,
+            "8" * 64,
+            str(UUID("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+            "2026-09-25T00:00:00Z",
+        ))
+        assert orchestrated.final_state.phase == "COMPLETE"
+        assert orchestrated.metadata.export_tool == export_tool
+        assert orchestrated.metadata.restore_tool == restore_tool
+        assert {
+            candidate_sha,
+            orchestrated.metadata.export_tool.tool_source_sha,
+            orchestrated.metadata.restore_tool.tool_source_sha,
+        } == {candidate_sha, export_tool_source_sha, restore_tool_source_sha}
+        with psycopg.connect(admin.conninfo(database="postgres")) as connection:
+            assert connection.execute(
+                "SELECT "
+                "(SELECT count(*) FROM pg_database WHERE datname LIKE "
+                "'pdi_p3d_restore_%_test'), "
+                "(SELECT count(*) FROM pg_roles WHERE rolname LIKE "
+                "'pdi_p3d_restore_owner_%_test')"
+            ).fetchone() == disposable_before
     finally:
         _drop_database(admin, source_database)

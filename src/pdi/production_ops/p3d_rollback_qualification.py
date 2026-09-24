@@ -16,7 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -63,6 +63,11 @@ SNAPSHOT_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 SNAPSHOT_TOKEN_PATTERN = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{8}-[0-9]+")
 SAFE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,255}")
+ALEMBIC_REVISION_PATTERN = re.compile(r"[0-9a-z]{1,64}")
+SYSTEM_PACKAGE_NAME_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?"
+)
+SYSTEM_PACKAGE_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+:~_-]{0,255}")
 CANONICAL_BASELINE_TABLES = (
     "assets",
     "blobs",
@@ -166,6 +171,18 @@ def _inside(path: Path, root: Path) -> bool:
         return True
     except (OSError, ValueError):
         return False
+
+
+def _single_source_alembic_head(payload: str) -> str:
+    try:
+        heads = json.loads(payload)
+    except (TypeError, json.JSONDecodeError):
+        _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+    if (not isinstance(heads, list) or len(heads) != 1 or
+            not isinstance(heads[0], str) or
+            ALEMBIC_REVISION_PATTERN.fullmatch(heads[0]) is None):
+        _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+    return heads[0]
 
 
 def _disposable_root(path: Path, *, code: FailureCode) -> Path:
@@ -967,6 +984,81 @@ class ResticBackupAdapter:
         return destination
 
 
+@dataclass(frozen=True, order=True)
+class SystemRuntimeFileEvidenceV1:
+    path: str
+    resolved_path: str
+    file_sha256: str
+    uid: int
+    gid: int
+    mode: str
+    package_name: str
+    package_version: str
+
+    def to_mapping(self) -> dict[str, Any]:
+        for value in (self.path, self.resolved_path):
+            if not isinstance(value, str):
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+            parsed = Path(value)
+            if (not parsed.is_absolute() or
+                    ".." in parsed.parts or any(character in value for character in ("\n", "\r", "\x00"))):
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+        if (self.uid != 0 or self.gid != 0 or
+                re.fullmatch(r"0[0-7]{3,4}", self.mode) is None or
+                int(self.mode, 8) & 0o022 or
+                SYSTEM_PACKAGE_NAME_PATTERN.fullmatch(self.package_name) is None or
+                SYSTEM_PACKAGE_VERSION_PATTERN.fullmatch(self.package_version) is None):
+            _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+        return {
+            "path": self.path,
+            "resolved_path": self.resolved_path,
+            "file_sha256": _require_hash(self.file_sha256),
+            "uid": self.uid,
+            "gid": self.gid,
+            "mode": self.mode,
+            "package_name": self.package_name,
+            "package_version": self.package_version,
+        }
+
+
+@dataclass(frozen=True)
+class SourceSystemRuntimeEvidenceV1:
+    os_id: str
+    os_version_id: str
+    architecture: str
+    python_implementation: str
+    python_version: str
+    python_abi: str
+    platform: str
+    entries: tuple[SystemRuntimeFileEvidenceV1, ...]
+
+    def to_mapping(self) -> dict[str, Any]:
+        for value in (
+            self.os_id, self.os_version_id, self.architecture,
+            self.python_implementation, self.python_version, self.python_abi, self.platform,
+        ):
+            if SAFE_NAME_PATTERN.fullmatch(value) is None:
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+        ordered = tuple(sorted(self.entries))
+        if (not ordered or len({(item.path, item.resolved_path) for item in ordered}) != len(ordered)):
+            _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+        return {
+            "version": 1,
+            "os_id": self.os_id,
+            "os_version_id": self.os_version_id,
+            "architecture": self.architecture,
+            "python_implementation": self.python_implementation,
+            "python_version": self.python_version,
+            "python_abi": self.python_abi,
+            "platform": self.platform,
+            "entries": [item.to_mapping() for item in ordered],
+        }
+
+
+def source_system_runtime_fingerprint(value: SourceSystemRuntimeEvidenceV1) -> str:
+    return contract_fingerprint(value.to_mapping())
+
+
 @dataclass(frozen=True)
 class ReleaseFilesystemFacts:
     current_target: Path
@@ -979,6 +1071,7 @@ class ReleaseFilesystemFacts:
     system_runtime_fingerprint: str
     distributions: tuple[RuntimeDistributionEntryV1, ...]
     migration_tree_fingerprint: str
+    source_alembic_head: str
     import_smoke: bool
 
 
@@ -1007,10 +1100,15 @@ class SourceRuntimeQualifier:
             python_abi=facts.python_abi,
             distributions=facts.distributions,
         )
+        runtime_hash = contract_fingerprint({
+            "source_runtime_fingerprint": runtime_hash,
+            "migration_tree_fingerprint": facts.migration_tree_fingerprint,
+            "source_alembic_head": facts.source_alembic_head,
+        })
         evidence = SourceRuntimeEvidenceV1(
             source_sha, release_hash, runtime_hash, facts.system_runtime_fingerprint,
             facts.python_version, facts.python_abi, facts.migration_tree_fingerprint,
-            EXPECTED_ALEMBIC,
+            facts.source_alembic_head,
         )
         evidence.validate()
         return evidence
@@ -1033,10 +1131,18 @@ class RootControlledReleaseFactsReader:
         current_path: Path = Path("/opt/pdi/current"),
         *,
         approved_external_symlink_roots: tuple[Path, ...] = (Path("/usr"),),
+        os_release_path: Path = Path("/etc/os-release"),
+        ldd_path: Path = Path("/usr/bin/ldd"),
+        dpkg_path: Path = Path("/usr/bin/dpkg"),
+        dpkg_query_path: Path = Path("/usr/bin/dpkg-query"),
         runner: CommandRunner = subprocess.run,
     ):
         self.current_path = current_path
         self.approved_external_symlink_roots = approved_external_symlink_roots
+        self.os_release_path = os_release_path
+        self.ldd_path = ldd_path
+        self.dpkg_path = dpkg_path
+        self.dpkg_query_path = dpkg_query_path
         self.runner = runner
 
     @staticmethod
@@ -1048,6 +1154,19 @@ class RootControlledReleaseFactsReader:
                              capture_output=True, check=False, shell=False)
         if result.returncode != 0:
             _raise(FailureCode.ROLLBACK_SOURCE_INVALID)
+        return result.stdout.strip()
+
+    @staticmethod
+    def _system_env() -> dict[str, str]:
+        return {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+
+    def _run_system(self, argv: tuple[str, ...], *, cwd: Path) -> str:
+        result = self.runner(
+            argv, cwd=cwd, env=self._system_env(), text=True,
+            capture_output=True, check=False, shell=False,
+        )
+        if result.returncode != 0:
+            _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
         return result.stdout.strip()
 
     @staticmethod
@@ -1066,6 +1185,150 @@ class RootControlledReleaseFactsReader:
                 current = current.parent
         except OSError:
             return False
+
+    def _os_identity(self) -> tuple[str, str]:
+        try:
+            raw_info = self.os_release_path.lstat()
+            resolved = self.os_release_path.resolve(strict=True)
+            resolved_info = resolved.lstat()
+            if (raw_info.st_uid != 0 or raw_info.st_gid != 0 or
+                    (not stat.S_ISLNK(raw_info.st_mode) and raw_info.st_mode & 0o022) or
+                    not stat.S_ISREG(resolved_info.st_mode) or resolved_info.st_uid != 0 or
+                    resolved_info.st_gid != 0 or resolved_info.st_mode & 0o022 or
+                    not self._root_controlled(self.os_release_path.parent, stop=Path("/")) or
+                    not self._root_controlled(resolved, stop=Path("/"))):
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+            values: dict[str, str] = {}
+            for line in resolved.read_text(encoding="utf-8").splitlines():
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, encoded = line.split("=", 1)
+                if key not in {"ID", "VERSION_ID"}:
+                    continue
+                decoded = shlex.split(encoded, posix=True)
+                if len(decoded) != 1 or SAFE_NAME_PATTERN.fullmatch(decoded[0]) is None:
+                    _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+                values[key] = decoded[0]
+            if set(values) != {"ID", "VERSION_ID"}:
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+            return values["ID"], values["VERSION_ID"]
+        except RollbackQualificationError:
+            raise
+        except (OSError, UnicodeError, ValueError):
+            _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+
+    @staticmethod
+    def _parse_ldd_output(payload: str) -> tuple[Path, ...]:
+        dependencies: set[Path] = set()
+        for raw_line in payload.splitlines():
+            line = raw_line.strip()
+            if not line or line == "statically linked":
+                continue
+            if "=>" in line:
+                _name, target = line.split("=>", 1)
+                token = target.strip().split(maxsplit=1)[0]
+                if token == "not" or not token.startswith("/"):
+                    _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+                dependencies.add(Path(token))
+                continue
+            token = line.split(maxsplit=1)[0]
+            if token in {"linux-vdso.so.1", "linux-gate.so.1"}:
+                continue
+            if not token.startswith("/"):
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+            dependencies.add(Path(token))
+        return tuple(sorted(dependencies))
+
+    def _package_identity(self, path: Path, resolved: Path, *, cwd: Path) -> tuple[str, str]:
+        packages: set[str] = set()
+        for candidate in dict.fromkeys((path, resolved)):
+            result = self.runner(
+                (str(self.dpkg_query_path), "--search", str(candidate)),
+                cwd=cwd, env=self._system_env(), text=True,
+                capture_output=True, check=False, shell=False,
+            )
+            if result.returncode != 0:
+                continue
+            for line in result.stdout.splitlines():
+                if ": " not in line:
+                    _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+                package, _installed_path = line.split(": ", 1)
+                if SYSTEM_PACKAGE_NAME_PATTERN.fullmatch(package) is None:
+                    _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+                packages.add(package)
+        if len(packages) != 1:
+            _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+        package = next(iter(packages))
+        version = self._run_system((
+            str(self.dpkg_query_path), "--show", "--showformat=${Version}", package,
+        ), cwd=cwd)
+        if SYSTEM_PACKAGE_VERSION_PATTERN.fullmatch(version) is None:
+            _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+        return package, version
+
+    def _system_runtime_entry(self, path: Path, *, cwd: Path) -> SystemRuntimeFileEvidenceV1:
+        try:
+            raw_info = path.lstat()
+            resolved = path.resolve(strict=True)
+            resolved_info = resolved.lstat()
+            if (raw_info.st_uid != 0 or raw_info.st_gid != 0 or
+                    (not stat.S_ISLNK(raw_info.st_mode) and raw_info.st_mode & 0o022) or
+                    not stat.S_ISREG(resolved_info.st_mode) or resolved_info.st_uid != 0 or
+                    resolved_info.st_gid != 0 or resolved_info.st_mode & 0o022 or
+                    not self._root_controlled(path.parent, stop=Path("/")) or
+                    not self._root_controlled(resolved, stop=Path("/"))):
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+            package, version = self._package_identity(path, resolved, cwd=cwd)
+            entry = SystemRuntimeFileEvidenceV1(
+                str(path), str(resolved), _sha256_file(resolved),
+                resolved_info.st_uid, resolved_info.st_gid,
+                f"0{stat.S_IMODE(resolved_info.st_mode):03o}", package, version,
+            )
+            entry.to_mapping()
+            return entry
+        except RollbackQualificationError:
+            raise
+        except OSError:
+            _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+
+    def _system_runtime_evidence(
+        self,
+        *,
+        release_path: Path,
+        python_path: Path,
+        site_packages: Path,
+        runtime: Mapping[str, Any],
+    ) -> SourceSystemRuntimeEvidenceV1:
+        python_target = python_path.resolve(strict=True)
+        binaries = {python_target}
+        for path in site_packages.rglob("*"):
+            if path.is_file() and (path.name.endswith(".so") or ".so." in path.name):
+                binaries.add(path.resolve(strict=True))
+        dependency_paths: set[Path] = {python_target}
+        for binary in sorted(binaries):
+            binary_inside_release = _inside(binary, release_path)
+            trust_root = release_path if binary_inside_release else Path("/")
+            if ((not binary_inside_release and binary != python_target) or
+                    not self._root_controlled(binary, stop=trust_root)):
+                _raise(FailureCode.ROLLBACK_RUNTIME_INVALID)
+            ldd_output = self._run_system((str(self.ldd_path), str(binary)), cwd=release_path)
+            dependency_paths.update(self._parse_ldd_output(ldd_output))
+        os_id, os_version_id = self._os_identity()
+        architecture = self._run_system(
+            (str(self.dpkg_path), "--print-architecture"), cwd=release_path,
+        )
+        evidence = SourceSystemRuntimeEvidenceV1(
+            os_id,
+            os_version_id,
+            architecture,
+            str(runtime["implementation"]),
+            str(runtime["version"]),
+            str(runtime["abi"]),
+            str(runtime["platform"]),
+            tuple(self._system_runtime_entry(path, cwd=release_path) for path in sorted(dependency_paths)),
+        )
+        evidence.to_mapping()
+        return evidence
 
     def read(self, release_path: Path) -> ReleaseFilesystemFacts:
         try:
@@ -1141,6 +1404,13 @@ class RootControlledReleaseFactsReader:
                 "'platform':sys.platform}))",
             ), cwd=release_path, env=import_env)
             runtime = json.loads(runtime_json)
+            source_alembic_head = _single_source_alembic_head(self._run((
+                str(python_path), "-c",
+                "import json; from alembic.config import Config; "
+                "from alembic.script import ScriptDirectory; "
+                "print(json.dumps(sorted(ScriptDirectory.from_config("
+                "Config('alembic.ini')).get_heads())))",
+            ), cwd=release_path, env=import_env))
             distributions = []
             site_packages = next(iter(sorted((release_path / ".venv").glob("lib/python*/site-packages"))), None)
             if site_packages is None:
@@ -1157,16 +1427,18 @@ class RootControlledReleaseFactsReader:
                 (str(path.relative_to(release_path)), _sha256_file(path))
                 for path in sorted((release_path / "migrations").rglob("*.py"))
             ]
+            system_runtime = self._system_runtime_evidence(
+                release_path=release_path,
+                python_path=python_path,
+                site_packages=site_packages,
+                runtime=runtime,
+            )
             return ReleaseFilesystemFacts(
                 current_target, head, status_output == "", tuple(entries), python_path,
-                str(runtime["version"]), str(runtime["abi"]), contract_fingerprint({
-                    "python_sha256": _sha256_file(python_path),
-                    "python_version": str(runtime["version"]),
-                    "python_abi": str(runtime["abi"]),
-                    "python_implementation": str(runtime["implementation"]),
-                    "platform": str(runtime["platform"]),
-                }),
-                tuple(distributions), contract_fingerprint({"migrations": migration_entries}), True,
+                str(runtime["version"]), str(runtime["abi"]),
+                source_system_runtime_fingerprint(system_runtime),
+                tuple(distributions), contract_fingerprint({"migrations": migration_entries}),
+                source_alembic_head, True,
             )
         except RollbackQualificationError:
             raise
@@ -1388,18 +1660,18 @@ class RollbackQualificationOrchestrator:
         self.snapshot_coordinator_factory = snapshot_coordinator_factory
         self.backup_adapter = backup_adapter
         self.restore_adapter = restore_adapter
-        self.export_tool = export_tool
-        self.restore_tool = restore_tool
         self.persistence_policy = persistence_policy
-        if (export_tool.tool_name is not ToolName.BACKUP_EXPORT or
-                restore_tool.tool_name is not ToolName.RESTORE_QUALIFY):
+        try:
+            self.export_tool = OperatorToolIdentity.from_mapping(export_tool.to_mapping())
+            self.restore_tool = OperatorToolIdentity.from_mapping(restore_tool.to_mapping())
+        except PreparationContractError:
+            _raise(FailureCode.ROLLBACK_SOURCE_INVALID)
+        if (self.export_tool.tool_name is not ToolName.BACKUP_EXPORT or
+                self.restore_tool.tool_name is not ToolName.RESTORE_QUALIFY):
             _raise(FailureCode.ROLLBACK_SOURCE_INVALID)
 
     def run(self, context: QualificationContext) -> RollbackQualificationResult:
         context.validate()
-        if (self.export_tool.tool_source_sha != context.candidate_sha or
-                self.restore_tool.tool_source_sha != context.candidate_sha):
-            _raise(FailureCode.ROLLBACK_SOURCE_INVALID)
         operation_id = str(uuid4())
         operation_root = self.disposable_root / f"operation-{operation_id}"
         operation_root.mkdir(mode=0o700)
@@ -1636,20 +1908,18 @@ class Postgres16RestoreQualificationAdapter:
     ) -> RestoreQualificationResult:
         identity = uuid4().hex
         database = f"pdi_p3d_restore_{identity}_test"
-        role = f"pdi_p3d_restore_{identity}_test"
-        password = secrets.token_urlsafe(32)
-        target = replace(self.admin_target, database=database, user=role, password=password)
+        owner_role = f"pdi_p3d_restore_owner_{identity}_test"
+        target = replace(self.admin_target, database=database)
         admin_database = "postgres"
         try:
+            source_runtime.validate()
             with psycopg.connect(self.admin_target.conninfo(database=admin_database), autocommit=True) as connection:
                 connection.execute(
-                    sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
-                        sql.Identifier(role), sql.Literal(password),
-                    ),
+                    sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(owner_role))
                 )
                 connection.execute(
                     sql.SQL("CREATE DATABASE {} OWNER {}").format(
-                        sql.Identifier(database), sql.Identifier(role),
+                        sql.Identifier(database), sql.Identifier(owner_role),
                     )
                 )
             self.dump_adapter.restore(dump_path=recovered_dump, target=target)
@@ -1660,6 +1930,7 @@ class Postgres16RestoreQualificationAdapter:
                 restored = self.baseline_collector.collect(connection)
                 if (baseline_counts_fingerprint(restored) != baseline_counts_fingerprint(baseline) or
                         restored.alembic_revision != baseline.alembic_revision or
+                        restored.alembic_revision != source_runtime.expected_alembic or
                         restored.postgres_major != baseline.postgres_major or
                         restored.provider_states != baseline.provider_states or
                         restored.source_provider_counts != baseline.source_provider_counts or
@@ -1683,6 +1954,7 @@ class Postgres16RestoreQualificationAdapter:
                 compatibility = contract_fingerprint({
                     "source_runtime_fingerprint": source_runtime.source_runtime_fingerprint,
                     "migration_tree_fingerprint": source_runtime.migration_tree_fingerprint,
+                    "source_alembic_head": source_runtime.expected_alembic,
                     "alembic": restored.alembic_revision,
                     "postgres_major": restored.postgres_major,
                     "read_smoke": list(read_smoke),
@@ -1714,7 +1986,7 @@ class Postgres16RestoreQualificationAdapter:
                         )
                     )
                     connection.execute(
-                        sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role))
+                        sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(owner_role))
                     )
             except Exception:
                 cleanup_failed = True
