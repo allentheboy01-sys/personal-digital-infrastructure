@@ -189,6 +189,7 @@ def _run(
     env: Mapping[str, str],
     cwd: Path | None = None,
     capture: bool = True,
+    failure_code: str = "P3D_RELEASE_BUNDLE_COMMAND_FAILED",
 ) -> subprocess.CompletedProcess[str]:
     if not argv or not Path(argv[0]).is_absolute():
         _fail("P3D_RELEASE_BUNDLE_EXECUTABLE_INVALID")
@@ -207,9 +208,9 @@ def _run(
         fixed = re.search(r"(?:^|\n)FAILURE_CODE=(P3D_RELEASE_BUNDLE_[A-Z0-9_]+)(?:\n|$)", error.stderr or "")
         if fixed:
             _fail(fixed.group(1))
-        _fail("P3D_RELEASE_BUNDLE_COMMAND_FAILED")
+        _fail(failure_code)
     except OSError:
-        _fail("P3D_RELEASE_BUNDLE_COMMAND_FAILED")
+        _fail(failure_code)
 
 
 def verify_clean_candidate_checkout(source: Path, candidate_sha: str, *, home: Path) -> None:
@@ -1162,6 +1163,7 @@ def _build_distributions(source_tree: Path, output: Path, python: Path) -> tuple
     _run(
         (python, "-m", "build", "--no-isolation", "--wheel", "--sdist", "--outdir", output),
         cwd=source_tree, env=_fixed_python_env(network=False), capture=False,
+        failure_code="P3D_RELEASE_BUNDLE_DISTRIBUTION_BUILD_FAILED",
     )
     wheels = list(output.glob("*.whl"))
     sdists = list(output.glob("*.tar.gz"))
@@ -1221,6 +1223,7 @@ def build_release_input_bundle(
         _run(
             (builder_python, "-m", "pip", "install", "--no-index", "--no-deps", wheel),
             env=_fixed_python_env(network=False), capture=False,
+            failure_code="P3D_RELEASE_BUNDLE_BUILDER_INSTALL_FAILED",
         )
         command = (
             builder_python, "-m", "pdi.production_ops.p3d_release_bundle", "_assemble",
@@ -1231,7 +1234,10 @@ def build_release_input_bundle(
             "--run-identity", run_identity, "--run-attempt", run_attempt,
             "--output-dir", output_dir,
         )
-        completed = _run(command, env=_fixed_python_env(network=True), cwd=work)
+        completed = _run(
+            command, env=_fixed_python_env(network=True), cwd=work,
+            failure_code="P3D_RELEASE_BUNDLE_ASSEMBLY_FAILED",
+        )
         try:
             result = json.loads(completed.stdout)
         except json.JSONDecodeError:

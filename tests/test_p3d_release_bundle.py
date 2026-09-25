@@ -534,6 +534,18 @@ def test_subprocess_boundary_propagates_only_fixed_child_failure(monkeypatch):
     assert "private detail" not in str(error.value)
 
 
+def test_subprocess_boundary_uses_stage_specific_fixed_failure(monkeypatch):
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0], stderr="untrusted failure text")
+
+    monkeypatch.setattr(subject.subprocess, "run", fail)
+    with pytest.raises(subject.ReleaseBundleError, match="DISTRIBUTION_BUILD_FAILED"):
+        subject._run(
+            (Path("/usr/bin/false"),), env={},
+            failure_code="P3D_RELEASE_BUNDLE_DISTRIBUTION_BUILD_FAILED",
+        )
+
+
 def test_cli_has_no_production_capabilities():
     actions = subject._parser()._subparsers._group_actions[0].choices
     assert set(actions) == {"build", "verify", "_assemble"}
