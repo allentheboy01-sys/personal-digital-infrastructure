@@ -220,6 +220,29 @@ def test_synthetic_provider_cannot_cross_into_production() -> None:
     assert raised.value.code is FailureCode.RELEASE_OS_RUNTIME_MISMATCH
 
 
+def test_qualification_provider_requires_non_writable_runtime(tmp_path: Path) -> None:
+    value = manifest()
+    python = tmp_path / "trusted-runtime/bin/python3.13"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"synthetic-python")
+    python.chmod(0o755)
+    provider = subject.QualificationHostRuntimeAuthorityProvider(
+        python, os_runtime_manifest_fingerprint(value),
+    )
+    policy = subject.BootstrapPolicy(
+        subject.BootstrapMode.QUALIFICATION, tmp_path, os.geteuid(), os.getegid(),
+        os.geteuid(), os.getegid(), "QUALIFICATION_ONLY", (tmp_path,),
+    )
+    evidence = provider.verify(value, policy=policy)
+    assert evidence.system_python_path == python
+    assert len(evidence.authority_fingerprint) == 64
+
+    python.chmod(0o775)
+    with pytest.raises(subject.BootstrapError) as raised:
+        provider.verify(value, policy=policy)
+    assert raised.value.code is FailureCode.RELEASE_OS_RUNTIME_MISMATCH
+
+
 def test_offline_pip_argv_is_hash_locked_binary_only(tmp_path: Path, monkeypatch) -> None:
     calls: list[tuple[str, ...]] = []
 
@@ -311,8 +334,17 @@ def _minimal_release(tmp_path: Path) -> Path:
     return release
 
 
+def _synthetic_approved_python(tmp_path: Path) -> Path:
+    python = tmp_path / "trusted-runtime/python3.13"
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"synthetic-python")
+    python.chmod(0o755)
+    return python
+
+
 def test_release_tree_trust_and_fingerprint(tmp_path: Path, monkeypatch) -> None:
     release = _minimal_release(tmp_path)
+    approved_python = _synthetic_approved_python(tmp_path)
     monkeypatch.setattr(subject, "_verify_git", lambda *args, **kwargs: None)
     policy = subject.BootstrapPolicy(
         subject.BootstrapMode.QUALIFICATION, tmp_path, os.geteuid(), os.getegid(),
@@ -320,7 +352,7 @@ def test_release_tree_trust_and_fingerprint(tmp_path: Path, monkeypatch) -> None
     )
     value = subject._verify_release_tree(
         release, candidate=CANDIDATE, policy=policy,
-        approved_python=Path("/usr/bin/python3.13"), home=tmp_path,
+        approved_python=approved_python, home=tmp_path,
     )
     assert len(value) == 64
 
@@ -328,6 +360,7 @@ def test_release_tree_trust_and_fingerprint(tmp_path: Path, monkeypatch) -> None
 @pytest.mark.parametrize("mutation", ["writable", "fifo", "external-symlink", "foreign-owner"])
 def test_release_tree_rejects_mutable_special_or_untrusted_content(tmp_path: Path, monkeypatch, mutation: str) -> None:
     release = _minimal_release(tmp_path)
+    approved_python = _synthetic_approved_python(tmp_path)
     policy = subject.BootstrapPolicy(
         subject.BootstrapMode.QUALIFICATION, tmp_path, os.geteuid(), os.getegid(),
         os.geteuid(), os.getegid(), "QUALIFICATION_ONLY", (Path("/usr"),),
@@ -347,7 +380,7 @@ def test_release_tree_rejects_mutable_special_or_untrusted_content(tmp_path: Pat
     with pytest.raises(subject.BootstrapError) as raised:
         subject._verify_release_tree(
             release, candidate=CANDIDATE, policy=policy,
-            approved_python=Path("/usr/bin/python3.13"), home=tmp_path,
+            approved_python=approved_python, home=tmp_path,
         )
     assert raised.value.code is FailureCode.RELEASE_IMMUTABILITY_FAILED
 
@@ -458,3 +491,15 @@ def test_bootstrap_artifact_design_is_independent_and_deferred() -> None:
         "SELF_UPDATE": "FORBIDDEN",
         "BUILD_STATUS": "DEFERRED",
     }
+
+
+def test_ci_qualification_mirrors_and_hardens_setup_python_runtime() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert 'runtime_source="${pythonLocation:?}"' in workflow
+    assert 'qualification_runtime="$RUNNER_TEMP/pdi-p3d-root-bootstrap-runtime"' in workflow
+    assert 'sudo cp -aL "$runtime_source/." "$qualification_runtime/"' in workflow
+    assert 'sudo chown -R root:root "$qualification_runtime"' in workflow
+    assert 'sudo chmod -R go-w "$qualification_runtime"' in workflow
+    assert 'system_python="$qualification_runtime/bin/python"' in workflow
+    assert 'PDI_P3D_BOOTSTRAP_SYSTEM_PYTHON="$system_python"' in workflow
+    assert 'sudo chmod -R go-w "$runtime_source"' not in workflow

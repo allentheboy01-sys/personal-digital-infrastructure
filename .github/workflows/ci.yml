@@ -159,8 +159,28 @@ jobs:
           test -f "$bundle"
           test -f "$digests"
           test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
-          system_python="$(command -v python)"
+          runtime_source="${pythonLocation:?}"
+          qualification_runtime="$RUNNER_TEMP/pdi-p3d-root-bootstrap-runtime"
           qualification_root="$RUNNER_TEMP/pdi-p3d-root-bootstrap-disposable"
+          test -d "$runtime_source"
+          test "$qualification_runtime" != "$RUNNER_TEMP"
+          sudo rm -rf -- "$qualification_runtime"
+          sudo mkdir -p "$qualification_runtime"
+          sudo cp -aL "$runtime_source/." "$qualification_runtime/"
+          sudo chown -R root:root "$qualification_runtime"
+          sudo chmod -R go-w "$qualification_runtime"
+          system_python="$qualification_runtime/bin/python"
+          sudo test -x "$system_python"
+          sudo "$system_python" -c '
+          import os
+          import stat
+          import sys
+
+          info = os.stat(sys.executable)
+          assert stat.S_ISREG(info.st_mode)
+          assert not (info.st_mode & 0o022)
+          assert sys.version_info[:2] == (3, 13)
+          '
           sudo /usr/bin/env -i \
             PATH=/usr/bin:/bin \
             LC_ALL=C \
