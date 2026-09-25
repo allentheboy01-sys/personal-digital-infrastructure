@@ -160,27 +160,98 @@ jobs:
           test -f "$digests"
           test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
           runtime_source="${pythonLocation:?}"
-          qualification_runtime="$RUNNER_TEMP/pdi-p3d-root-bootstrap-runtime"
-          qualification_root="$RUNNER_TEMP/pdi-p3d-root-bootstrap-disposable"
           test -d "$runtime_source"
-          test "$qualification_runtime" != "$RUNNER_TEMP"
-          sudo rm -rf -- "$qualification_runtime"
-          sudo mkdir -p "$qualification_runtime"
+          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-root-bootstrap-runtime.XXXXXX)"
+          qualification_root="$(sudo mktemp -d /tmp/pdi-p3d-root-bootstrap-disposable.XXXXXX)"
+          case "$qualification_runtime" in
+            /tmp/pdi-p3d-root-bootstrap-runtime.*) ;;
+            *) exit 1 ;;
+          esac
+          case "$qualification_root" in
+            /tmp/pdi-p3d-root-bootstrap-disposable.*) ;;
+            *) exit 1 ;;
+          esac
+          test "$qualification_runtime" != /tmp
+          test "$qualification_runtime" != /
+          test "$qualification_root" != /tmp
+          test "$qualification_root" != /
+          cleanup() {
+            case "$qualification_runtime" in
+              /tmp/pdi-p3d-root-bootstrap-runtime.*) ;;
+              *) return 1 ;;
+            esac
+            case "$qualification_root" in
+              /tmp/pdi-p3d-root-bootstrap-disposable.*) ;;
+              *) return 1 ;;
+            esac
+            test "$qualification_runtime" != /tmp
+            test "$qualification_runtime" != /
+            test "$qualification_root" != /tmp
+            test "$qualification_root" != /
+            sudo rm -rf -- "$qualification_runtime" "$qualification_root"
+          }
+          trap cleanup EXIT
+          sudo chmod 0755 "$qualification_root"
+          sudo chown root:root "$qualification_root"
           sudo cp -aL "$runtime_source/." "$qualification_runtime/"
           sudo chown -R root:root "$qualification_runtime"
-          sudo chmod -R go-w "$qualification_runtime"
+          sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
+          if [ -n "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)" ]; then
+            echo 'RUNTIME_MIRROR_SPECIAL_FILES=DETECTED'
+            exit 1
+          fi
+          echo 'RUNTIME_MIRROR_SPECIAL_FILES=NONE'
           system_python="$qualification_runtime/bin/python"
           sudo test -x "$system_python"
           sudo "$system_python" -c '
+          import itertools
           import os
+          import pathlib
           import stat
           import sys
 
-          info = os.stat(sys.executable)
-          assert stat.S_ISREG(info.st_mode)
-          assert not (info.st_mode & 0o022)
+          root = pathlib.Path(sys.argv[1])
+          assert root == pathlib.Path(sys.executable).parents[1]
+          for path in itertools.chain((root,), root.rglob("*")):
+              info = path.lstat()
+              mode = stat.S_IMODE(info.st_mode)
+              assert info.st_uid == 0 and info.st_gid == 0
+              if stat.S_ISDIR(info.st_mode):
+                  assert mode == 0o755
+              elif stat.S_ISREG(info.st_mode):
+                  assert mode in (0o644, 0o755)
+              else:
+                  raise AssertionError("unexpected runtime mirror file type")
+          assert sys.version_info[:2] == (3, 13)
+          ' "$qualification_runtime"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            /usr/bin/setpriv \
+              --reuid=65534 \
+              --regid=65534 \
+              --clear-groups \
+              --no-new-privs \
+              -- "$system_python" -c '
+          import ctypes
+          import json
+          import os
+          import pathlib
+          import ssl
+          import sys
+          import sysconfig
+
+          assert os.geteuid() == 65534
+          assert os.getegid() == 65534
+          assert os.getgroups() == []
+          assert "NoNewPrivs:\t1" in pathlib.Path("/proc/self/status").read_text(encoding="utf-8")
           assert sys.version_info[:2] == (3, 13)
           '
+          qualification_log="$RUNNER_TEMP/pdi-p3d-root-bootstrap-qualification.log"
+          set +e
           sudo /usr/bin/env -i \
             PATH=/usr/bin:/bin \
             LC_ALL=C \
@@ -192,7 +263,21 @@ jobs:
             PDI_P3D_BOOTSTRAP_CANDIDATE_SHA="$EXPECTED_CANDIDATE_SHA" \
             PDI_P3D_BOOTSTRAP_TOOL_SOURCE_SHA="$EXPECTED_CANDIDATE_SHA" \
             PDI_P3D_BOOTSTRAP_SYSTEM_PYTHON="$system_python" \
-            "$system_python" -m pytest -q tests/integration/test_p3d_release_bootstrap.py
+            PDI_P3D_BOOTSTRAP_RUNTIME_USER=nobody \
+            PDI_P3D_BOOTSTRAP_RUNTIME_GROUP=nogroup \
+            "$system_python" -m pytest -q tests/integration/test_p3d_release_bootstrap.py \
+            2>&1 | tee "$qualification_log"
+          qualification_status="${PIPESTATUS[0]}"
+          set -e
+          if [ "$qualification_status" -ne 0 ]; then
+            if grep -Fq 'P3D_RELEASE_STAGE_RUNTIME_INVALID' "$qualification_log"; then
+              echo 'RUNTIME_DIAGNOSTIC_REQUIRED=YES'
+              echo 'RUNTIME_DIAGNOSTIC_STAGE=CANDIDATE_RUNTIME_VERIFICATION'
+            fi
+            rm -f -- "$qualification_log"
+            exit "$qualification_status"
+          fi
+          rm -f -- "$qualification_log"
           test ! -e "$qualification_root/current"
 
   p3d-systemd-static:

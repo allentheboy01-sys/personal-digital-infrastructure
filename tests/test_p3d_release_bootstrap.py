@@ -496,10 +496,36 @@ def test_bootstrap_artifact_design_is_independent_and_deferred() -> None:
 def test_ci_qualification_mirrors_and_hardens_setup_python_runtime() -> None:
     workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert 'runtime_source="${pythonLocation:?}"' in workflow
-    assert 'qualification_runtime="$RUNNER_TEMP/pdi-p3d-root-bootstrap-runtime"' in workflow
+    assert 'qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-root-bootstrap-runtime.XXXXXX)"' in workflow
+    assert 'qualification_root="$(sudo mktemp -d /tmp/pdi-p3d-root-bootstrap-disposable.XXXXXX)"' in workflow
+    assert 'qualification_runtime="$RUNNER_TEMP/pdi-p3d-root-bootstrap-runtime"' not in workflow
+    assert 'qualification_root="$RUNNER_TEMP/pdi-p3d-root-bootstrap-disposable"' not in workflow
+    assert 'trap cleanup EXIT' in workflow
+    assert 'sudo rm -rf -- "$qualification_runtime" "$qualification_root"' in workflow
+    assert 'sudo rm -rf "$RUNNER_TEMP"' not in workflow
+    assert 'sudo chmod 0755 "$qualification_root"' in workflow
+    assert 'sudo chown root:root "$qualification_root"' in workflow
     assert 'sudo cp -aL "$runtime_source/." "$qualification_runtime/"' in workflow
     assert 'sudo chown -R root:root "$qualification_runtime"' in workflow
-    assert 'sudo chmod -R go-w "$qualification_runtime"' in workflow
+    assert 'sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +' in workflow
+    assert 'sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +' in workflow
+    assert 'sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +' in workflow
+    assert '! -type d ! -type f -print -quit' in workflow
+    assert 'RUNTIME_MIRROR_SPECIAL_FILES=DETECTED' in workflow
+    assert 'RUNTIME_MIRROR_SPECIAL_FILES=NONE' in workflow
+    assert 'assert info.st_uid == 0 and info.st_gid == 0' in workflow
+    assert 'assert mode == 0o755' in workflow
+    assert 'assert mode in (0o644, 0o755)' in workflow
     assert 'system_python="$qualification_runtime/bin/python"' in workflow
+    assert '/usr/bin/setpriv \\' in workflow
+    assert '--reuid=65534 \\' in workflow
+    assert '--regid=65534 \\' in workflow
+    assert '--clear-groups \\' in workflow
+    assert '--no-new-privs \\' in workflow
     assert 'PDI_P3D_BOOTSTRAP_SYSTEM_PYTHON="$system_python"' in workflow
+    assert 'PDI_P3D_BOOTSTRAP_RUNTIME_USER=nobody \\' in workflow
+    assert 'PDI_P3D_BOOTSTRAP_RUNTIME_GROUP=nogroup \\' in workflow
+    assert 'RUNTIME_DIAGNOSTIC_REQUIRED=YES' in workflow
+    assert 'RUNTIME_DIAGNOSTIC_STAGE=CANDIDATE_RUNTIME_VERIFICATION' in workflow
     assert 'sudo chmod -R go-w "$runtime_source"' not in workflow
+    assert 'sudo chown -R root:root "$runtime_source"' not in workflow
