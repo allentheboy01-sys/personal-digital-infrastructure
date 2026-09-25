@@ -422,6 +422,22 @@ def test_canonical_tar_supports_only_the_required_long_path_pax_header(tmp_path:
     assert subject.safe_extract_bundle(bundle, tmp_path / "target") == (relative,)
 
 
+def test_canonical_tar_uses_exact_path_header_for_splittable_path_over_100_bytes(tmp_path: Path):
+    root = tmp_path / "root"
+    prefix = root / ("p" * 20)
+    prefix.mkdir(parents=True)
+    relative = "p" * 20 + "/" + "x" * 85
+    (root / relative).write_bytes(b"asset")
+    bundle = tmp_path / "bundle.tar"
+
+    subject._write_canonical_tar(root, (relative,), bundle)
+
+    with tarfile.open(bundle, "r:") as archive:
+        member = archive.getmembers()[0]
+        assert member.pax_headers == {"path": relative}
+    assert subject.safe_extract_bundle(bundle, tmp_path / "target") == (relative,)
+
+
 def test_archive_rejects_unapproved_pax_metadata(tmp_path: Path):
     bundle = tmp_path / "unsafe-pax.tar"
     with tarfile.open(bundle, "w:", format=tarfile.PAX_FORMAT) as archive:

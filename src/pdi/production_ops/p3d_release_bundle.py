@@ -707,20 +707,8 @@ def _write_canonical_tar(root: Path, members: Sequence[str], output: Path) -> No
                     archive.addfile(info, stream)
 
 
-def _ustar_name_fits(name: str) -> bool:
-    info = tarfile.TarInfo(name)
-    info.size = 0
-    info.mode = 0o644
-    info.uid = 0
-    info.gid = 0
-    info.uname = ""
-    info.gname = ""
-    info.mtime = 0
-    try:
-        info.tobuf(tarfile.USTAR_FORMAT)
-    except ValueError:
-        return False
-    return True
+def _canonical_pax_headers(name: str) -> dict[str, str]:
+    return {"path": name} if len(name.encode("utf-8")) > tarfile.LENGTH_NAME else {}
 
 
 def _validate_archive_member(member: tarfile.TarInfo, seen: set[str]) -> str:
@@ -729,7 +717,7 @@ def _validate_archive_member(member: tarfile.TarInfo, seen: set[str]) -> str:
         _fail("P3D_RELEASE_BUNDLE_ARCHIVE_INVALID")
     if (member.uid, member.gid, member.uname, member.gname, member.mtime, member.mode) != (0, 0, "", "", 0, 0o644):
         _fail("P3D_RELEASE_BUNDLE_ARCHIVE_METADATA_INVALID")
-    expected_pax_headers = {} if _ustar_name_fits(name) else {"path": name}
+    expected_pax_headers = _canonical_pax_headers(name)
     if member.pax_headers != expected_pax_headers:
         _fail("P3D_RELEASE_BUNDLE_ARCHIVE_METADATA_INVALID")
     seen.add(name)
