@@ -15,17 +15,22 @@ expected to be a separately pinned, attested, standard-library `.pyz`; building
 that artifact is deferred from WP4.
 
 The bundle path, candidate SHA, outer bundle SHA-256, OS/runtime manifest
-fingerprint, authority class, roots, lock, and runtime identity are explicit.
-There is no "latest" discovery. The frozen WP3 verifier is called offline with
-`perform_offline_install=False` before release staging. The input is copied
-once, hash-checked and fsynced into the protected operation directory, avoiding
-a caller-writable bundle race.
+fingerprint, authority class, roots, and lock are explicit. Qualification also
+uses an explicit synthetic runtime identity. Production instead pins runtime
+authority to the systemd service identity `pdi:pdi`; the caller cannot select a
+different production user or group. There is no "latest" discovery. The frozen
+WP3 verifier is called offline with `perform_offline_install=False` before
+release staging. The input is copied once, hash-checked and fsynced into the
+protected operation directory, avoiding a caller-writable bundle race.
 
 `QUALIFICATION` accepts only `QUALIFICATION_ONLY` in an explicit disposable
-trust root. `PRODUCTION` requires effective UID 0, `/opt/pdi/releases`, fixed
-protected state and lock locations, a non-root `pdi` identity, and the separate
-`PRODUCTION_RELEASE` authority class. Therefore the current WP3 qualification
-artifact can never stage into the production release root.
+trust root and may use an explicit synthetic identity such as `nobody:nogroup`.
+`PRODUCTION` requires effective UID 0, `/opt/pdi/releases`, fixed protected
+state and lock locations, the fixed non-root `pdi:pdi` identity, and the
+separate `PRODUCTION_RELEASE` authority class. Policy construction resolves
+that fixed account locally, and input validation independently re-resolves and
+cross-checks both UID and GID. Therefore the current WP3 qualification artifact
+can never stage into the production release root.
 
 ## Gate B state and recovery
 

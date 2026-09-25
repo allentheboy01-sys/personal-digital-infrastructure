@@ -70,6 +70,8 @@ SETPRIV = Path("/usr/bin/setpriv")
 DPKG = Path("/usr/bin/dpkg")
 DPKG_QUERY = Path("/usr/bin/dpkg-query")
 PRODUCTION_AUTHORITY_CLASS = "PRODUCTION_RELEASE"
+PRODUCTION_RUNTIME_USER = "pdi"
+PRODUCTION_RUNTIME_GROUP = "pdi"
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SAFE_AUTHORITY_CLASS = re.compile(r"[A-Z][A-Z0-9_]{1,63}")
@@ -259,14 +261,13 @@ class BootstrapPolicy:
         )
 
     @classmethod
-    def production(
-        cls,
-        *,
-        runtime_uid: int,
-        runtime_gid: int,
-    ) -> "BootstrapPolicy":
-        if os.geteuid() != 0 or runtime_uid == 0 or runtime_gid == 0:
+    def production(cls) -> "BootstrapPolicy":
+        if os.geteuid() != 0:
             _fail(FailureCode.RELEASE_IMMUTABILITY_FAILED)
+        runtime_uid, runtime_gid = resolve_runtime_identity(
+            PRODUCTION_RUNTIME_USER,
+            PRODUCTION_RUNTIME_GROUP,
+        )
         return cls(
             BootstrapMode.PRODUCTION,
             Path("/"),
@@ -282,6 +283,22 @@ class BootstrapPolicy:
         if self.expected_authority_class != inputs.expected_authority_class:
             _fail(FailureCode.RELEASE_ARTIFACT_INVALID)
         if self.mode is BootstrapMode.PRODUCTION:
+            if inputs.expected_authority_class == QUALIFICATION_AUTHORITY_CLASS:
+                _fail(FailureCode.RELEASE_ARTIFACT_INVALID)
+            if (
+                inputs.runtime_user != PRODUCTION_RUNTIME_USER
+                or inputs.runtime_group != PRODUCTION_RUNTIME_GROUP
+            ):
+                _fail(FailureCode.RELEASE_RUNTIME_INVALID)
+            expected_runtime_uid, expected_runtime_gid = resolve_runtime_identity(
+                PRODUCTION_RUNTIME_USER,
+                PRODUCTION_RUNTIME_GROUP,
+            )
+            if (
+                self.runtime_uid != expected_runtime_uid
+                or self.runtime_gid != expected_runtime_gid
+            ):
+                _fail(FailureCode.RELEASE_RUNTIME_INVALID)
             expected = (
                 Path("/opt/pdi/releases"),
                 Path("/var/lib/pdi-p3d/preparation"),
@@ -294,7 +311,7 @@ class BootstrapPolicy:
                 inputs.lock_path,
                 inputs.current_path,
             )
-            if actual != expected or inputs.expected_authority_class == QUALIFICATION_AUTHORITY_CLASS:
+            if actual != expected:
                 _fail(FailureCode.RELEASE_ARTIFACT_INVALID)
         else:
             for path in (

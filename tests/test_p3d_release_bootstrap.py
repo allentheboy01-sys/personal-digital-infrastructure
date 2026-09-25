@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 
 import pytest
 
@@ -84,6 +86,28 @@ def make_policy(root: Path) -> subject.BootstrapPolicy:
         owner_gid=os.getegid(),
         runtime_uid=os.geteuid(),
         runtime_gid=os.getegid(),
+    )
+
+
+def production_inputs(
+    tmp_path: Path,
+    *,
+    runtime_user: str = subject.PRODUCTION_RUNTIME_USER,
+    runtime_group: str = subject.PRODUCTION_RUNTIME_GROUP,
+) -> subject.BootstrapInputs:
+    return subject.BootstrapInputs(
+        (tmp_path / "bundle.tar").absolute(),
+        CANDIDATE,
+        BUNDLE_HASH,
+        OS_HASH,
+        subject.PRODUCTION_AUTHORITY_CLASS,
+        tool(),
+        Path("/opt/pdi/releases"),
+        Path("/var/lib/pdi-p3d/preparation"),
+        Path("/run/lock/pdi/p3d-release-bootstrap.lock"),
+        Path("/opt/pdi/current"),
+        runtime_user,
+        runtime_group,
     )
 
 
@@ -184,6 +208,133 @@ def test_qualification_authority_is_rejected_by_production_policy(tmp_path: Path
     with pytest.raises(subject.BootstrapError) as raised:
         policy.validate_inputs(inputs)
     assert raised.value.code is FailureCode.RELEASE_ARTIFACT_INVALID
+
+
+def test_production_policy_resolves_and_validates_fixed_pdi_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def resolve(user: str, group: str) -> tuple[int, int]:
+        calls.append((user, group))
+        return 1200, 1300
+
+    monkeypatch.setattr(subject.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(subject, "resolve_runtime_identity", resolve)
+    policy = subject.BootstrapPolicy.production()
+    policy.validate_inputs(production_inputs(tmp_path))
+    assert policy.runtime_uid == 1200
+    assert policy.runtime_gid == 1300
+    assert calls == [("pdi", "pdi"), ("pdi", "pdi")]
+
+
+@pytest.mark.parametrize(
+    ("runtime_user", "runtime_group"),
+    (("nobody", "nogroup"), ("pdi", "foreign-group")),
+)
+def test_production_inputs_reject_noncanonical_runtime_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_user: str,
+    runtime_group: str,
+) -> None:
+    monkeypatch.setattr(subject, "resolve_runtime_identity", lambda user, group: (1200, 1300))
+    policy = subject.BootstrapPolicy(
+        subject.BootstrapMode.PRODUCTION, Path("/"), 0, 0, 1200, 1300,
+        subject.PRODUCTION_AUTHORITY_CLASS, (Path("/usr"),),
+    )
+    with pytest.raises(subject.BootstrapError) as raised:
+        policy.validate_inputs(production_inputs(
+            tmp_path, runtime_user=runtime_user, runtime_group=runtime_group,
+        ))
+    assert raised.value.code is FailureCode.RELEASE_RUNTIME_INVALID
+
+
+@pytest.mark.parametrize(("runtime_uid", "runtime_gid"), ((1201, 1300), (1200, 1301)))
+def test_production_policy_rejects_resolved_runtime_id_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_uid: int,
+    runtime_gid: int,
+) -> None:
+    monkeypatch.setattr(subject, "resolve_runtime_identity", lambda user, group: (1200, 1300))
+    policy = subject.BootstrapPolicy(
+        subject.BootstrapMode.PRODUCTION, Path("/"), 0, 0, runtime_uid, runtime_gid,
+        subject.PRODUCTION_AUTHORITY_CLASS, (Path("/usr"),),
+    )
+    with pytest.raises(subject.BootstrapError) as raised:
+        policy.validate_inputs(production_inputs(tmp_path))
+    assert raised.value.code is FailureCode.RELEASE_RUNTIME_INVALID
+
+
+def test_qualification_policy_allows_explicit_nobody_identity(tmp_path: Path) -> None:
+    root = make_root(tmp_path)
+    bundle = tmp_path / "bundle.tar"
+    bundle.write_bytes(b"bundle")
+    base = make_inputs(root, bundle)
+    inputs = subject.BootstrapInputs(
+        base.bundle_path, base.expected_candidate_sha, base.expected_bundle_sha256,
+        base.expected_os_runtime_manifest_sha256, base.expected_authority_class,
+        base.bootstrap_tool_identity, base.releases_root, base.preparation_state_root,
+        base.lock_path, base.current_path, "nobody", "nogroup",
+    )
+    policy = subject.BootstrapPolicy.qualification(
+        disposable_root=root,
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+        runtime_uid=65534,
+        runtime_gid=65534,
+    )
+    policy.validate_inputs(inputs)
+
+
+def test_production_cli_rejects_caller_selected_runtime_identity() -> None:
+    command = (
+        sys.executable,
+        "scripts/pdi_p3d_release_bootstrap.py",
+        "--mode", "PRODUCTION",
+        "--bundle", "/nonexistent/bundle.tar",
+        "--expected-candidate-sha", CANDIDATE,
+        "--expected-bundle-sha256", BUNDLE_HASH,
+        "--expected-os-runtime-manifest-sha256", OS_HASH,
+        "--expected-authority-class", subject.PRODUCTION_AUTHORITY_CLASS,
+        "--bootstrap-tool-version", "1.0.0",
+        "--bootstrap-tool-artifact-sha256", ARTIFACT_HASH,
+        "--bootstrap-tool-source-sha", BOOTSTRAP_SOURCE,
+        "--releases-root", "/opt/pdi/releases",
+        "--preparation-state-root", "/var/lib/pdi-p3d/preparation",
+        "--lock-path", "/run/lock/pdi/p3d-release-bootstrap.lock",
+        "--current-path", "/opt/pdi/current",
+        "--runtime-user", "nobody",
+        "--runtime-group", "nogroup",
+    )
+    result = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(Path("src").resolve()),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert result.stdout == (
+        "P3D_RELEASE_BOOTSTRAP=FAIL\n"
+        "FAILURE_CODE=P3D_RELEASE_STAGE_RUNTIME_INVALID\n"
+    )
+    assert result.stderr == ""
+
+
+def test_production_cli_and_systemd_share_fixed_runtime_identity() -> None:
+    cli = Path("scripts/pdi_p3d_release_bootstrap.py").read_text(encoding="utf-8")
+    unit = Path("deployment/systemd/pdi-scoped-pipeline@.service").read_text(encoding="utf-8")
+    assert "policy = BootstrapPolicy.production()" in cli
+    assert "BootstrapPolicy.production(runtime_uid=" not in cli
+    assert f"User={subject.PRODUCTION_RUNTIME_USER}" in unit.splitlines()
+    assert f"Group={subject.PRODUCTION_RUNTIME_GROUP}" in unit.splitlines()
 
 
 def test_wrong_bundle_hash_fails_before_verifier(tmp_path: Path) -> None:

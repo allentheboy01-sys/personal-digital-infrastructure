@@ -9,13 +9,15 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-from pdi.production_ops.p3d_preparation_contracts import OperatorToolIdentity, ToolName
+from pdi.production_ops.p3d_preparation_contracts import FailureCode, OperatorToolIdentity, ToolName
 from pdi.production_ops.p3d_release_bootstrap import (
     BootstrapError,
     BootstrapInputs,
     BootstrapMode,
     BootstrapPolicy,
     DebianHostRuntimeAuthorityProvider,
+    PRODUCTION_RUNTIME_GROUP,
+    PRODUCTION_RUNTIME_USER,
     QualificationHostRuntimeAuthorityProvider,
     ReleaseBootstrap,
     resolve_runtime_identity,
@@ -58,20 +60,19 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        runtime_uid, runtime_gid = resolve_runtime_identity(args.runtime_user, args.runtime_group)
-        tool = OperatorToolIdentity.from_mapping({
-            "TOOL_NAME": ToolName.RELEASE_BOOTSTRAP.value,
-            "TOOL_VERSION": args.bootstrap_tool_version,
-            "TOOL_ARTIFACT_SHA256": args.bootstrap_tool_artifact_sha256,
-            "TOOL_SOURCE_SHA": args.bootstrap_tool_source_sha,
-        })
         mode = BootstrapMode(args.mode)
         if mode is BootstrapMode.PRODUCTION:
+            if (
+                args.runtime_user != PRODUCTION_RUNTIME_USER
+                or args.runtime_group != PRODUCTION_RUNTIME_GROUP
+            ):
+                raise BootstrapError(FailureCode.RELEASE_RUNTIME_INVALID)
             if args.qualification_root is not None or args.qualification_system_python is not None:
                 raise ValueError("qualification override forbidden")
-            policy = BootstrapPolicy.production(runtime_uid=runtime_uid, runtime_gid=runtime_gid)
+            policy = BootstrapPolicy.production()
             provider = DebianHostRuntimeAuthorityProvider()
         else:
+            runtime_uid, runtime_gid = resolve_runtime_identity(args.runtime_user, args.runtime_group)
             if args.qualification_root is None or args.qualification_system_python is None:
                 raise ValueError("qualification authority required")
             policy = BootstrapPolicy.qualification(
@@ -85,6 +86,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.qualification_system_python,
                 args.expected_os_runtime_manifest_sha256,
             )
+        tool = OperatorToolIdentity.from_mapping({
+            "TOOL_NAME": ToolName.RELEASE_BOOTSTRAP.value,
+            "TOOL_VERSION": args.bootstrap_tool_version,
+            "TOOL_ARTIFACT_SHA256": args.bootstrap_tool_artifact_sha256,
+            "TOOL_SOURCE_SHA": args.bootstrap_tool_source_sha,
+        })
         inputs = BootstrapInputs(
             args.bundle,
             args.expected_candidate_sha,
