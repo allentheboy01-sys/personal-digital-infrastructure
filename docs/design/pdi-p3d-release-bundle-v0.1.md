@@ -51,7 +51,11 @@ archive member set to equal the payload manifest plus those five files.
 The uncompressed tar is canonical: sorted regular files only, mode 0644,
 uid/gid 0, empty owner/group names, and mtime 0. Verification rejects absolute
 or parent paths, duplicates, links, devices, FIFOs, unexpected members, and
-metadata drift before copying any member. It never calls `extractall()`.
+metadata drift before copying any member. The PAX format is used solely so
+standard wheel filenames longer than 100 UTF-8 bytes remain unchanged; for
+such a member the verifier permits exactly one `path` header equal to the
+validated member name, and rejects all other extended metadata. It never calls
+`extractall()`.
 
 The systemd set is exactly one generic service and six enrichment timers. Its
 fingerprint covers exact source path, future canonical target path, content
@@ -67,9 +71,9 @@ and file manifest. `ReleaseInputBundleManifestV1` binds its canonical hash.
 
 CI checks out `github.event.pull_request.head.sha`, validates exact HEAD and a
 clean tree, builds the bundle, verifies it offline from archive bytes, and uses
-the GitHub-owned `actions/attest` action pinned to a reviewed full commit SHA.
-An independent step runs `gh attestation verify` against the repository before
-rerunning the bundle verifier and offline install proof.
+the GitHub-owned `actions/attest-build-provenance` action pinned to a reviewed
+full commit SHA. An independent step runs `gh attestation verify` against the
+repository before rerunning the bundle verifier and offline install proof.
 
 The bundle can vary between CI runs because run identity is provenance input.
 Within one input set, canonical JSON, runtime lock, wheel inventory, OS
