@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import sys
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -424,7 +423,11 @@ def test_root_controlled_release_reader_scans_runtime_with_fixed_environments(
     dist_info = release / ".venv/lib/python3.13/site-packages/demo.dist-info"
     (dist_info / "METADATA").write_text("Name: Demo_Package\nVersion: 1.2.3\n", encoding="utf-8")
     (dist_info / "RECORD").write_text("demo.py,,\n", encoding="utf-8")
-    python_target = Path(sys.executable).resolve()
+    external_runtime_root = tmp_path / "trusted-system-runtime"
+    python_target = external_runtime_root / "bin/python3.13"
+    python_target.parent.mkdir(parents=True)
+    python_target.write_bytes(b"synthetic-python-binary")
+    python_target.chmod(0o755)
     (release / ".venv/bin/python").symlink_to(python_target)
     release.chmod(0o755)
     for path in release.rglob("*"):
@@ -484,9 +487,20 @@ def test_root_controlled_release_reader_scans_runtime_with_fixed_environments(
             runner=runner,
         ).read(release)
 
+    python_target.chmod(0o777)
+    with pytest.raises(RollbackQualificationError, match=FailureCode.ROLLBACK_RUNTIME_INVALID.value):
+        RootControlledReleaseFactsReader(
+            current_path=current,
+            approved_external_symlink_roots=(external_runtime_root,),
+            os_release_path=os_release,
+            runner=runner,
+        ).read(release)
+    python_target.chmod(0o755)
+    calls.clear()
+
     facts = RootControlledReleaseFactsReader(
         current_path=current,
-        approved_external_symlink_roots=(python_target.parent,),
+        approved_external_symlink_roots=(external_runtime_root,),
         os_release_path=os_release,
         runner=runner,
     ).read(release)
