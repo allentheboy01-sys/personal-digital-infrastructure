@@ -1176,6 +1176,15 @@ def _build_distributions(source_tree: Path, output: Path, python: Path) -> tuple
     return wheels[0], sdists[0]
 
 
+def _current_python_executable() -> Path:
+    """Keep the active environment boundary; do not dereference venv Python."""
+
+    python = Path(sys.executable)
+    if not python.is_absolute() or not python.is_file():
+        _fail("P3D_RELEASE_BUNDLE_PYTHON_INVALID")
+    return python
+
+
 def build_release_input_bundle(
     *,
     source: Path,
@@ -1215,7 +1224,7 @@ def build_release_input_bundle(
         git_bundle = work / "pdi.git.bundle"
         create_and_verify_git_bundle(source, candidate, git_bundle, work_root=work, home=home)
         dist = work / "dist"
-        python = Path(sys.executable).resolve()
+        python = _current_python_executable()
         wheel, sdist = _build_distributions(build_source, dist, python)
         builder_venv = work / "builder-venv"
         venv.EnvBuilder(with_pip=True, clear=True).create(builder_venv)

@@ -546,6 +546,20 @@ def test_subprocess_boundary_uses_stage_specific_fixed_failure(monkeypatch):
         )
 
 
+def test_current_python_executable_preserves_venv_symlink_boundary(tmp_path, monkeypatch):
+    venv_python = tmp_path / "venv/bin/python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_bytes(b"")
+    target = tmp_path / "system-python"
+    target.write_bytes(b"")
+    venv_python.unlink()
+    venv_python.symlink_to(target)
+    monkeypatch.setattr(subject.sys, "executable", str(venv_python))
+
+    assert subject._current_python_executable() == venv_python
+    assert subject._current_python_executable() != venv_python.resolve()
+
+
 def test_cli_has_no_production_capabilities():
     actions = subject._parser()._subparsers._group_actions[0].choices
     assert set(actions) == {"build", "verify", "_assemble"}
