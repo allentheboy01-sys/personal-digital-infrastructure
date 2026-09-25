@@ -21,6 +21,7 @@ jobs:
       contents: read
       id-token: write
       attestations: write
+      artifact-metadata: write
     env:
       EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
@@ -54,6 +55,7 @@ jobs:
             --platform-tag manylinux_2_34_x86_64 \
             --repository "$GITHUB_REPOSITORY" \
             --workflow-path .github/workflows/ci.yml \
+            --workflow-source-sha "$GITHUB_WORKFLOW_SHA" \
             --run-identity "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --output-dir "$RUNNER_TEMP/pdi-p3d-release-bundle"
@@ -67,7 +69,8 @@ jobs:
             --expected-candidate "$EXPECTED_CANDIDATE_SHA" \
             --expected-bundle-sha256 "$bundle_sha"
       - name: Generate official GitHub build provenance attestation
-        uses: actions/attest-build-provenance@f057fd524d485ac48d9b534c235aad15b5bb303f # v3
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ runner.temp }}/pdi-p3d-release-bundle/pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}.tar
       - name: Independently verify attestation and bundle from bytes
@@ -77,9 +80,33 @@ jobs:
           bundle="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
           digests="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
           bundle_sha="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["BUNDLE_SHA256"])' "$digests")"
+          attestation_json="$RUNNER_TEMP/pdi-p3d-release-bundle/attestation-verification.json"
           gh attestation verify "$bundle" \
             --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+            --signer-digest "$GITHUB_WORKFLOW_SHA" \
+            --deny-self-hosted-runners \
+            --format=json > "$attestation_json"
+          python - "$attestation_json" "$digests" "$bundle" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          results = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))["BUNDLE_SHA256"]
+          if not isinstance(results, list) or len(results) != 1:
+              raise SystemExit("ATTESTATION_RESULT_CARDINALITY_INVALID")
+          subjects = results[0]["verificationResult"]["statement"]["subject"]
+          if not isinstance(subjects, list) or len(subjects) != 1:
+              raise SystemExit("ATTESTATION_SUBJECT_CARDINALITY_INVALID")
+          subject = subjects[0]
+          if Path(subject.get("name", "")).name != Path(sys.argv[3]).name:
+              raise SystemExit("ATTESTATION_SUBJECT_NAME_MISMATCH")
+          actual = subject.get("digest", {}).get("sha256")
+          if actual != expected:
+              raise SystemExit("ATTESTATION_SUBJECT_DIGEST_MISMATCH")
+          print(f"ATTESTATION_SUBJECT_DIGEST={actual}")
+          PY
           PYTHONPATH="$GITHUB_WORKSPACE/src" python scripts/build_p3d_release_bundle.py verify \
             --bundle "$bundle" \
             --expected-candidate "$EXPECTED_CANDIDATE_SHA" \

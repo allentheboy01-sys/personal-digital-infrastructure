@@ -67,13 +67,21 @@ not part of this static set.
 `P3DReleaseBundleProvenanceV1` binds repository, candidate, workflow path and
 workflow source SHA, run/attempt, fixed artifact identity, builder identity,
 Git bundle, wheel, sdist, wheelhouse, OS manifest, systemd set, runtime lock,
-and file manifest. `ReleaseInputBundleManifestV1` binds its canonical hash.
+and file manifest. The candidate SHA remains the source identity for the Git
+bundle, distributions, and builder tool. The separately supplied workflow
+source SHA identifies the reviewed workflow revision and may differ from the
+candidate on pull requests. `ReleaseInputBundleManifestV1` binds its canonical
+hash and independently cross-binds workflow, artifact, and systemd authority
+to the provenance record.
 
 CI checks out `github.event.pull_request.head.sha`, validates exact HEAD and a
 clean tree, builds the bundle, verifies it offline from archive bytes, and uses
-the GitHub-owned `actions/attest-build-provenance` action pinned to a reviewed
-full commit SHA. An independent step runs `gh attestation verify` against the
-repository before rerunning the bundle verifier and offline install proof.
+the GitHub-owned `actions/attest` v4.2.2 action pinned to a reviewed full commit
+SHA. An independent step runs `gh attestation verify` against the repository,
+exact signer workflow, exact workflow source digest, and GitHub-hosted runner
+policy. It parses the verified statement and compares its subject SHA-256 to
+the bundle digest before rerunning the bundle verifier and offline install
+proof.
 
 The bundle can vary between CI runs because run identity is provenance input.
 Within one input set, canonical JSON, runtime lock, wheel inventory, OS

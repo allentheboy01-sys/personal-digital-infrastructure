@@ -639,14 +639,19 @@ class P3DReleaseBundleProvenanceV1:
             _fail("P3D_RELEASE_BUNDLE_PROVENANCE_INVALID")
         candidate = _strict_text(value["CANDIDATE_SHA"], pattern=GIT_SHA)
         workflow_source = _strict_text(value["WORKFLOW_SOURCE_SHA"], pattern=GIT_SHA)
+        repository = _strict_text(value["REPOSITORY_IDENTITY"])
+        workflow_identity = _strict_text(value["WORKFLOW_IDENTITY"])
+        workflow_prefix = f"github:{repository}@{workflow_source}:"
+        workflow_path = workflow_identity.removeprefix(workflow_prefix)
         builder = OperatorToolIdentity.from_mapping(value["BUILDER_TOOL"])
-        if (workflow_source != candidate or builder.tool_source_sha != candidate or
+        if (not workflow_identity.startswith(workflow_prefix) or
+                not workflow_path.startswith(".github/workflows/") or
+                builder.tool_source_sha != candidate or
                 builder.tool_name is not ToolName.RELEASE_BUNDLE_BUILD or
                 builder.tool_artifact_sha256 != value["PDI_WHEEL_SHA256"]):
             _fail("P3D_RELEASE_BUNDLE_PROVENANCE_INVALID")
         return cls(
-            _strict_text(value["REPOSITORY_IDENTITY"]), candidate,
-            _strict_text(value["WORKFLOW_IDENTITY"]), workflow_source,
+            repository, candidate, workflow_identity, workflow_source,
             _strict_text(value["RUN_IDENTITY"]), _strict_text(value["RUN_ATTEMPT"]),
             _strict_text(value["ARTIFACT_IDENTITY"]), builder,
             *(_strict_text(value[key], pattern=SHA256) for key in (
@@ -820,6 +825,7 @@ class AssembleInputs:
     platform_tag: str
     repository_identity: str
     workflow_path: str
+    workflow_source_sha: str
     run_identity: str
     run_attempt: str
     output_dir: Path
@@ -827,6 +833,7 @@ class AssembleInputs:
 
 def assemble_release_input_bundle(inputs: AssembleInputs) -> tuple[Path, dict[str, str]]:
     candidate = _strict_text(inputs.candidate_sha, pattern=GIT_SHA)
+    workflow_source = _strict_text(inputs.workflow_source_sha, pattern=GIT_SHA)
     verify_builder_runtime(inputs.pdi_wheel)
     verify_source_tree_from_git_bundle(inputs.source_root, inputs.git_bundle, candidate)
     os_manifest = load_os_runtime_manifest(inputs.os_manifest_path)
@@ -908,7 +915,9 @@ def assemble_release_input_bundle(inputs: AssembleInputs) -> tuple[Path, dict[st
 
         os_hash = os_runtime_manifest_fingerprint(os_manifest)
         wheelhouse_hash = wheelhouse_manifest_fingerprint(wheel_manifest)
-        workflow_identity = f"github:{inputs.repository_identity}@{candidate}:{inputs.workflow_path}"
+        workflow_identity = (
+            f"github:{inputs.repository_identity}@{workflow_source}:{inputs.workflow_path}"
+        )
         artifact_name = f"{BUNDLE_PREFIX}-{candidate}"
         artifact_identity = f"github-run:{inputs.run_identity}:{inputs.run_attempt}:{artifact_name}"
         wheel_hash = sha256_file(inputs.pdi_wheel)
@@ -919,7 +928,7 @@ def assemble_release_input_bundle(inputs: AssembleInputs) -> tuple[Path, dict[st
             "TOOL_SOURCE_SHA": candidate,
         })
         provenance = P3DReleaseBundleProvenanceV1(
-            inputs.repository_identity, candidate, workflow_identity, candidate,
+            inputs.repository_identity, candidate, workflow_identity, workflow_source,
             inputs.run_identity, inputs.run_attempt, artifact_identity, builder,
             sha256_file(inputs.git_bundle), wheel_hash, sha256_file(inputs.pdi_sdist),
             wheelhouse_hash, os_hash, systemd_fingerprint, sha256_file(lock),
@@ -1164,6 +1173,9 @@ def verify_release_input_bundle(
             provenance.file_manifest_sha256 == contract_fingerprint(file_manifest.to_mapping()),
             release.builder_tool.tool_artifact_sha256 == release.pdi_wheel_sha256,
             release.builder_tool == provenance.builder_tool,
+            release.build_workflow_identity == provenance.workflow_identity,
+            release.build_artifact_identity == provenance.artifact_identity,
+            release.systemd_asset_fingerprint == provenance.systemd_asset_fingerprint,
         )
         if not all(cross):
             _fail("P3D_RELEASE_BUNDLE_CROSS_BINDING_INVALID")
@@ -1217,6 +1229,7 @@ def build_release_input_bundle(
     platform_tag: str,
     repository_identity: str,
     workflow_path: str,
+    workflow_source_sha: str,
     run_identity: str,
     run_attempt: str,
     output_dir: Path,
@@ -1229,6 +1242,7 @@ def build_release_input_bundle(
     workflow_path = _relative_path(workflow_path)
     if not workflow_path.startswith(".github/workflows/"):
         _fail("P3D_RELEASE_BUNDLE_WORKFLOW_INVALID")
+    workflow_source = _strict_text(workflow_source_sha, pattern=GIT_SHA)
     _strict_text(platform_tag)
     _strict_text(run_identity)
     _strict_text(run_attempt)
@@ -1264,6 +1278,7 @@ def build_release_input_bundle(
             "--git-bundle", git_bundle, "--pdi-wheel", wheel, "--pdi-sdist", sdist,
             "--os-manifest", os_manifest.resolve(), "--platform-tag", platform_tag,
             "--repository", repository_identity, "--workflow-path", workflow_path,
+            "--workflow-source-sha", workflow_source,
             "--run-identity", run_identity, "--run-attempt", run_attempt,
             "--output-dir", output_dir,
         )
@@ -1292,6 +1307,7 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--platform-tag", required=True)
     build.add_argument("--repository", required=True)
     build.add_argument("--workflow-path", required=True)
+    build.add_argument("--workflow-source-sha", required=True)
     build.add_argument("--run-identity", required=True)
     build.add_argument("--run-attempt", required=True)
     build.add_argument("--output-dir", type=Path, required=True)
@@ -1310,6 +1326,7 @@ def _parser() -> argparse.ArgumentParser:
     assemble.add_argument("--platform-tag", required=True)
     assemble.add_argument("--repository", required=True)
     assemble.add_argument("--workflow-path", required=True)
+    assemble.add_argument("--workflow-source-sha", required=True)
     assemble.add_argument("--run-identity", required=True)
     assemble.add_argument("--run-attempt", required=True)
     assemble.add_argument("--output-dir", type=Path, required=True)
@@ -1324,6 +1341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 source=args.source, candidate_sha=args.candidate,
                 os_manifest=args.os_manifest, platform_tag=args.platform_tag,
                 repository_identity=args.repository, workflow_path=args.workflow_path,
+                workflow_source_sha=args.workflow_source_sha,
                 run_identity=args.run_identity, run_attempt=args.run_attempt,
                 output_dir=args.output_dir,
             )
@@ -1332,7 +1350,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle, digests = assemble_release_input_bundle(AssembleInputs(
                 args.candidate, args.source_root, args.git_bundle, args.pdi_wheel,
                 args.pdi_sdist, args.os_manifest, args.platform_tag, args.repository,
-                args.workflow_path, args.run_identity, args.run_attempt, args.output_dir,
+                args.workflow_path, args.workflow_source_sha, args.run_identity,
+                args.run_attempt, args.output_dir,
             ))
             print(json.dumps({"BUNDLE_FILENAME": bundle.name, "DIGESTS": digests}, sort_keys=True))
         else:

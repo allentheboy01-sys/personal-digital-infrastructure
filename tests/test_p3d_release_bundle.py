@@ -28,6 +28,7 @@ from pdi.production_ops import p3d_release_bundle as subject
 
 H1 = "1" * 64
 CANDIDATE = "a" * 40
+WORKFLOW_SOURCE = "b" * 40
 
 
 def os_mapping(**changes):
@@ -181,8 +182,9 @@ def valid_bundle(tmp_path: Path) -> tuple[Path, str, str]:
         "TOOL_SOURCE_SHA": candidate,
     })
     provenance = subject.P3DReleaseBundleProvenanceV1(
-        "example/pdi", candidate, f"github:example/pdi@{candidate}:.github/workflows/ci.yml",
-        candidate, "1", "1", f"github-run:1:1:{subject.BUNDLE_PREFIX}-{candidate}",
+        "example/pdi", candidate,
+        f"github:example/pdi@{WORKFLOW_SOURCE}:.github/workflows/ci.yml",
+        WORKFLOW_SOURCE, "1", "1", f"github-run:1:1:{subject.BUNDLE_PREFIX}-{candidate}",
         builder, subject.sha256_file(source_bundle), wheel_hash, subject.sha256_file(sdist),
         wheelhouse_manifest_fingerprint(wheel_manifest), os_runtime_manifest_fingerprint(os_manifest),
         systemd_hash, subject.sha256_file(lock), subject.contract_fingerprint(file_manifest.to_mapping()),
@@ -364,7 +366,7 @@ def test_file_manifest_rejects_paths_duplicates_and_classes():
         })
 
 
-def test_provenance_rejects_foreign_candidate_and_wrong_builder_role():
+def test_provenance_separates_candidate_from_workflow_source_and_builder_role():
     builder = {
         "TOOL_NAME": ToolName.RELEASE_BUNDLE_BUILD.value, "TOOL_VERSION": "1.0.0",
         "TOOL_ARTIFACT_SHA256": H1, "TOOL_SOURCE_SHA": CANDIDATE,
@@ -372,16 +374,30 @@ def test_provenance_rejects_foreign_candidate_and_wrong_builder_role():
     value = {
         "PROVENANCE_VERSION": "1", "AUTHORITY_CLASS": subject.AUTHORITY_CLASS,
         "REPOSITORY_IDENTITY": "example/pdi", "CANDIDATE_SHA": CANDIDATE,
-        "WORKFLOW_IDENTITY": "github:example/pdi", "WORKFLOW_SOURCE_SHA": CANDIDATE,
+        "WORKFLOW_IDENTITY": (
+            f"github:example/pdi@{WORKFLOW_SOURCE}:.github/workflows/ci.yml"
+        ),
+        "WORKFLOW_SOURCE_SHA": WORKFLOW_SOURCE,
         "RUN_IDENTITY": "1", "RUN_ATTEMPT": "1", "ARTIFACT_IDENTITY": "artifact",
         "BUILDER_TOOL": builder, "GIT_BUNDLE_SHA256": H1, "PDI_WHEEL_SHA256": H1,
         "PDI_SDIST_SHA256": H1, "WHEELHOUSE_MANIFEST_SHA256": H1,
         "OS_RUNTIME_MANIFEST_SHA256": H1, "SYSTEMD_ASSET_FINGERPRINT": H1,
         "RUNTIME_LOCK_SHA256": H1, "FILE_MANIFEST_SHA256": H1,
     }
-    subject.P3DReleaseBundleProvenanceV1.from_mapping(value)
+    provenance = subject.P3DReleaseBundleProvenanceV1.from_mapping(value)
+    assert provenance.candidate_sha == CANDIDATE
+    assert provenance.workflow_source_sha == WORKFLOW_SOURCE
+    assert f"@{WORKFLOW_SOURCE}:" in provenance.workflow_identity
+    assert provenance.builder_tool.tool_source_sha == CANDIDATE
     with pytest.raises(subject.ReleaseBundleError):
-        subject.P3DReleaseBundleProvenanceV1.from_mapping({**value, "WORKFLOW_SOURCE_SHA": "b" * 40})
+        subject.P3DReleaseBundleProvenanceV1.from_mapping({
+            **value, "WORKFLOW_SOURCE_SHA": "c" * 40,
+        })
+    with pytest.raises(subject.ReleaseBundleError):
+        subject.P3DReleaseBundleProvenanceV1.from_mapping({
+            **value,
+            "WORKFLOW_IDENTITY": f"github:example/pdi@{CANDIDATE}:.github/workflows/ci.yml",
+        })
     with pytest.raises(Exception):
         subject.P3DReleaseBundleProvenanceV1.from_mapping({
             **value, "BUILDER_TOOL": {**builder, "TOOL_NAME": ToolName.RELEASE_BOOTSTRAP.value},
@@ -513,6 +529,36 @@ def rewrite_bundle(tmp_path: Path, bundle: Path, mutate) -> Path:
     return output
 
 
+@pytest.mark.parametrize(("field", "foreign"), [
+    ("WORKFLOW_IDENTITY", f"github:example/pdi@{WORKFLOW_SOURCE}:.github/workflows/foreign.yml"),
+    ("ARTIFACT_IDENTITY", "github-run:foreign:1:pdi-p3d-release-input-foreign"),
+    ("SYSTEMD_ASSET_FINGERPRINT", "f" * 64),
+])
+def test_release_authority_cross_bindings_fail_closed(
+    tmp_path: Path, field: str, foreign: str,
+):
+    bundle, candidate, _ = valid_bundle(tmp_path)
+
+    def mutate(root: Path) -> None:
+        provenance_path = root / "provenance/provenance.json"
+        release_path = root / "manifests/release-input.json"
+        provenance = json.loads(provenance_path.read_text())
+        release = json.loads(release_path.read_text())
+        provenance[field] = foreign
+        write_json(provenance_path, provenance)
+        release["PROVENANCE_SHA256"] = subject.contract_fingerprint(provenance)
+        write_json(release_path, release)
+
+    tampered = rewrite_bundle(tmp_path, bundle, mutate)
+    with pytest.raises(subject.ReleaseBundleError, match="CROSS_BINDING_INVALID"):
+        subject.verify_release_input_bundle(
+            tampered,
+            expected_candidate_sha=candidate,
+            expected_bundle_sha256=subject.sha256_file(tampered),
+            perform_offline_install=False,
+        )
+
+
 @pytest.mark.parametrize("mutation", [
     lambda root: (root / "source/pdi.git.bundle").write_bytes(b"bad"),
     lambda root: (root / "wheelhouse/pdi-0.6.0-py3-none-any.whl").write_bytes(b"bad"),
@@ -642,12 +688,25 @@ def test_ci_uses_exact_pr_head_pinned_attestation_and_independent_verification()
     workflow = Path(".github/workflows/ci.yml").read_text()
     assert "ref: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
     assert 'test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"' in workflow
-    assert "actions/attest-build-provenance@f057fd524d485ac48d9b534c235aad15b5bb303f" in workflow
+    assert "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2" in workflow
+    assert "actions/attest-build-provenance@" not in workflow
+    assert "id: attest" in workflow
+    assert "predicate-type:" not in workflow
+    assert "predicate-path:" not in workflow
+    assert "sbom-path:" not in workflow
     assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in workflow
     assert "gh attestation verify" in workflow
     assert workflow.count("scripts/build_p3d_release_bundle.py verify") == 2
     assert "attestations: write" in workflow
     assert "id-token: write" in workflow
+    assert "artifact-metadata: write" in workflow
+    assert '--workflow-source-sha "$GITHUB_WORKFLOW_SHA"' in workflow
+    assert '--signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"' in workflow
+    assert '--signer-digest "$GITHUB_WORKFLOW_SHA"' in workflow
+    assert "--deny-self-hosted-runners" in workflow
+    assert "--format=json" in workflow
+    assert 'subject.get("digest", {}).get("sha256")' in workflow
+    assert "ATTESTATION_SUBJECT_DIGEST_MISMATCH" in workflow
 
 
 def test_pr_merge_sha_cannot_replace_expected_candidate(tmp_path: Path):
