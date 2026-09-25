@@ -23,7 +23,6 @@ jobs:
       attestations: write
     env:
       EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      BUNDLE_ROOT: ${{ runner.temp }}/pdi-p3d-release-bundle
     steps:
       - name: Check out exact reviewed candidate (never PR merge SHA)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -47,7 +46,7 @@ jobs:
           python -m pip check
       - name: Build qualification-only release-input bundle
         run: |
-          mkdir -p "$BUNDLE_ROOT"
+          mkdir -p "$RUNNER_TEMP/pdi-p3d-release-bundle"
           PYTHONPATH="$GITHUB_WORKSPACE/src" python scripts/build_p3d_release_bundle.py build \
             --source "$GITHUB_WORKSPACE" \
             --candidate "$EXPECTED_CANDIDATE_SHA" \
@@ -57,11 +56,11 @@ jobs:
             --workflow-path .github/workflows/ci.yml \
             --run-identity "$GITHUB_RUN_ID" \
             --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --output-dir "$BUNDLE_ROOT"
+            --output-dir "$RUNNER_TEMP/pdi-p3d-release-bundle"
       - name: Verify bundle bytes and offline install before attestation
         run: |
-          bundle="$BUNDLE_ROOT/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
-          digests="$BUNDLE_ROOT/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          bundle="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
           bundle_sha="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["BUNDLE_SHA256"])' "$digests")"
           PYTHONPATH="$GITHUB_WORKSPACE/src" python scripts/build_p3d_release_bundle.py verify \
             --bundle "$bundle" \
@@ -75,8 +74,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          bundle="$BUNDLE_ROOT/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
-          digests="$BUNDLE_ROOT/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          bundle="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
           bundle_sha="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["BUNDLE_SHA256"])' "$digests")"
           gh attestation verify "$bundle" \
             --repo "$GITHUB_REPOSITORY" \
