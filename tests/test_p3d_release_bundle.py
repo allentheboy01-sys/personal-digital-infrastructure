@@ -508,12 +508,18 @@ def test_builder_runtime_must_be_the_exact_wheel_module(tmp_path: Path):
         subject.verify_builder_runtime(wheel)
 
 
-def test_fixed_python_environments_disable_config_and_offline_index():
+def test_fixed_python_environments_disable_config_and_offline_index(monkeypatch):
+    monkeypatch.setenv("PIP_EXTRA_INDEX_URL", "https://foreign.invalid/simple")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://foreign.invalid/simple")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
     online = subject._fixed_python_env(network=True)
     offline = subject._fixed_python_env(network=False)
     assert online["PIP_CONFIG_FILE"] == "/dev/null"
     assert "PIP_EXTRA_INDEX_URL" not in online
+    assert "PIP_INDEX_URL" not in online
+    assert online["HTTPS_PROXY"] == "http://proxy.invalid:8080"
     assert offline["PIP_NO_INDEX"] == "1"
+    assert "HTTPS_PROXY" not in offline
 
 
 def test_subprocess_boundary_propagates_only_fixed_child_failure(monkeypatch):

@@ -170,6 +170,16 @@ def _fixed_python_env(*, network: bool) -> dict[str, str]:
     }
     if not network:
         value["PIP_NO_INDEX"] = "1"
+    else:
+        # Transport-only allowlist. Pip indexes/configuration remain fixed by
+        # argv and PIP_CONFIG_FILE; offline verification inherits none of this.
+        for name in (
+            "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+            "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
+        ):
+            item = os.environ.get(name)
+            if item and not CONTROL.search(item):
+                value[name] = item
     return value
 
 
