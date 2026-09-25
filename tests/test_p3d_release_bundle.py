@@ -505,6 +505,18 @@ def test_fixed_python_environments_disable_config_and_offline_index():
     assert offline["PIP_NO_INDEX"] == "1"
 
 
+def test_subprocess_boundary_propagates_only_fixed_child_failure(monkeypatch):
+    def fail(*args, **kwargs):
+        raise subprocess.CalledProcessError(
+            1, args[0], stderr="private detail suppressed\nFAILURE_CODE=P3D_RELEASE_BUNDLE_SOURCE_INVALID\n",
+        )
+
+    monkeypatch.setattr(subject.subprocess, "run", fail)
+    with pytest.raises(subject.ReleaseBundleError, match="SOURCE_INVALID") as error:
+        subject._run((Path("/usr/bin/false"),), env={})
+    assert "private detail" not in str(error.value)
+
+
 def test_cli_has_no_production_capabilities():
     actions = subject._parser()._subparsers._group_actions[0].choices
     assert set(actions) == {"build", "verify", "_assemble"}

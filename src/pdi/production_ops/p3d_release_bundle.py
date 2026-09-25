@@ -193,7 +193,12 @@ def _run(
             stderr=subprocess.PIPE,
             shell=False,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except subprocess.CalledProcessError as error:
+        fixed = re.search(r"(?:^|\n)FAILURE_CODE=(P3D_RELEASE_BUNDLE_[A-Z0-9_]+)(?:\n|$)", error.stderr or "")
+        if fixed:
+            _fail(fixed.group(1))
+        _fail("P3D_RELEASE_BUNDLE_COMMAND_FAILED")
+    except OSError:
         _fail("P3D_RELEASE_BUNDLE_COMMAND_FAILED")
 
 
