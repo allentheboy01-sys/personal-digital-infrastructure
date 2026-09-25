@@ -1454,7 +1454,7 @@ class SourceFileFingerprintEntryV1:
     symlink_target: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
-        path = PurePosixPath(self.relative_path)
+        path = PurePosixPath(_safe_text(self.relative_path))
         if path.is_absolute() or ".." in path.parts or str(path) in {"", "."}:
             _fail()
         if self.kind not in {"file", "directory", "symlink"} or MODE.fullmatch(self.mode) is None:
@@ -1479,14 +1479,35 @@ class SourceFileFingerprintEntryV1:
         }
 
 
-def source_release_fingerprint(candidate_sha: str, entries: Sequence[SourceFileFingerprintEntryV1]) -> str:
+def _source_release_fingerprint_bytes(
+    candidate_sha: str,
+    entries: Sequence[SourceFileFingerprintEntryV1],
+) -> bytes:
+    """Canonical bytes for the closed filesystem-path fingerprint schema.
+
+    ``relative_path`` and ``symlink_target`` are validated path identities,
+    not free-form secret values.  Keeping this serializer private prevents
+    other contracts from bypassing the generic secret-material defense.
+    """
+
     ordered = sorted(entries)
     if not ordered or len({entry.relative_path for entry in ordered}) != len(ordered):
         _fail()
-    return contract_fingerprint({
+    payload = _canonicalize({
         "candidate_sha": _git_sha(candidate_sha),
         "entries": [entry.to_mapping() for entry in ordered],
     })
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def source_release_fingerprint(candidate_sha: str, entries: Sequence[SourceFileFingerprintEntryV1]) -> str:
+    return hashlib.sha256(_source_release_fingerprint_bytes(candidate_sha, entries)).hexdigest()
 
 
 @dataclass(frozen=True, order=True)

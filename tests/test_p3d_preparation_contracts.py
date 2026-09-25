@@ -48,6 +48,7 @@ from pdi.production_ops.p3d_preparation_contracts import (
     rollback_metadata_fingerprint,
     source_release_fingerprint,
     source_runtime_fingerprint,
+    _source_release_fingerprint_bytes,
     transition_preparation_state,
     validate_gate_tool_authority,
     validate_preparation_journal_chain,
@@ -986,6 +987,90 @@ def test_source_release_and_runtime_fingerprints_are_order_independent() -> None
         python_abi="cp313",
         distributions=distributions,
     )
+
+
+def test_source_release_fingerprint_preserves_legacy_safe_bytes_and_digest() -> None:
+    entries = (
+        SourceFileFingerprintEntryV1("src/pdi/a.py", "file", "0644", 0, 0, H1),
+        SourceFileFingerprintEntryV1("src/pdi", "directory", "0755", 0, 0),
+    )
+    payload = {
+        "candidate_sha": CANDIDATE,
+        "entries": [entry.to_mapping() for entry in sorted(entries)],
+    }
+    legacy_bytes = canonical_json_bytes(payload)
+    legacy_digest = contract_fingerprint(payload)
+    assert _source_release_fingerprint_bytes(CANDIDATE, entries) == legacy_bytes
+    assert source_release_fingerprint(CANDIDATE, entries) == legacy_digest
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        ".venv/lib/python3.13/token.py",
+        ".venv/lib/python3.13/secrets.py",
+        ".venv/site-packages/google/oauth2/__init__.py",
+        ".venv/site-packages/tokenizers/__init__.py",
+    ],
+)
+def test_source_release_fingerprint_classifies_secret_marker_filenames_as_paths(
+    relative_path: str,
+) -> None:
+    release_hash = source_release_fingerprint(
+        CANDIDATE,
+        (SourceFileFingerprintEntryV1(relative_path, "file", "0644", 0, 0, H1),),
+    )
+    assert len(release_hash) == 64
+    runtime_hash = source_runtime_fingerprint(
+        source_release_sha256=release_hash,
+        system_runtime_sha256=H2,
+        python_version="3.13.7",
+        python_abi="cp313",
+        distributions=(RuntimeDistributionEntryV1("alpha", "1.0.0", H3),),
+    )
+    assert len(runtime_hash) == 64
+
+
+def test_source_release_fingerprint_classifies_symlink_target_as_path() -> None:
+    value = source_release_fingerprint(
+        CANDIDATE,
+        (
+            SourceFileFingerprintEntryV1(
+                ".venv/bin/python",
+                "symlink",
+                "0777",
+                0,
+                0,
+                symlink_target="/usr/lib/python3.13/secrets.py",
+            ),
+        ),
+    )
+    assert len(value) == 64
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"TOKEN": "abc"},
+        {"PASSWORD": "abc"},
+        {"value": "contains-OAUTH-secret"},
+    ],
+)
+def test_generic_canonical_json_secret_rejection_is_unchanged(payload) -> None:
+    with pytest.raises(
+        PreparationContractError,
+        match=FailureCode.CONTRACT_SECRET_MATERIAL.value,
+    ):
+        canonical_json_bytes(payload)
+
+
+@pytest.mark.parametrize("path", ["src/pdi/control\n.py", "src/pdi/control\x00.py"])
+def test_source_release_paths_still_reject_control_characters(path: str) -> None:
+    with pytest.raises(PreparationContractError):
+        source_release_fingerprint(
+            CANDIDATE,
+            (SourceFileFingerprintEntryV1(path, "file", "0644", 0, 0, H1),),
+        )
 
 
 def test_failure_code_registry_is_fixed_and_namespaced() -> None:
