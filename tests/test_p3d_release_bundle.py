@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import inspect
 import json
 import os
 from pathlib import Path
@@ -558,6 +559,13 @@ def test_current_python_executable_preserves_venv_symlink_boundary(tmp_path, mon
 
     assert subject._current_python_executable() == venv_python
     assert subject._current_python_executable() != venv_python.resolve()
+
+
+def test_assembly_uses_active_builder_environment_for_wheel_resolution():
+    source = inspect.getsource(subject.assemble_release_input_bundle)
+
+    assert "python = _current_python_executable()" in source
+    assert "Path(sys.executable).resolve()" not in source
 
 
 def test_cli_has_no_production_capabilities():

@@ -838,7 +838,7 @@ def assemble_release_input_bundle(inputs: AssembleInputs) -> tuple[Path, dict[st
         constraints = inputs.source_root / "constraints/python3.13.txt"
         if not constraints.is_file() or constraints.is_symlink():
             _fail("P3D_RELEASE_BUNDLE_CONSTRAINTS_INVALID")
-        python = Path(sys.executable).resolve()
+        python = _current_python_executable()
         platform_arguments = tuple(
             item
             for value in compatible_pip_platforms(inputs.platform_tag, os_manifest.arch)
@@ -852,7 +852,12 @@ def assemble_release_input_bundle(inputs: AssembleInputs) -> tuple[Path, dict[st
             "--constraint", constraints, "--index-url", "https://pypi.org/simple",
             inputs.pdi_wheel,
         )
-        _run(download_command, env=_fixed_python_env(network=True), capture=False)
+        _run(
+            download_command,
+            env=_fixed_python_env(network=True),
+            capture=False,
+            failure_code="P3D_RELEASE_BUNDLE_WHEELHOUSE_RESOLUTION_FAILED",
+        )
         wheel_manifest = build_wheelhouse_manifest(wheelhouse, os_manifest, inputs.platform_tag)
         pdi_entries = [entry for entry in wheel_manifest.wheels if entry.package == "pdi"]
         if len(pdi_entries) != 1 or pdi_entries[0].sha256 != sha256_file(inputs.pdi_wheel):
