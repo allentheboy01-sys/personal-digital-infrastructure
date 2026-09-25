@@ -388,6 +388,16 @@ def _platform_compatible(wheel_platform: str, target_platform: str, arch: str) -
     return wheel_platform == target_platform and wheel_platform.endswith(f"_{arch}")
 
 
+def compatible_pip_platforms(target_platform: str, arch: str) -> tuple[str, ...]:
+    target = _parse_manylinux(target_platform)
+    if target is None or target[0] != 2 or target[2] != arch:
+        _fail("P3D_RELEASE_BUNDLE_OS_TARGET_INVALID")
+    values = [f"manylinux_2_{minor}_{arch}" for minor in range(target[1], 4, -1)]
+    aliases = ((17, "manylinux2014"), (12, "manylinux2010"), (5, "manylinux1"))
+    values.extend(f"{name}_{arch}" for minor, name in aliases if minor <= target[1])
+    return tuple(values)
+
+
 def wheel_is_target_compatible(entry: WheelEntryV1, manifest: OSRuntimeManifestV1, platform_tag: str) -> bool:
     expected_python = "".join(manifest.python_version.split(".")[:2])
     expected_cp = f"cp{expected_python}"
@@ -818,9 +828,14 @@ def assemble_release_input_bundle(inputs: AssembleInputs) -> tuple[Path, dict[st
         if not constraints.is_file() or constraints.is_symlink():
             _fail("P3D_RELEASE_BUNDLE_CONSTRAINTS_INVALID")
         python = Path(sys.executable).resolve()
+        platform_arguments = tuple(
+            item
+            for value in compatible_pip_platforms(inputs.platform_tag, os_manifest.arch)
+            for item in ("--platform", value)
+        )
         download_command = (
             python, "-m", "pip", "download", "--dest", wheelhouse,
-            "--only-binary=:all:", "--platform", inputs.platform_tag,
+            "--only-binary=:all:", *platform_arguments,
             "--python-version", ".".join(map(str, sys.version_info[:2])),
             "--implementation", "cp", "--abi", f"cp{sys.version_info.major}{sys.version_info.minor}",
             "--constraint", constraints, "--index-url", "https://pypi.org/simple",

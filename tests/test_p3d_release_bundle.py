@@ -313,6 +313,17 @@ def test_wheelhouse_manifest_and_runtime_lock_are_derived_and_exact(tmp_path: Pa
             subject.verify_runtime_lock(mutation, manifest)
 
 
+def test_pip_platform_resolution_includes_all_compatible_manylinux_floors():
+    values = subject.compatible_pip_platforms("manylinux_2_34_x86_64", "x86_64")
+    assert values[0] == "manylinux_2_34_x86_64"
+    assert "manylinux_2_28_x86_64" in values
+    assert "manylinux_2_17_x86_64" in values
+    assert "manylinux2014_x86_64" in values
+    assert "manylinux1_x86_64" in values
+    with pytest.raises(subject.ReleaseBundleError):
+        subject.compatible_pip_platforms("musllinux_1_2_x86_64", "x86_64")
+
+
 def test_wheelhouse_rejects_extra_non_wheel_and_duplicate_package(tmp_path: Path):
     wheelhouse = tmp_path / "wheelhouse"
     wheelhouse.mkdir()
