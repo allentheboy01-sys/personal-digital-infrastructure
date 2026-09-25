@@ -305,15 +305,25 @@ def verify_source_tree_from_git_bundle(
         repo = work / "repo"
         repo.mkdir()
         env = _fixed_git_env(home)
-        _run((GIT, "bundle", "verify", git_bundle), env=env)
-        _run((GIT, "init", "--quiet", repo), env=env)
-        _run((GIT, "-C", repo, "fetch", "--quiet", git_bundle, "HEAD"), env=env)
-        if _run((GIT, "-C", repo, "rev-parse", "FETCH_HEAD"), env=env).stdout.strip() != candidate_sha:
+        failure = "P3D_RELEASE_BUNDLE_SOURCE_PROOF_FAILED"
+        _run((GIT, "bundle", "verify", git_bundle), env=env, failure_code=failure)
+        _run((GIT, "init", "--quiet", repo), env=env, failure_code=failure)
+        _run(
+            (GIT, "-C", repo, "fetch", "--quiet", git_bundle, "HEAD"),
+            env=env,
+            failure_code=failure,
+        )
+        if _run(
+            (GIT, "-C", repo, "rev-parse", "FETCH_HEAD"),
+            env=env,
+            failure_code=failure,
+        ).stdout.strip() != candidate_sha:
             _fail("P3D_RELEASE_BUNDLE_CANDIDATE_MISMATCH")
         archive = work / "source.tar"
         _run(
             (GIT, "-C", repo, "archive", "--format=tar", f"--output={archive}", candidate_sha),
             env=env,
+            failure_code=failure,
         )
         expected = work / "expected"
         _safe_extract_source_archive(archive, expected)

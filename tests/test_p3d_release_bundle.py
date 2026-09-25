@@ -578,6 +578,21 @@ def test_subprocess_boundary_uses_stage_specific_fixed_failure(monkeypatch):
         )
 
 
+def test_source_bundle_proof_uses_fixed_stage_failure(monkeypatch, tmp_path):
+    observed = []
+
+    def fail(argv, **kwargs):
+        observed.append(kwargs.get("failure_code"))
+        raise subject.ReleaseBundleError(kwargs["failure_code"])
+
+    monkeypatch.setattr(subject, "_run", fail)
+    with pytest.raises(subject.ReleaseBundleError, match="SOURCE_PROOF_FAILED"):
+        subject.verify_source_tree_from_git_bundle(
+            tmp_path / "source", tmp_path / "source.bundle", CANDIDATE,
+        )
+    assert observed == ["P3D_RELEASE_BUNDLE_SOURCE_PROOF_FAILED"]
+
+
 def test_current_python_executable_preserves_venv_symlink_boundary(tmp_path, monkeypatch):
     venv_python = tmp_path / "venv/bin/python"
     venv_python.parent.mkdir(parents=True)
