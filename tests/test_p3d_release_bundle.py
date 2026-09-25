@@ -405,6 +405,37 @@ def test_canonical_tar_metadata_and_round_trip(tmp_path: Path):
     assert subject.safe_extract_bundle(bundle, target) == ("a", "b")
 
 
+def test_canonical_tar_supports_only_the_required_long_path_pax_header(tmp_path: Path):
+    root = tmp_path / "root"
+    wheelhouse = root / "wheelhouse"
+    wheelhouse.mkdir(parents=True)
+    relative = "wheelhouse/" + "x" * 105 + ".whl"
+    (root / relative).write_bytes(b"wheel")
+    bundle = tmp_path / "bundle.tar"
+
+    subject._write_canonical_tar(root, (relative,), bundle)
+
+    with tarfile.open(bundle, "r:") as archive:
+        member = archive.getmembers()[0]
+        assert member.name == relative
+        assert member.pax_headers == {"path": relative}
+    assert subject.safe_extract_bundle(bundle, tmp_path / "target") == (relative,)
+
+
+def test_archive_rejects_unapproved_pax_metadata(tmp_path: Path):
+    bundle = tmp_path / "unsafe-pax.tar"
+    with tarfile.open(bundle, "w:", format=tarfile.PAX_FORMAT) as archive:
+        info = tarfile.TarInfo("safe")
+        info.size = 1
+        info.mode = 0o644
+        info.uid = info.gid = info.mtime = 0
+        info.uname = info.gname = ""
+        info.pax_headers = {"comment": "not-authoritative"}
+        archive.addfile(info, io.BytesIO(b"x"))
+    with pytest.raises(subject.ReleaseBundleError, match="ARCHIVE_METADATA_INVALID"):
+        subject.safe_extract_bundle(bundle, tmp_path / "target")
+
+
 @pytest.mark.parametrize("kind,name", [
     ("symlink", "safe"), ("hardlink", "safe"), ("fifo", "safe"),
     ("file", "/absolute"), ("file", "../escape"),
