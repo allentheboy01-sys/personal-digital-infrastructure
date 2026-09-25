@@ -47,7 +47,7 @@ def _wheel(
     return path
 
 
-def test_real_git_bundle_has_no_local_object_store_dependency(tmp_path: Path):
+def test_real_git_bundle_has_no_local_object_store_dependency(tmp_path: Path, monkeypatch):
     repo = tmp_path / "source"
     repo.mkdir()
     _git(repo, "init", "--quiet")
@@ -67,6 +67,9 @@ def test_real_git_bundle_has_no_local_object_store_dependency(tmp_path: Path):
     work = tmp_path / "work"
     work.mkdir()
     bundle = tmp_path / "artifact/source/pdi.git.bundle"
+    outside = tmp_path / "non-repository-cwd"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
     subject.create_and_verify_git_bundle(
         repo, candidate, bundle, work_root=work, home=home,
     )

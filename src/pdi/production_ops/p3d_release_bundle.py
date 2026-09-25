@@ -235,10 +235,10 @@ def create_and_verify_git_bundle(
     env = _fixed_git_env(home)
     output.parent.mkdir(parents=True, exist_ok=True)
     _run((GIT, "-C", source, "bundle", "create", output, "HEAD"), env=env)
-    _run((GIT, "bundle", "verify", output), env=env)
     empty = work_root / "empty-git-verification"
     empty.mkdir(mode=0o700)
     _run((GIT, "init", "--quiet", empty), env=env)
+    _run((GIT, "-C", empty, "bundle", "verify", output), env=env)
     _run((GIT, "-C", empty, "fetch", "--quiet", output, "HEAD"), env=env)
     fetched = _run((GIT, "-C", empty, "rev-parse", "FETCH_HEAD"), env=env).stdout.strip()
     if fetched != candidate_sha:
@@ -306,8 +306,12 @@ def verify_source_tree_from_git_bundle(
         repo.mkdir()
         env = _fixed_git_env(home)
         failure = "P3D_RELEASE_BUNDLE_SOURCE_PROOF_FAILED"
-        _run((GIT, "bundle", "verify", git_bundle), env=env, failure_code=failure)
         _run((GIT, "init", "--quiet", repo), env=env, failure_code=failure)
+        _run(
+            (GIT, "-C", repo, "bundle", "verify", git_bundle),
+            env=env,
+            failure_code=failure,
+        )
         _run(
             (GIT, "-C", repo, "fetch", "--quiet", git_bundle, "HEAD"),
             env=env,
@@ -982,10 +986,10 @@ def _verify_git_bundle_from_payload(path: Path, candidate: str, root: Path) -> N
     home = root / "git-home"
     home.mkdir(mode=0o700)
     env = _fixed_git_env(home)
-    _run((GIT, "bundle", "verify", path), env=env)
     empty = root / "empty-repo"
     empty.mkdir()
     _run((GIT, "init", "--quiet", empty), env=env)
+    _run((GIT, "-C", empty, "bundle", "verify", path), env=env)
     _run((GIT, "-C", empty, "fetch", "--quiet", path, "HEAD"), env=env)
     if _run((GIT, "-C", empty, "rev-parse", "FETCH_HEAD"), env=env).stdout.strip() != candidate:
         _fail("P3D_RELEASE_BUNDLE_GIT_INCOMPLETE")
