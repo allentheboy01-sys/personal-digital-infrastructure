@@ -292,6 +292,62 @@ jobs:
           --root "$RUNNER_TEMP/p3d-systemd-static-root"
           --release-sha "$GITHUB_SHA"
 
+  p3d-inert-asset-qualification:
+    name: P3D inert asset qualification
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PDI_TEST_DATABASE_URL: >-
+        postgresql+psycopg://pdi_gate_c:pdi-gate-c-synthetic@127.0.0.1:5432/pdi_gate_c_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pdi_gate_c_test
+          POSTGRES_USER: pdi_gate_c
+          POSTGRES_PASSWORD: pdi-gate-c-synthetic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pdi_gate_c -d pdi_gate_c_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fail closed on candidate drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install qualification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m pip check
+      - name: Run root-owned disposable Gate C qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_executable="$(command -v python)"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE" \
+            PDI_TEST_DATABASE_URL="$PDI_TEST_DATABASE_URL" \
+            "$python_executable" -m pytest -q \
+              tests/test_p3d_inert_asset_install.py \
+              tests/integration/test_p3d_inert_asset_install.py
+
   host-safe:
     name: Host safe
     runs-on: ubuntu-latest
