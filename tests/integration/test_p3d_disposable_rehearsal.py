@@ -420,7 +420,72 @@ def _host_systemd_snapshot() -> str:
     return sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()
 
 
-def _prepare_rootfs(root: Path, runtime_uid: int, runtime_gid: int) -> None:
+def _trusted_host_os_release(
+    candidates: tuple[Path, ...] = (
+        Path("/usr/lib/os-release"),
+        Path("/etc/os-release"),
+    ),
+) -> tuple[Path, bytes]:
+    for candidate in candidates:
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise AssertionError("ROOTFS_OS_RELEASE_SOURCE_INVALID") from exc
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise AssertionError("ROOTFS_OS_RELEASE_SOURCE_NOT_REGULAR")
+        payload = resolved.read_bytes()
+        if not payload:
+            raise AssertionError("ROOTFS_OS_RELEASE_SOURCE_EMPTY")
+        if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+            raise AssertionError("ROOTFS_OS_RELEASE_SOURCE_UNTRUSTED")
+        return resolved, payload
+    raise AssertionError("ROOTFS_OS_RELEASE_SOURCE_MISSING")
+
+
+def _assert_materialized_os_release(root: Path, expected: bytes) -> None:
+    destination = root / "etc/os-release"
+    info = destination.lstat()
+    assert stat.S_ISREG(info.st_mode) and not destination.is_symlink()
+    assert info.st_uid == 0 and info.st_gid == 0
+    assert stat.S_IMODE(info.st_mode) == 0o644
+    assert expected and destination.read_bytes() == expected
+
+
+def _materialize_rootfs_os_release(
+    root: Path,
+    *,
+    candidates: tuple[Path, ...] = (
+        Path("/usr/lib/os-release"),
+        Path("/etc/os-release"),
+    ),
+) -> bytes:
+    _, payload = _trusted_host_os_release(candidates)
+    destination = root / "etc/os-release"
+    assert not destination.exists() and not destination.is_symlink()
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o644,
+    )
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _assert_materialized_os_release(root, payload)
+    return payload
+
+
+def _prepare_rootfs(root: Path, runtime_uid: int, runtime_gid: int) -> bytes:
     for relative, mode in (
         ("usr", 0o755), ("etc", 0o755), ("etc/systemd", 0o755),
         ("etc/systemd/system", 0o755), ("opt", 0o755), ("opt/pdi", 0o755),
@@ -438,7 +503,7 @@ def _prepare_rootfs(root: Path, runtime_uid: int, runtime_gid: int) -> None:
         path = root / name
         if not path.exists() and not path.is_symlink():
             path.symlink_to(target)
-    (root / "etc/os-release").symlink_to("../usr/lib/os-release")
+    os_release = _materialize_rootfs_os_release(root)
     _write(
         root / "etc/passwd",
         "root:x:0:0:root:/root:/bin/bash\n"
@@ -458,6 +523,7 @@ def _prepare_rootfs(root: Path, runtime_uid: int, runtime_gid: int) -> None:
     _write(root / "etc/machine-id", "", 0o644, 0, 0)
     default_target = root / "etc/systemd/system/default.target"
     default_target.symlink_to("/usr/lib/systemd/system/basic.target")
+    return os_release
 
 
 def _tool(candidate: str) -> OperatorToolIdentity:
@@ -519,11 +585,79 @@ def test_rootfs_default_target_remains_basic_target(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(os, "chown", lambda *args: None)
+    monkeypatch.setitem(
+        globals(),
+        "_materialize_rootfs_os_release",
+        lambda root: b"trusted-os-release\n",
+    )
     root = tmp_path / "root"
     _prepare_rootfs(root, 65534, 65534)
     default_target = root / "etc/systemd/system/default.target"
     assert default_target.is_symlink()
     assert os.readlink(default_target) == "/usr/lib/systemd/system/basic.target"
+
+
+def test_trusted_host_os_release_accepts_resolved_root_authority(
+    tmp_path: Path,
+) -> None:
+    candidate = tmp_path / "os-release"
+    candidate.symlink_to("/usr/lib/os-release")
+    resolved, payload = _trusted_host_os_release((candidate,))
+    info = resolved.stat()
+    assert resolved == Path("/usr/lib/os-release").resolve(strict=True)
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_uid == 0 and not stat.S_IMODE(info.st_mode) & 0o022
+    assert payload and payload == resolved.read_bytes()
+
+
+def test_trusted_host_os_release_rejects_missing_source(tmp_path: Path) -> None:
+    with pytest.raises(AssertionError, match="ROOTFS_OS_RELEASE_SOURCE_MISSING"):
+        _trusted_host_os_release((tmp_path / "missing-os-release",))
+
+
+def test_trusted_host_os_release_rejects_writable_source(tmp_path: Path) -> None:
+    source = tmp_path / "writable-os-release"
+    source.write_bytes(b"ID=synthetic\n")
+    source.chmod(0o666)
+    with pytest.raises(AssertionError, match="ROOTFS_OS_RELEASE_SOURCE_UNTRUSTED"):
+        _trusted_host_os_release((source,))
+
+
+def test_trusted_host_os_release_rejects_non_regular_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "os-release-directory"
+    source.mkdir()
+    candidate = tmp_path / "os-release-link"
+    candidate.symlink_to(source, target_is_directory=True)
+    with pytest.raises(
+        AssertionError,
+        match="ROOTFS_OS_RELEASE_SOURCE_NOT_REGULAR",
+    ):
+        _trusted_host_os_release((candidate,))
+
+
+def test_trusted_host_os_release_rejects_empty_source(tmp_path: Path) -> None:
+    source = tmp_path / "empty-os-release"
+    source.write_bytes(b"")
+    source.chmod(0o644)
+    with pytest.raises(AssertionError, match="ROOTFS_OS_RELEASE_SOURCE_EMPTY"):
+        _trusted_host_os_release((source,))
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root ownership assertion")
+def test_rootfs_os_release_is_materialized_from_exact_trusted_bytes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "root"
+    (root / "etc").mkdir(parents=True)
+    source, expected = _trusted_host_os_release()
+    actual = _materialize_rootfs_os_release(root)
+    destination = root / "etc/os-release"
+    _assert_materialized_os_release(root, expected)
+    assert source.is_file()
+    assert actual == expected == destination.read_bytes()
+    assert not destination.is_symlink()
 
 
 def _secure_diagnostic_stream(path: Path):
@@ -1008,7 +1142,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     account = pwd.getpwnam("pdi")
     group = grp.getgrnam("pdi")
     assert account.pw_uid > 0 and group.gr_gid > 0 and account.pw_gid == group.gr_gid
-    _prepare_rootfs(root, account.pw_uid, group.gr_gid)
+    trusted_os_release = _prepare_rootfs(root, account.pw_uid, group.gr_gid)
     digests = json.loads(digest_path.read_text(encoding="utf-8"))
     assert digests["CANDIDATE_SHA"] == candidate
     assert len(candidate) == 40
@@ -1172,6 +1306,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
 
             rehearsal_operation = str(uuid4())
             machine = machine_name_for(rehearsal_operation)
+            _assert_materialized_os_release(root, trusted_os_release)
             command = _build_nspawn_command(machine, root, system_python)
             diagnostic_root = root / "var/lib/pdi-p3d/rehearsal-diagnostics"
             nspawn_stdout = diagnostic_root / "nspawn.stdout"
