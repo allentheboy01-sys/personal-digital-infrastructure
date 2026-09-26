@@ -14,6 +14,639 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
+  p3d-release-bundle:
+    name: P3D release bundle qualification
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out exact reviewed candidate (never PR merge SHA)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fail closed on candidate or source drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install exact build-only tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build setuptools
+          python -m pip check
+      - name: Build qualification-only release-input bundle
+        run: |
+          mkdir -p "$RUNNER_TEMP/pdi-p3d-release-bundle"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python scripts/build_p3d_release_bundle.py build \
+            --source "$GITHUB_WORKSPACE" \
+            --candidate "$EXPECTED_CANDIDATE_SHA" \
+            --os-manifest "$GITHUB_WORKSPACE/.github/p3d/qualification-os-runtime.json" \
+            --platform-tag manylinux_2_34_x86_64 \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow-path .github/workflows/ci.yml \
+            --workflow-source-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-identity "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --output-dir "$RUNNER_TEMP/pdi-p3d-release-bundle"
+      - name: Verify bundle bytes and offline install before attestation
+        run: |
+          bundle="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          bundle_sha="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["BUNDLE_SHA256"])' "$digests")"
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python scripts/build_p3d_release_bundle.py verify \
+            --bundle "$bundle" \
+            --expected-candidate "$EXPECTED_CANDIDATE_SHA" \
+            --expected-bundle-sha256 "$bundle_sha"
+      - name: Generate official GitHub build provenance attestation
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/pdi-p3d-release-bundle/pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}.tar
+      - name: Independently verify attestation and bundle from bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bundle="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-release-bundle/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          bundle_sha="$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["BUNDLE_SHA256"])' "$digests")"
+          attestation_json="$RUNNER_TEMP/pdi-p3d-release-bundle/attestation-verification.json"
+          gh attestation verify "$bundle" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" \
+            --signer-digest "$GITHUB_WORKFLOW_SHA" \
+            --deny-self-hosted-runners \
+            --format=json > "$attestation_json"
+          python - "$attestation_json" "$digests" "$bundle" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          results = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))["BUNDLE_SHA256"]
+          if not isinstance(results, list) or len(results) != 1:
+              raise SystemExit("ATTESTATION_RESULT_CARDINALITY_INVALID")
+          subjects = results[0]["verificationResult"]["statement"]["subject"]
+          if not isinstance(subjects, list) or len(subjects) != 1:
+              raise SystemExit("ATTESTATION_SUBJECT_CARDINALITY_INVALID")
+          subject = subjects[0]
+          if Path(subject.get("name", "")).name != Path(sys.argv[3]).name:
+              raise SystemExit("ATTESTATION_SUBJECT_NAME_MISMATCH")
+          actual = subject.get("digest", {}).get("sha256")
+          if actual != expected:
+              raise SystemExit("ATTESTATION_SUBJECT_DIGEST_MISMATCH")
+          print(f"ATTESTATION_SUBJECT_DIGEST={actual}")
+          PY
+          PYTHONPATH="$GITHUB_WORKSPACE/src" python scripts/build_p3d_release_bundle.py verify \
+            --bundle "$bundle" \
+            --expected-candidate "$EXPECTED_CANDIDATE_SHA" \
+            --expected-bundle-sha256 "$bundle_sha"
+          python -c 'import json,sys; value=json.load(open(sys.argv[1], encoding="utf-8")); [print(f"{key}={value[key]}") for key in sorted(value)]' "$digests"
+      - name: Upload content-addressed qualification artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}
+          path: |
+            ${{ runner.temp }}/pdi-p3d-release-bundle/pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}.tar
+            ${{ runner.temp }}/pdi-p3d-release-bundle/pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}.digests.json
+          if-no-files-found: error
+          retention-days: 14
+
+  p3d-root-bootstrap:
+    name: P3D root bootstrap qualification
+    needs: p3d-release-bundle
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fail closed on candidate drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install qualification test runner only
+        run: python -m pip install 'pytest>=9,<10'
+      - name: Download exact candidate qualification bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/pdi-p3d-root-bootstrap-input
+      - name: Run disposable offline root bootstrap qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/pdi-p3d-root-bootstrap-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-root-bootstrap-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          test -f "$bundle"
+          test -f "$digests"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
+          runtime_source="${pythonLocation:?}"
+          test -d "$runtime_source"
+          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-root-bootstrap-runtime.XXXXXX)"
+          qualification_root="$(sudo mktemp -d /tmp/pdi-p3d-root-bootstrap-disposable.XXXXXX)"
+          case "$qualification_runtime" in
+            /tmp/pdi-p3d-root-bootstrap-runtime.*) ;;
+            *) exit 1 ;;
+          esac
+          case "$qualification_root" in
+            /tmp/pdi-p3d-root-bootstrap-disposable.*) ;;
+            *) exit 1 ;;
+          esac
+          test "$qualification_runtime" != /tmp
+          test "$qualification_runtime" != /
+          test "$qualification_root" != /tmp
+          test "$qualification_root" != /
+          cleanup() {
+            case "$qualification_runtime" in
+              /tmp/pdi-p3d-root-bootstrap-runtime.*) ;;
+              *) return 1 ;;
+            esac
+            case "$qualification_root" in
+              /tmp/pdi-p3d-root-bootstrap-disposable.*) ;;
+              *) return 1 ;;
+            esac
+            test "$qualification_runtime" != /tmp
+            test "$qualification_runtime" != /
+            test "$qualification_root" != /tmp
+            test "$qualification_root" != /
+            sudo rm -rf -- "$qualification_runtime" "$qualification_root"
+          }
+          trap cleanup EXIT
+          sudo chmod 0755 "$qualification_root"
+          sudo chown root:root "$qualification_root"
+          sudo cp -aL "$runtime_source/." "$qualification_runtime/"
+          sudo chown -R root:root "$qualification_runtime"
+          sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
+          if [ -n "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)" ]; then
+            echo 'RUNTIME_MIRROR_SPECIAL_FILES=DETECTED'
+            exit 1
+          fi
+          echo 'RUNTIME_MIRROR_SPECIAL_FILES=NONE'
+          system_python="$qualification_runtime/bin/python"
+          sudo test -x "$system_python"
+          sudo "$system_python" -c '
+          import itertools
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          assert root == pathlib.Path(sys.executable).parents[1]
+          for path in itertools.chain((root,), root.rglob("*")):
+              info = path.lstat()
+              mode = stat.S_IMODE(info.st_mode)
+              assert info.st_uid == 0 and info.st_gid == 0
+              if stat.S_ISDIR(info.st_mode):
+                  assert mode == 0o755
+              elif stat.S_ISREG(info.st_mode):
+                  assert mode in (0o644, 0o755)
+              else:
+                  raise AssertionError("unexpected runtime mirror file type")
+          assert sys.version_info[:2] == (3, 13)
+          ' "$qualification_runtime"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            /usr/bin/setpriv \
+              --reuid=65534 \
+              --regid=65534 \
+              --clear-groups \
+              --no-new-privs \
+              -- "$system_python" -c '
+          import ctypes
+          import json
+          import os
+          import pathlib
+          import ssl
+          import sys
+          import sysconfig
+
+          assert os.geteuid() == 65534
+          assert os.getegid() == 65534
+          assert os.getgroups() == []
+          assert "NoNewPrivs:\t1" in pathlib.Path("/proc/self/status").read_text(encoding="utf-8")
+          assert sys.version_info[:2] == (3, 13)
+          '
+          qualification_log="$RUNNER_TEMP/pdi-p3d-root-bootstrap-qualification.log"
+          set +e
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$GITHUB_WORKSPACE/src" \
+            PDI_P3D_BOOTSTRAP_BUNDLE="$bundle" \
+            PDI_P3D_BOOTSTRAP_DIGESTS="$digests" \
+            PDI_P3D_BOOTSTRAP_QUALIFICATION_ROOT="$qualification_root" \
+            PDI_P3D_BOOTSTRAP_CANDIDATE_SHA="$EXPECTED_CANDIDATE_SHA" \
+            PDI_P3D_BOOTSTRAP_TOOL_SOURCE_SHA="$EXPECTED_CANDIDATE_SHA" \
+            PDI_P3D_BOOTSTRAP_SYSTEM_PYTHON="$system_python" \
+            PDI_P3D_BOOTSTRAP_RUNTIME_USER=nobody \
+            PDI_P3D_BOOTSTRAP_RUNTIME_GROUP=nogroup \
+            "$system_python" -m pytest -q tests/integration/test_p3d_release_bootstrap.py \
+            2>&1 | tee "$qualification_log"
+          qualification_status="${PIPESTATUS[0]}"
+          set -e
+          if [ "$qualification_status" -ne 0 ]; then
+            if grep -Fq 'P3D_RELEASE_STAGE_RUNTIME_INVALID' "$qualification_log"; then
+              echo 'RUNTIME_DIAGNOSTIC_REQUIRED=YES'
+              echo 'RUNTIME_DIAGNOSTIC_STAGE=CANDIDATE_RUNTIME_VERIFICATION'
+            fi
+            rm -f -- "$qualification_log"
+            exit "$qualification_status"
+          fi
+          rm -f -- "$qualification_log"
+          test ! -e "$qualification_root/current"
+
+  p3d-systemd-static:
+    name: P3D systemd static verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Verify exact P3D units in a disposable offline root
+        run: >-
+          sudo python3 scripts/verify_p3d_systemd_static.py
+          --root "$RUNNER_TEMP/p3d-systemd-static-root"
+          --release-sha "$GITHUB_SHA"
+
+  p3d-inert-asset-qualification:
+    name: P3D inert asset qualification
+    needs: p3d-release-bundle
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PDI_TEST_DATABASE_URL: >-
+        postgresql+psycopg://pdi_gate_c:pdi-gate-c-synthetic@127.0.0.1:5432/pdi_gate_c_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pdi_gate_c_test
+          POSTGRES_USER: pdi_gate_c
+          POSTGRES_PASSWORD: pdi-gate-c-synthetic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pdi_gate_c -d pdi_gate_c_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fail closed on candidate drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install qualification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m pip check
+      - name: Download exact candidate qualification bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/pdi-p3d-gate-c-input
+      - name: Run root-owned cross-gate disposable Gate C qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_executable="$(command -v python)"
+          bundle="$RUNNER_TEMP/pdi-p3d-gate-c-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-gate-c-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          test -f "$bundle"
+          test -f "$digests"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
+          runtime_source="${pythonLocation:?}"
+          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-gate-c-runtime.XXXXXX)"
+          qualification_root="$(sudo mktemp -d /tmp/pdi-p3d-gate-c-disposable.XXXXXX)"
+          case "$qualification_runtime" in
+            /tmp/pdi-p3d-gate-c-runtime.*) ;;
+            *) exit 1 ;;
+          esac
+          case "$qualification_root" in
+            /tmp/pdi-p3d-gate-c-disposable.*) ;;
+            *) exit 1 ;;
+          esac
+          cleanup() {
+            case "$qualification_runtime" in
+              /tmp/pdi-p3d-gate-c-runtime.*) ;;
+              *) return 1 ;;
+            esac
+            case "$qualification_root" in
+              /tmp/pdi-p3d-gate-c-disposable.*) ;;
+              *) return 1 ;;
+            esac
+            sudo rm -rf -- "$qualification_runtime" "$qualification_root"
+          }
+          trap cleanup EXIT
+          sudo cp -aL "$runtime_source/." "$qualification_runtime/"
+          sudo chown -R root:root "$qualification_runtime"
+          sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
+          test -z "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)"
+          system_python="$qualification_runtime/bin/python"
+          sudo test -x "$system_python"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE" \
+            PDI_TEST_DATABASE_URL="$PDI_TEST_DATABASE_URL" \
+            PDI_P3D_GATE_C_BUNDLE="$bundle" \
+            PDI_P3D_GATE_C_DIGESTS="$digests" \
+            PDI_P3D_GATE_C_QUALIFICATION_ROOT="$qualification_root" \
+            PDI_P3D_GATE_C_SYSTEM_PYTHON="$system_python" \
+            PDI_P3D_GATE_C_CANDIDATE_SHA="$EXPECTED_CANDIDATE_SHA" \
+            "$python_executable" -m pytest -q \
+              tests/test_p3d_inert_asset_install.py \
+              tests/integration/test_p3d_inert_asset_install.py
+
+  p3d-pre-rehearsal-evidence-qualification:
+    name: P3D pre-rehearsal evidence qualification
+    needs: p3d-release-bundle
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PDI_TEST_DATABASE_URL: >-
+        postgresql+psycopg://pdi_wp6:pdi-wp6-synthetic@127.0.0.1:5432/pdi_wp6_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pdi_wp6_test
+          POSTGRES_USER: pdi_wp6
+          POSTGRES_PASSWORD: pdi-wp6-synthetic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pdi_wp6 -d pdi_wp6_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fail closed on candidate drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install qualification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m pip check
+      - name: Download exact candidate qualification bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/pdi-p3d-wp6-input
+      - name: Run root-owned A-B-C to read-only WP6 qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_executable="$(command -v python)"
+          bundle="$RUNNER_TEMP/pdi-p3d-wp6-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-wp6-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          test -f "$bundle"
+          test -f "$digests"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
+          runtime_source="${pythonLocation:?}"
+          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-wp6-runtime.XXXXXX)"
+          qualification_root="$(sudo mktemp -d /tmp/pdi-p3d-wp6-disposable.XXXXXX)"
+          case "$qualification_runtime" in
+            /tmp/pdi-p3d-wp6-runtime.*) ;;
+            *) exit 1 ;;
+          esac
+          case "$qualification_root" in
+            /tmp/pdi-p3d-wp6-disposable.*) ;;
+            *) exit 1 ;;
+          esac
+          cleanup() {
+            case "$qualification_runtime" in
+              /tmp/pdi-p3d-wp6-runtime.*) ;;
+              *) return 1 ;;
+            esac
+            case "$qualification_root" in
+              /tmp/pdi-p3d-wp6-disposable.*) ;;
+              *) return 1 ;;
+            esac
+            sudo rm -rf -- "$qualification_runtime" "$qualification_root"
+          }
+          trap cleanup EXIT
+          sudo cp -aL "$runtime_source/." "$qualification_runtime/"
+          sudo chown -R root:root "$qualification_runtime"
+          sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
+          test -z "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)"
+          system_python="$qualification_runtime/bin/python"
+          sudo test -x "$system_python"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE" \
+            PDI_TEST_DATABASE_URL="$PDI_TEST_DATABASE_URL" \
+            PDI_P3D_WP6_BUNDLE="$bundle" \
+            PDI_P3D_WP6_DIGESTS="$digests" \
+            PDI_P3D_WP6_QUALIFICATION_ROOT="$qualification_root" \
+            PDI_P3D_WP6_SYSTEM_PYTHON="$system_python" \
+            PDI_P3D_WP6_CANDIDATE_SHA="$EXPECTED_CANDIDATE_SHA" \
+            "$python_executable" -m pytest -q \
+              tests/test_p3d_pre_rehearsal_evidence.py \
+              tests/integration/test_p3d_pre_rehearsal_evidence.py
+
+  p3d-disposable-rehearsal:
+    name: P3D disposable real-systemd rehearsal
+    needs: p3d-release-bundle
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PDI_TEST_DATABASE_URL: >-
+        postgresql+psycopg://pdi_wp7:pdi-wp7-synthetic@127.0.0.1:5432/pdi_wp7_runtime_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pdi_wp7_runtime_test
+          POSTGRES_USER: pdi_wp7
+          POSTGRES_PASSWORD: pdi-wp7-synthetic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pdi_wp7 -d pdi_wp7_runtime_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fail closed on candidate drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Install disposable systemd-nspawn host capability
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes systemd-container
+          test "$(ps -p 1 -o comm= | xargs)" = systemd
+          test -x /usr/bin/systemd-nspawn
+          test -x /usr/bin/machinectl
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install qualification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m pip check
+      - name: Download exact candidate qualification bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/pdi-p3d-wp7-input
+      - name: Run exact six services in one isolated real systemd manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_executable="$(command -v python)"
+          bundle="$RUNNER_TEMP/pdi-p3d-wp7-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-wp7-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          test -f "$bundle"
+          test -f "$digests"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
+          if ! getent group pdi >/dev/null; then
+            sudo groupadd --system pdi
+          fi
+          if ! getent passwd pdi >/dev/null; then
+            sudo useradd --system --gid pdi --no-create-home \
+              --home-dir /nonexistent --shell /usr/sbin/nologin pdi
+          fi
+          test "$(id -u pdi)" -gt 0
+          test "$(id -g pdi)" -gt 0
+          runtime_source="${pythonLocation:?}"
+          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-wp7-runtime.XXXXXX)"
+          rehearsal_root="$(sudo mktemp -d /tmp/pdi-p3d-rehearsal-XXXXXXXX)"
+          sudo rmdir "$rehearsal_root"
+          case "$qualification_runtime" in
+            /tmp/pdi-p3d-wp7-runtime.*) ;;
+            *) exit 1 ;;
+          esac
+          case "$rehearsal_root" in
+            /tmp/pdi-p3d-rehearsal-*) ;;
+            *) exit 1 ;;
+          esac
+          cleanup() {
+            case "$qualification_runtime" in
+              /tmp/pdi-p3d-wp7-runtime.*) ;;
+              *) return 1 ;;
+            esac
+            case "$rehearsal_root" in
+              /tmp/pdi-p3d-rehearsal-*) ;;
+              *) return 1 ;;
+            esac
+            sudo rm -rf -- "$qualification_runtime" "$rehearsal_root"
+          }
+          trap cleanup EXIT
+          sudo cp -aL "$runtime_source/." "$qualification_runtime/"
+          sudo chown -R root:root "$qualification_runtime"
+          sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
+          test -z "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)"
+          system_python="$qualification_runtime/bin/python"
+          sudo test -x "$system_python"
+          rehearsal_log="$RUNNER_TEMP/pdi-p3d-wp7-rehearsal.log"
+          rehearsal_report="$RUNNER_TEMP/pdi-p3d-wp7-rehearsal.xml"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            HOME=/root \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            PYTHONPATH="$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE" \
+            PDI_TEST_DATABASE_URL="$PDI_TEST_DATABASE_URL" \
+            PDI_P3D_WP7_DISPOSABLE=1 \
+            PDI_P3D_WP7_BUNDLE="$bundle" \
+            PDI_P3D_WP7_DIGESTS="$digests" \
+            PDI_P3D_WP7_REHEARSAL_ROOT="$rehearsal_root" \
+            PDI_P3D_WP7_SYSTEM_PYTHON="$system_python" \
+            PDI_P3D_WP7_CANDIDATE_SHA="$EXPECTED_CANDIDATE_SHA" \
+            "$python_executable" -m pytest -q -s \
+              --junitxml="$rehearsal_report" \
+              tests/integration/test_p3d_disposable_rehearsal.py \
+              2>&1 | tee "$rehearsal_log"
+          python - "$rehearsal_report" <<'PY'
+          import sys
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          totals = {
+              name: sum(int(suite.attrib.get(name, "0")) for suite in suites)
+              for name in ("tests", "failures", "errors", "skipped")
+          }
+          assert totals == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}, totals
+          PY
+          grep -Fx 'P3D_DISPOSABLE_REHEARSAL=PASS' "$rehearsal_log"
+          grep -Fx 'SYSTEMD_MANAGER_REAL=PASS' "$rehearsal_log"
+          grep -Fx 'SYSTEMD_MANAGER_ISOLATED=PASS' "$rehearsal_log"
+          grep -Fx 'P3D_SERVICE_START_COUNT=6' "$rehearsal_log"
+          grep -Fx 'P3D_TIMER_ENABLE_COUNT=0' "$rehearsal_log"
+          grep -Fx 'POSTGRESQL_MAJOR=16' "$rehearsal_log"
+          grep -Fx 'RUNTIME_PIPELINE_COVERAGE=6/6' "$rehearsal_log"
+          grep -Fx 'POST_REHEARSAL_RUNTIME_LEDGER_PROOF=PASS' "$rehearsal_log"
+          grep -Fx 'TIMERS_FINAL_STATE=DISABLED_INACTIVE' "$rehearsal_log"
+          grep -Fx 'PRODUCTION_TOUCHED=NO' "$rehearsal_log"
+          rm -f -- "$rehearsal_log" "$rehearsal_report"
+
   host-safe:
     name: Host safe
     runs-on: ubuntu-latest
@@ -33,7 +666,7 @@ jobs:
       - name: Validate installed dependencies
         run: python -m pip check
       - name: Run host-safe suite
-        run: python -m pytest -q
+        run: python -m pytest -q --ignore=tests/integration
       - name: Validate public documentation links
         run: python scripts/check_markdown_links.py
       - name: Run portability regression
@@ -62,6 +695,10 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install PostgreSQL 16 and disposable Restic clients
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client-16 restic
       - name: Set up Python 3.13
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:

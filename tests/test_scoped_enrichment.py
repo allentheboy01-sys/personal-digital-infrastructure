@@ -236,3 +236,54 @@ def test_scoped_remote_reader_rejects_legacy_null_scope():
                 metadata={},
             )
         )
+
+
+def test_scoped_remote_reader_requires_provider_account():
+    principal = PrincipalId("mu11-a")
+    instance_id, scope_id = uuid4(), uuid4()
+    resolver = ScopedEnrichmentAccessResolver(
+        principal,
+        Identities(
+            {scope_id: SimpleNamespace(
+                id=scope_id, provider_instance_id=instance_id,
+                provider_account_id=None, enabled=True,
+            )},
+            {instance_id: SimpleNamespace(
+                id=instance_id, provider_type="nextcloud", enabled=True,
+            )},
+            {},
+        ),
+        ProviderAccessBindingRegistry(()),
+        Secrets({}),
+        {},
+    )
+    with pytest.raises(ObservationExtractionError, match="Provider Account"):
+        resolver.resolve(_source("nextcloud", scope_id))
+
+
+def test_scoped_immich_reader_requires_remote_identity():
+    principal = PrincipalId("mu11-a")
+    instance_id, account_id, scope_id = uuid4(), uuid4(), uuid4()
+    resolver = ScopedEnrichmentAccessResolver(
+        principal,
+        Identities(
+            {scope_id: SimpleNamespace(
+                id=scope_id, provider_instance_id=instance_id,
+                provider_account_id=account_id, enabled=True,
+            )},
+            {instance_id: SimpleNamespace(
+                id=instance_id, provider_type="immich", enabled=True,
+            )},
+            {account_id: SimpleNamespace(
+                id=account_id, provider_instance_id=instance_id,
+                provider_native_id=None, enabled=True,
+            )},
+        ),
+        ProviderAccessBindingRegistry((ProviderAccessBinding(
+            principal, scope_id, "immich", "binding",
+        ),)),
+        Secrets({"binding": "secret"}),
+        {"immich": lambda *_: object()},
+    )
+    with pytest.raises(ObservationExtractionError, match="identity"):
+        resolver.resolve(_source("immich", scope_id))

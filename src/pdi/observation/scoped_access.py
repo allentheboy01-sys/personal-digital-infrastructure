@@ -56,18 +56,24 @@ class ScopedEnrichmentAccessResolver:
             raise ObservationExtractionError(
                 "Enrichment Source Provider does not match Scope"
             )
-        native_id = None
-        if scope.provider_account_id is not None:
-            account = self._identities.get_account(scope.provider_account_id)
-            if (
-                account is None
-                or not account.enabled
-                or account.provider_instance_id != instance.id
-            ):
-                raise ObservationExtractionError(
-                    "Provider Account is missing, disabled, or inconsistent"
-                )
-            native_id = account.provider_native_id
+        if scope.provider_account_id is None:
+            raise ObservationExtractionError(
+                "Remote enrichment Scope has no Provider Account"
+            )
+        account = self._identities.get_account(scope.provider_account_id)
+        if (
+            account is None
+            or not account.enabled
+            or account.provider_instance_id != instance.id
+        ):
+            raise ObservationExtractionError(
+                "Provider Account is missing, disabled, or inconsistent"
+            )
+        native_id = account.provider_native_id
+        if instance.provider_type == "immich" and not native_id:
+            raise ObservationExtractionError(
+                "Immich Provider Account identity is unavailable"
+            )
         binding = self._bindings.resolve(
             self._principal_id, scope.id, instance.provider_type
         )
