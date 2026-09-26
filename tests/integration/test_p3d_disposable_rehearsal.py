@@ -70,6 +70,11 @@ _SECRET_ASSIGNMENT = re.compile(
     r"REFRESH[_-]?TOKEN|OAUTH|SECRET)\b\s*[:=]\s*"
     r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\r\n]+)"
 )
+_PROTECTED_SECRET_MARKERS = (
+    "DATABASE__URL",
+    "NEXTCLOUD__PASSWORD",
+    "IMMICH__API_KEY",
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,9 @@ class _ManagerStartupDiagnostic:
     machinectl_return_code: int
     machinectl_stdout_sha256: str
     machinectl_stderr_sha256: str
+    diagnostic_safe_excerpt: str
+    nspawn_stderr_safe_excerpt: str
+    machinectl_stderr_safe_excerpt: str
     sanitized_nspawn_stdout: str
     sanitized_nspawn_stderr: str
     sanitized_machinectl_stdout: str
@@ -89,7 +97,7 @@ class _ManagerStartupDiagnostic:
 
     def safe_message(self) -> str:
         exit_code = -1 if self.nspawn_exit_code is None else self.nspawn_exit_code
-        return "\n".join((
+        lines = [
             self.failure_class,
             f"NSPAWN_EXIT_CODE={exit_code}",
             f"NSPAWN_FAILURE_CLASS={self.failure_class}",
@@ -99,7 +107,17 @@ class _ManagerStartupDiagnostic:
             f"MACHINECTL_RETURN_CODE={self.machinectl_return_code}",
             f"MACHINECTL_STDOUT_SHA256={self.machinectl_stdout_sha256}",
             f"MACHINECTL_STDERR_SHA256={self.machinectl_stderr_sha256}",
-        ))
+        ]
+        if self.diagnostic_safe_excerpt == "PASS":
+            lines.extend((
+                "DIAGNOSTIC_SAFE_EXCERPT=PASS",
+                f"NSPAWN_STDERR_SAFE_EXCERPT={self.nspawn_stderr_safe_excerpt}",
+                "MACHINECTL_STDERR_SAFE_EXCERPT="
+                f"{self.machinectl_stderr_safe_excerpt}",
+            ))
+        else:
+            lines.append("DIAGNOSTIC_SAFE_EXCERPT=REDACTED")
+        return "\n".join(lines)
 
 
 class _ManagerStartupError(AssertionError):
@@ -502,14 +520,83 @@ def _read_diagnostic(
     return digest, _sanitize_diagnostic(excerpt, secret_values)
 
 
+def _contains_unsafe_secret_material(
+    value: str,
+    secret_values: tuple[str, ...],
+) -> bool:
+    folded = value.casefold()
+    if any(marker.casefold() in folded for marker in _PROTECTED_SECRET_MARKERS):
+        return True
+    if any(secret in value for secret in secret_values if secret):
+        return True
+    return _SECRET_ASSIGNMENT.search(value) is not None
+
+
+def _escaped_tail(value: str, limit: int) -> str:
+    pieces = []
+    length = 0
+    for character in reversed(value):
+        escaped = json.dumps(character, ensure_ascii=False)[1:-1]
+        if length + len(escaped) > limit:
+            break
+        pieces.append(escaped)
+        length += len(escaped)
+    return "".join(reversed(pieces))
+
+
+def _safe_diagnostic_excerpts(
+    nspawn_stderr: str,
+    machinectl_stderr: str,
+    secret_values: tuple[str, ...],
+) -> tuple[str, str, str]:
+    if any(
+        _contains_unsafe_secret_material(value, secret_values)
+        for value in (nspawn_stderr, machinectl_stderr)
+    ):
+        return "REDACTED", "", ""
+    return (
+        "PASS",
+        _escaped_tail(nspawn_stderr, 1024),
+        _escaped_tail(machinectl_stderr, 512),
+    )
+
+
 def _diagnostic_class(*values: str) -> str:
     combined = "\n".join(values).casefold()
     categories = (
-        ("MOUNT_OR_BIND_FAILURE", ("mount", "bind")),
-        ("ROOTFS_FAILURE", ("rootfs", "root directory", "os tree")),
-        ("NAMESPACE_FAILURE", ("namespace", "clone", "unshare")),
-        ("SYSTEMD_BOOT_FAILURE", ("failed to boot", "systemd", "pid 1")),
-        ("MACHINE_REGISTRATION_UNAVAILABLE", ("no machine", "not registered")),
+        (
+            "MOUNT_OR_BIND_FAILURE",
+            ("failed to mount", "mount failed", "failed to bind", "bind mount"),
+        ),
+        (
+            "ROOTFS_FAILURE",
+            ("invalid rootfs", "root directory", "os tree", "root filesystem"),
+        ),
+        (
+            "NAMESPACE_OR_CGROUP_FAILURE",
+            ("namespace", "failed to clone", "failed to unshare", "cgroup"),
+        ),
+        (
+            "MACHINE_REGISTRATION_FAILURE",
+            ("no machine", "not registered", "failed to register machine"),
+        ),
+        (
+            "PID1_EXEC_FAILURE",
+            (
+                "failed to execute /sbin/init",
+                "failed to execute /usr/lib/systemd/systemd",
+                "failed to exec pid 1",
+            ),
+        ),
+        (
+            "SYSTEMD_BOOT_FAILURE",
+            (
+                "failed to boot",
+                "failed to start systemd",
+                "failed to invoke systemd",
+                "pid 1 exited",
+            ),
+        ),
     )
     for category, markers in categories:
         if any(marker in combined for marker in markers):
@@ -535,6 +622,13 @@ def _manager_startup_error(
         machinectl_return_code = last_machinectl.returncode
         machinectl_stdout = _sanitize_diagnostic(last_machinectl.stdout, secret_values)
         machinectl_stderr = _sanitize_diagnostic(last_machinectl.stderr, secret_values)
+    safe_state, nspawn_safe_excerpt, machinectl_safe_excerpt = (
+        _safe_diagnostic_excerpts(
+            sanitized_stderr,
+            machinectl_stderr,
+            secret_values,
+        )
+    )
     diagnostic = _ManagerStartupDiagnostic(
         failure_class=failure_class,
         diagnostic_class=_diagnostic_class(
@@ -549,6 +643,9 @@ def _manager_startup_error(
         machinectl_return_code=machinectl_return_code,
         machinectl_stdout_sha256=sha256(machinectl_stdout.encode()).hexdigest(),
         machinectl_stderr_sha256=sha256(machinectl_stderr.encode()).hexdigest(),
+        diagnostic_safe_excerpt=safe_state,
+        nspawn_stderr_safe_excerpt=nspawn_safe_excerpt,
+        machinectl_stderr_safe_excerpt=machinectl_safe_excerpt,
         sanitized_nspawn_stdout=sanitized_stdout,
         sanitized_nspawn_stderr=sanitized_stderr,
         sanitized_machinectl_stdout=machinectl_stdout,
@@ -655,6 +752,35 @@ def test_wait_for_machine_detects_early_exit_with_sanitized_diagnostics(
     assert "[REDACTED]" in diagnostic.sanitized_nspawn_stderr
     assert secret not in diagnostic.sanitized_nspawn_stderr
     assert secret not in str(raised.value)
+    assert diagnostic.diagnostic_safe_excerpt == "REDACTED"
+    assert "DIAGNOSTIC_SAFE_EXCERPT=REDACTED" in str(raised.value)
+    assert "NSPAWN_STDERR_SAFE_EXCERPT=" not in str(raised.value)
+
+
+def test_wait_for_machine_emits_safe_nspawn_stderr_excerpt(tmp_path: Path) -> None:
+    stdout, stderr = _synthetic_diagnostics(tmp_path)
+    stderr.write_text(
+        "Failed to execute /usr/lib/systemd/systemd\nSecond safe line\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(_ManagerStartupError) as raised:
+        _wait_for_machine(
+            "pdi-p3d-synthetic",
+            _SyntheticProcess(1),
+            nspawn_stdout=stdout,
+            nspawn_stderr=stderr,
+            runner=lambda *args, **kwargs: None,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.diagnostic_class == "PID1_EXEC_FAILURE"
+    assert diagnostic.diagnostic_safe_excerpt == "PASS"
+    assert diagnostic.nspawn_stderr_safe_excerpt == (
+        "Failed to execute /usr/lib/systemd/systemd\\nSecond safe line\\n"
+    )
+    assert "NSPAWN_STDERR_SAFE_EXCERPT=" in str(raised.value)
+    assert "Second safe line\\n" in str(raised.value)
 
 
 def test_wait_for_machine_distinguishes_registration_timeout(tmp_path: Path) -> None:
@@ -689,10 +815,71 @@ def test_wait_for_machine_distinguishes_registration_timeout(tmp_path: Path) -> 
         "DISPOSABLE_SYSTEMD_MANAGER_REGISTRATION_TIMEOUT"
     )
     assert diagnostic.nspawn_exit_code is None
-    assert diagnostic.diagnostic_class == "MACHINE_REGISTRATION_UNAVAILABLE"
+    assert diagnostic.diagnostic_class == "MACHINE_REGISTRATION_FAILURE"
     assert diagnostic.machinectl_return_code == 1
     assert diagnostic.sanitized_machinectl_stderr == "No machine known\n"
+    assert diagnostic.diagnostic_safe_excerpt == "PASS"
+    assert diagnostic.machinectl_stderr_safe_excerpt == "No machine known\\n"
+    assert "MACHINECTL_STDERR_SAFE_EXCERPT=No machine known\\n" in str(
+        raised.value
+    )
     assert len(calls) == 2
+
+
+def test_safe_diagnostic_excerpt_escapes_newlines_and_caps_lengths() -> None:
+    nspawn = "nspawn diagnostic\n" * 200
+    machinectl = "machine diagnostic\n" * 100
+    state, nspawn_excerpt, machinectl_excerpt = _safe_diagnostic_excerpts(
+        nspawn,
+        machinectl,
+        (),
+    )
+    assert state == "PASS"
+    assert len(nspawn_excerpt) <= 1024
+    assert len(machinectl_excerpt) <= 512
+    assert "\n" not in nspawn_excerpt and "\r" not in nspawn_excerpt
+    assert "\n" not in machinectl_excerpt and "\r" not in machinectl_excerpt
+    assert "\\n" in nspawn_excerpt
+    assert "\\n" in machinectl_excerpt
+
+
+@pytest.mark.parametrize(
+    ("nspawn", "machinectl", "secret_values"),
+    (
+        ("DATABASE__URL=[REDACTED]", "", ()),
+        ("PASSWORD=[REDACTED]", "", ()),
+        ("ordinary leaked-value text", "", ("leaked-value",)),
+        ("", "IMMICH__API_KEY=[REDACTED]", ()),
+    ),
+)
+def test_unsafe_diagnostic_excerpt_is_suppressed(
+    nspawn: str,
+    machinectl: str,
+    secret_values: tuple[str, ...],
+) -> None:
+    assert _safe_diagnostic_excerpts(
+        nspawn,
+        machinectl,
+        secret_values,
+    ) == ("REDACTED", "", "")
+
+
+def test_diagnostic_class_prefers_specific_failure_over_systemd_boot() -> None:
+    assert _diagnostic_class(
+        "Failed to mount root filesystem; failed to boot systemd",
+    ) == "MOUNT_OR_BIND_FAILURE"
+    assert _diagnostic_class(
+        "Failed to unshare namespace before failed to boot",
+    ) == "NAMESPACE_OR_CGROUP_FAILURE"
+
+
+def test_plain_systemd_occurrence_is_not_systemd_boot_failure() -> None:
+    assert _diagnostic_class(
+        "systemd-nspawn terminated before registration",
+    ) == "UNCLASSIFIED"
+    assert _diagnostic_class(
+        "Failed to invoke systemd",
+    ) == "SYSTEMD_BOOT_FAILURE"
 
 
 def test_wait_for_machine_accepts_successful_registration(tmp_path: Path) -> None:
