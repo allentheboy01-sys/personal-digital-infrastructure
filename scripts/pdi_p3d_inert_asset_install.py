@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,6 +20,7 @@ from pdi.production_ops.p3d_inert_asset_install import (
     ProductionReadOnlySystemdStateProvider,
     SyntheticSystemdStateProvider,
     SystemdSnapshot,
+    verify_candidate_installer_runtime,
 )
 from pdi.production_ops.p3d_preparation_contracts import (
     OperatorToolIdentity,
@@ -54,14 +54,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _tool(candidate: str) -> OperatorToolIdentity:
+def _tool(candidate: str, policy: InertAssetPolicy) -> OperatorToolIdentity:
     module = Path(__import__(
         "pdi.production_ops.p3d_inert_asset_install", fromlist=["__file__"]
     ).__file__)
+    artifact_sha256 = verify_candidate_installer_runtime(
+        policy,
+        candidate,
+        module_file=module,
+        script_file=Path(__file__),
+    )
     return OperatorToolIdentity.from_mapping({
         "TOOL_NAME": ToolName.INERT_ASSET_INSTALL.value,
         "TOOL_VERSION": TOOL_VERSION,
-        "TOOL_ARTIFACT_SHA256": hashlib.sha256(module.read_bytes()).hexdigest(),
+        "TOOL_ARTIFACT_SHA256": artifact_sha256,
         "TOOL_SOURCE_SHA": candidate,
     })
 
@@ -97,7 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.gate_a_operation_id,
             args.gate_b_operation_id,
             args.expected_systemd_asset_fingerprint,
-            _tool(args.expected_candidate_sha),
+            _tool(args.expected_candidate_sha, policy),
         )
         result = InertAssetInstaller(
             inputs=inputs, policy=policy, systemd=systemd,

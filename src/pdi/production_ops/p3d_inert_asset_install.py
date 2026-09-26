@@ -21,6 +21,7 @@ import re
 import stat
 import subprocess
 import shutil
+import sys
 from typing import Callable, Mapping, Protocol, Sequence
 from uuid import UUID, uuid4
 
@@ -82,7 +83,15 @@ from pdi.scoped_operator_config import load_scoped_operator_configuration
 
 SYSTEMD_ANALYZE = Path("/usr/bin/systemd-analyze")
 SYSTEMCTL = Path("/usr/bin/systemctl")
+GIT = Path("/usr/bin/git")
 SAFE_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+GIT_READ_ONLY_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 P3C_TIMERS = (
@@ -131,6 +140,64 @@ def _safe_sha(value: str, *, git: bool = False) -> str:
     return value
 
 
+def _inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def verify_candidate_installer_runtime(
+    policy: "InertAssetPolicy",
+    candidate_sha: str,
+    *,
+    executable: Path | None = None,
+    module_file: Path | None = None,
+    script_file: Path | None = None,
+    runner=subprocess.run,
+) -> str:
+    """Bind the running installer bytes and interpreter to one exact release."""
+    candidate = _safe_sha(candidate_sha, git=True)
+    release = policy.candidate_releases_root / candidate
+    expected_python = release / ".venv/bin/python"
+    expected_source = release / "src/pdi/production_ops/p3d_inert_asset_install.py"
+    expected_script = release / "scripts/pdi_p3d_inert_asset_install.py"
+    executable = Path(sys.executable if executable is None else executable).absolute()
+    module_file = Path(__file__ if module_file is None else module_file).absolute()
+    script_file = Path(sys.argv[0] if script_file is None else script_file).absolute()
+    try:
+        release_info = release.lstat()
+        if (not stat.S_ISDIR(release_info.st_mode) or stat.S_ISLNK(release_info.st_mode) or
+                executable != expected_python or script_file != expected_script):
+            raise OSError
+        resolved_python = executable.resolve(strict=True)
+        resolved_module = module_file.resolve(strict=True)
+        resolved_source = expected_source.resolve(strict=True)
+        resolved_script = script_file.resolve(strict=True)
+        venv = (release / ".venv").resolve(strict=True)
+        if (not _inside(resolved_python, venv) or
+                not _inside(resolved_module, venv) or
+                resolved_source != expected_source or
+                resolved_script != expected_script or
+                resolved_module.read_bytes() != resolved_source.read_bytes()):
+            raise OSError
+        for argv in (
+            (str(GIT), "-C", str(release), "rev-parse", "HEAD"),
+            (str(GIT), "-C", str(release), "status", "--porcelain", "--untracked-files=all"),
+        ):
+            result = runner(
+                argv, capture_output=True, text=True, timeout=30,
+                env=dict(GIT_READ_ONLY_ENV), shell=False,
+            )
+            if result.returncode != 0:
+                raise OSError
+            if argv[-2:] == ("rev-parse", "HEAD"):
+                if result.stdout.strip() != candidate:
+                    raise OSError
+            elif result.stdout.strip():
+                raise OSError
+        return _sha256(resolved_module.read_bytes())
+    except (OSError, subprocess.TimeoutExpired):
+        _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
+
+
 class InstallMode(str, Enum):
     QUALIFICATION = "QUALIFICATION"
     PRODUCTION = "PRODUCTION"
@@ -152,9 +219,13 @@ class InertAssetPolicy:
         import grp
         import pwd
         try:
+            account = pwd.getpwnam("pdi")
+            group = grp.getgrnam("pdi")
+            if account.pw_uid == 0 or group.gr_gid == 0:
+                _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
             return cls(
                 InstallMode.PRODUCTION, Path("/"), 0, 0,
-                pwd.getpwnam("pdi").pw_uid, grp.getgrnam("pdi").gr_gid,
+                account.pw_uid, group.gr_gid,
             )
         except KeyError:
             _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
@@ -248,6 +319,14 @@ class SystemdSnapshot:
 
 
 @dataclass(frozen=True)
+class SystemdReadResult:
+    action: str
+    unit: str
+    returncode: int
+    value: str
+
+
+@dataclass(frozen=True)
 class RenderedAssets:
     content: Mapping[str, bytes]
     expected_manifest: tuple[InstalledFileEntryV1, ...]
@@ -265,7 +344,7 @@ class InertAssetInstallResult:
 
 
 class SystemdStateProvider(Protocol):
-    def snapshot(self) -> SystemdSnapshot: ...
+    def snapshot(self, *, post_install: bool = False) -> SystemdSnapshot: ...
 
 
 class ProductionReadOnlySystemdStateProvider:
@@ -274,31 +353,44 @@ class ProductionReadOnlySystemdStateProvider:
     def __init__(self, runner=subprocess.run) -> None:
         self.runner = runner
 
-    def _read(self, action: str, unit: str) -> tuple[int, str]:
+    def _read(self, action: str, unit: str) -> SystemdReadResult:
         if action not in {"is-enabled", "is-active", "show"}:
             _fail(FailureCode.ASSET_SYSTEMD_NOT_QUIET)
         argv = (str(SYSTEMCTL), action, unit)
         if action == "show":
             argv = (*argv, "--property=Id,LoadState,ActiveState,SubState,UnitFileState,FragmentPath")
-        result = self.runner(
-            argv, capture_output=True, text=True,
-            timeout=30, env=dict(SAFE_ENV), shell=False,
-        )
-        return result.returncode, result.stdout.strip()
+        try:
+            result = self.runner(
+                argv, capture_output=True, text=True,
+                timeout=30, env=dict(SAFE_ENV), shell=False,
+            )
+            value = result.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            _fail(FailureCode.ASSET_SYSTEMD_NOT_QUIET)
+        if not value or (action != "show" and "\n" in value):
+            _fail(FailureCode.ASSET_SYSTEMD_NOT_QUIET)
+        return SystemdReadResult(action, unit, result.returncode, value)
 
-    def snapshot(self) -> SystemdSnapshot:
+    @staticmethod
+    def _exact(result: SystemdReadResult, expected: str, returncodes: frozenset[int]) -> bool:
+        return result.value == expected and result.returncode in returncodes
+
+    def snapshot(self, *, post_install: bool = False) -> SystemdSnapshot:
         p3c: list[dict[str, object]] = []
         for unit in (*P3C_TIMERS, P3C_SERVICE):
             enabled = self._read("is-enabled", unit)
             active = self._read("is-active", unit)
             shown = self._read("show", unit)
             if unit in P3C_TIMERS and not (
-                    enabled[0] == 0 and enabled[1] == "enabled" and
-                    active[0] == 0 and active[1] == "active"):
+                    self._exact(enabled, "enabled", frozenset({0})) and
+                    self._exact(active, "active", frozenset({0})) and
+                    shown.returncode == 0):
+                _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
+            if shown.returncode != 0:
                 _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
             p3c.append({
-                "unit": unit, "enabled": enabled[1], "active": active[1],
-                "show_sha256": _sha256(shown[1].encode()),
+                "unit": unit, "enabled": enabled.value, "active": active.value,
+                "show_sha256": _sha256(shown.value.encode()),
             })
         p3d: list[dict[str, str]] = []
         quiet = True
@@ -306,11 +398,21 @@ class ProductionReadOnlySystemdStateProvider:
             unit = P3D_TIMER_UNITS[key]
             enabled = self._read("is-enabled", unit)
             active = self._read("is-active", unit)
-            enabled_value = enabled[1] or "not-found"
-            active_value = active[1] or "inactive"
-            if enabled_value == "enabled" or active_value == "active":
+            disabled_inactive = (
+                self._exact(enabled, "disabled", frozenset({1})) and
+                self._exact(active, "inactive", frozenset({3}))
+            )
+            absent_quiet = (
+                not post_install and
+                self._exact(enabled, "not-found", frozenset({1, 4})) and
+                (
+                    self._exact(active, "unknown", frozenset({3, 4})) or
+                    self._exact(active, "inactive", frozenset({3}))
+                )
+            )
+            if not (disabled_inactive or absent_quiet):
                 quiet = False
-            p3d.append({"unit": unit, "enabled": enabled_value, "active": active_value})
+            p3d.append({"unit": unit, "enabled": enabled.value, "active": active.value})
         return SystemdSnapshot(
             contract_fingerprint({"p3c": p3c}),
             contract_fingerprint({"p3d": p3d}),
@@ -325,7 +427,7 @@ class SyntheticSystemdStateProvider:
         self.value = snapshot
         self.calls = 0
 
-    def snapshot(self) -> SystemdSnapshot:
+    def snapshot(self, *, post_install: bool = False) -> SystemdSnapshot:
         self.calls += 1
         return self.value
 
@@ -450,7 +552,11 @@ class ProtectedPrerequisiteReader:
 
     def collect(self, *, home: Path) -> PrerequisiteEvidence:
         candidate = self.inputs.candidate_sha
-        gate_a = self.policy.preparation_root / self.inputs.gate_a_operation_id / "authority"
+        gate_a = (
+            self.policy.preparation_root
+            / f"operation-{self.inputs.gate_a_operation_id}"
+            / "authority"
+        )
         _, gate_a_events = _load_complete_gate(
             gate_a, gate=PreparationGate.ROLLBACK_QUALIFICATION,
             candidate=candidate, owner_uid=self.policy.owner_uid, owner_gid=self.policy.owner_gid,
@@ -517,7 +623,7 @@ class ProtectedPrerequisiteReader:
             )
         except Exception:
             _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
-        snapshot = self.systemd.snapshot()
+        snapshot = self.systemd.snapshot(post_install=False)
         if not snapshot.p3d_quiet:
             _fail(FailureCode.ASSET_SYSTEMD_NOT_QUIET)
         return PrerequisiteEvidence(
@@ -1124,7 +1230,7 @@ class InertAssetInstaller:
             state, events, GateCPhase.FINAL_STATIC_VERIFIED,
             tool=self.inputs.tool_identity, evidence=(rendered.installation_fingerprint,),
         )
-        after = self.systemd.snapshot()
+        after = self.systemd.snapshot(post_install=True)
         if (not after.p3d_quiet or
                 after.p3c_fingerprint != prerequisites.p3c_systemd_before):
             _fail(FailureCode.ASSET_SYSTEMD_NOT_QUIET)

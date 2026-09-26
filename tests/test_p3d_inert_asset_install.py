@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import grp
 import inspect
 import os
+import pwd
+import subprocess
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -14,6 +17,7 @@ from pdi.production_ops.p3d_preparation_contracts import (
     CANONICAL_P3D_INSTALL_PATHS,
     CANONICAL_P3D_PIPELINE_KEYS,
     FailureCode,
+    GateAPhase,
     GateCPhase,
     OperatorToolIdentity,
     P3DRollbackMetadataV1,
@@ -21,6 +25,8 @@ from pdi.production_ops.p3d_preparation_contracts import (
     ReleasePinState,
     RollbackReleasePinV1,
     ToolName,
+    atomic_create_no_replace,
+    canonical_json_bytes,
     rollback_metadata_fingerprint,
 )
 from pdi.production_ops.p3d_evidence import PersonalDatabaseEvidence
@@ -30,6 +36,10 @@ from pdi.production_ops.p3d_release_bundle import (
     systemd_asset_fingerprint,
 )
 from pdi.production_ops.p3d_release_bootstrap import GateBJournalStore
+from pdi.production_ops.p3d_rollback_qualification import (
+    GateAJournalStore,
+    serialize_metadata,
+)
 from pdi.scoped_enrichment_profiles import profile_keys
 from pdi.scoped_operator_config import load_scoped_operator_configuration
 
@@ -149,6 +159,117 @@ def test_gate_c_tool_authority_is_candidate_bound() -> None:
             CANDIDATE, OPERATION, OPERATION, H1,
             tool(CANDIDATE, ToolName.RELEASE_BOOTSTRAP),
         ).validate()
+
+
+def _candidate_runtime(tmp_path: Path) -> tuple[module.InertAssetPolicy, Path, Path, Path]:
+    policy = prepare_root(tmp_path)
+    release = policy.candidate_releases_root / CANDIDATE
+    executable = release / ".venv/bin/python"
+    imported = release / ".venv/lib/python3.13/site-packages/pdi/production_ops/p3d_inert_asset_install.py"
+    source = release / "src/pdi/production_ops/p3d_inert_asset_install.py"
+    script = release / "scripts/pdi_p3d_inert_asset_install.py"
+    payload = b"# synthetic exact candidate installer\n"
+    for path, value in (
+        (executable, b"synthetic-python\n"),
+        (imported, payload),
+        (source, payload),
+        (script, b"# synthetic CLI\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    return policy, executable, imported, script
+
+
+def test_candidate_installer_runtime_binds_python_module_source_and_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy, executable, imported, script = _candidate_runtime(tmp_path)
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        value = f"{CANDIDATE}\n" if argv[-2:] == ("rev-parse", "HEAD") else ""
+        return SimpleNamespace(returncode=0, stdout=value)
+
+    monkeypatch.setenv("GIT_OPTIONAL_LOCKS", "1")
+    monkeypatch.setenv("GIT_DIR", "/tmp/foreign-git")
+    digest = module.verify_candidate_installer_runtime(
+        policy, CANDIDATE, executable=executable, module_file=imported,
+        script_file=script, runner=runner,
+    )
+    assert digest == module._sha256(imported.read_bytes())
+    assert len(calls) == 2
+    for argv, kwargs in calls:
+        assert argv[0] == "/usr/bin/git"
+        assert kwargs["env"] == module.GIT_READ_ONLY_ENV
+        assert kwargs["shell"] is False
+    assert calls[0][0][-2:] == ("rev-parse", "HEAD")
+    assert calls[1][0][-3:] == ("status", "--porcelain", "--untracked-files=all")
+
+
+@pytest.mark.parametrize("case", ("workspace-module", "old-source", "wrong-head", "dirty"))
+def test_candidate_installer_runtime_rejects_unbound_authority(
+    tmp_path: Path, case: str,
+) -> None:
+    policy, executable, imported, script = _candidate_runtime(tmp_path)
+    module_file = imported
+    if case == "workspace-module":
+        module_file = tmp_path / "workspace/pdi/production_ops/p3d_inert_asset_install.py"
+        module_file.parent.mkdir(parents=True)
+        module_file.write_bytes(imported.read_bytes())
+    elif case == "old-source":
+        imported.write_bytes(b"# old installer bytes\n")
+
+    def runner(argv, **kwargs):
+        if argv[-2:] == ("rev-parse", "HEAD"):
+            value = f"{SOURCE if case == 'wrong-head' else CANDIDATE}\n"
+        else:
+            value = "src/pdi/production_ops/p3d_inert_asset_install.py\n" if case == "dirty" else ""
+        return SimpleNamespace(returncode=0, stdout=value)
+
+    with pytest.raises(module.InertAssetInstallError) as error:
+        module.verify_candidate_installer_runtime(
+            policy, CANDIDATE, executable=executable, module_file=module_file,
+            script_file=script, runner=runner,
+        )
+    assert error.value.code is FailureCode.ASSET_PREREQUISITE_INVALID
+
+
+@pytest.mark.parametrize(("uid", "gid", "missing", "passes"), (
+    (1200, 1300, None, True),
+    (0, 1300, None, False),
+    (1200, 0, None, False),
+    (1200, 1300, "user", False),
+    (1200, 1300, "group", False),
+))
+def test_production_policy_requires_nonroot_pdi_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    uid: int,
+    gid: int,
+    missing: str | None,
+    passes: bool,
+) -> None:
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+
+    def get_user(name: str):
+        if missing == "user":
+            raise KeyError(name)
+        return SimpleNamespace(pw_uid=uid)
+
+    def get_group(name: str):
+        if missing == "group":
+            raise KeyError(name)
+        return SimpleNamespace(gr_gid=gid)
+
+    monkeypatch.setattr(pwd, "getpwnam", get_user)
+    monkeypatch.setattr(grp, "getgrnam", get_group)
+    if passes:
+        policy = module.InertAssetPolicy.production()
+        assert (policy.runtime_uid, policy.runtime_gid) == (1200, 1300)
+    else:
+        with pytest.raises(module.InertAssetInstallError) as error:
+            module.InertAssetPolicy.production()
+        assert error.value.code is FailureCode.ASSET_PREREQUISITE_INVALID
 
 
 def test_canonical_rendered_set_and_secret_minimization() -> None:
@@ -441,7 +562,8 @@ def test_production_systemd_provider_only_uses_read_commands() -> None:
             return SimpleNamespace(returncode=0, stdout="enabled\n" if action == "is-enabled" else "active\n")
         if unit == module.P3C_SERVICE:
             return SimpleNamespace(returncode=1, stdout="static\n" if action == "is-enabled" else "inactive\n")
-        return SimpleNamespace(returncode=1, stdout="disabled\n" if action == "is-enabled" else "inactive\n")
+        return SimpleNamespace(returncode=1 if action == "is-enabled" else 3,
+                               stdout="disabled\n" if action == "is-enabled" else "inactive\n")
 
     snapshot = module.ProductionReadOnlySystemdStateProvider(runner).snapshot()
     assert snapshot.p3d_quiet
@@ -451,6 +573,92 @@ def test_production_systemd_provider_only_uses_read_commands() -> None:
     with pytest.raises(module.InertAssetInstallError):
         module.ProductionReadOnlySystemdStateProvider(runner)._read("start", "anything")
     assert len(calls) == before
+
+
+@pytest.mark.parametrize(("enabled", "enabled_rc", "active", "active_rc", "post_install", "quiet"), (
+    ("disabled", 1, "inactive", 3, False, True),
+    ("disabled", 1, "inactive", 3, True, True),
+    ("disabled", 0, "inactive", 3, False, False),
+    ("not-found", 4, "unknown", 4, False, True),
+    ("not-found", 1, "inactive", 3, False, True),
+    ("not-found", 4, "unknown", 4, True, False),
+    ("enabled", 0, "inactive", 3, False, False),
+    ("enabled-runtime", 0, "inactive", 3, False, False),
+    ("linked-runtime", 0, "inactive", 3, False, False),
+    ("disabled", 1, "active", 0, False, False),
+    ("disabled", 1, "activating", 0, False, False),
+    ("disabled", 1, "deactivating", 0, False, False),
+    ("disabled", 1, "failed", 3, False, False),
+    ("unexpected", 0, "inactive", 3, False, False),
+))
+def test_production_systemd_p3d_states_are_exact_and_fail_closed(
+    enabled: str, enabled_rc: int, active: str, active_rc: int,
+    post_install: bool, quiet: bool,
+) -> None:
+    def runner(argv, **kwargs):
+        action, unit = argv[1], argv[2]
+        if action == "show":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="Id=synthetic\nLoadState=loaded\nActiveState=inactive\n",
+            )
+        if unit in module.P3C_TIMERS:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="enabled\n" if action == "is-enabled" else "active\n",
+            )
+        if unit == module.P3C_SERVICE:
+            return SimpleNamespace(
+                returncode=0 if action == "is-enabled" else 3,
+                stdout="static\n" if action == "is-enabled" else "inactive\n",
+            )
+        return SimpleNamespace(
+            returncode=enabled_rc if action == "is-enabled" else active_rc,
+            stdout=f"{enabled if action == 'is-enabled' else active}\n",
+        )
+
+    snapshot = module.ProductionReadOnlySystemdStateProvider(runner).snapshot(
+        post_install=post_install,
+    )
+    assert snapshot.p3d_quiet is quiet
+
+
+@pytest.mark.parametrize("failure", ("empty", "oserror", "timeout", "show"))
+def test_production_systemd_command_failures_are_rejected(failure: str) -> None:
+    def runner(argv, **kwargs):
+        action, unit = argv[1], argv[2]
+        if failure == "oserror" and unit in module.P3D_TIMER_UNITS.values():
+            raise OSError("synthetic")
+        if failure == "timeout" and unit in module.P3D_TIMER_UNITS.values():
+            raise subprocess.TimeoutExpired(argv, 30)
+        if failure == "empty" and unit in module.P3D_TIMER_UNITS.values():
+            return SimpleNamespace(returncode=1, stdout="")
+        if action == "show":
+            return SimpleNamespace(
+                returncode=(1 if failure == "show" else 0),
+                stdout="LoadState=loaded\n",
+            )
+        if unit in module.P3C_TIMERS:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="enabled\n" if action == "is-enabled" else "active\n",
+            )
+        if unit == module.P3C_SERVICE:
+            return SimpleNamespace(
+                returncode=0 if action == "is-enabled" else 3,
+                stdout="static\n" if action == "is-enabled" else "inactive\n",
+            )
+        return SimpleNamespace(
+            returncode=1 if action == "is-enabled" else 3,
+            stdout="disabled\n" if action == "is-enabled" else "inactive\n",
+        )
+
+    with pytest.raises(module.InertAssetInstallError) as error:
+        module.ProductionReadOnlySystemdStateProvider(runner).snapshot()
+    assert error.value.code in {
+        FailureCode.ASSET_SYSTEMD_NOT_QUIET,
+        FailureCode.ASSET_PREREQUISITE_INVALID,
+    }
 
 
 def test_systemd_analyze_is_absolute_shell_false_and_failure_is_closed(tmp_path: Path) -> None:
@@ -585,6 +793,74 @@ def rollback_metadata() -> P3DRollbackMetadataV1:
     ):
         mapping.update({f"{prefix}_{key}": value for key, value in identity.to_mapping().items()})
     return P3DRollbackMetadataV1.from_mapping(mapping)
+
+
+def _write_complete_gate_a_authority(preparation_root: Path) -> Path:
+    authority = preparation_root / f"operation-{OPERATION}" / "authority"
+    authority.parent.mkdir(parents=True)
+    preparation_root.chmod(0o700)
+    authority.parent.chmod(0o700)
+    policy = AtomicCreatePolicyV1(os.geteuid(), os.getegid(), 0o600, preparation_root)
+    store = GateAJournalStore(authority, policy=policy)
+    export_tool = tool("c" * 40, ToolName.BACKUP_EXPORT)
+    restore_tool = tool("d" * 40, ToolName.RESTORE_QUALIFY)
+    state = store.initialize(
+        operation_id=OPERATION, candidate_sha=CANDIDATE, started_at=WHEN,
+        export_tool=export_tool, restore_tool=restore_tool,
+    )
+    events = ()
+    metadata = rollback_metadata()
+    metadata_hash = rollback_metadata_fingerprint(metadata)
+    pin = RollbackReleasePinV1(
+        metadata.snapshot_id, metadata.source_release_sha,
+        metadata.source_release_fingerprint, metadata.source_runtime_fingerprint,
+        metadata.source_system_runtime_fingerprint, metadata_hash,
+        metadata.qualified_at_utc, ReleasePinState.ACTIVE,
+    )
+    atomic_create_no_replace(
+        authority / f"rollback-release-pin-{metadata.snapshot_id}.json",
+        canonical_json_bytes(pin.to_mapping()) + b"\n", policy=policy,
+    )
+    atomic_create_no_replace(
+        authority / "p3d-pre-enrichment.env",
+        serialize_metadata(metadata), policy=policy,
+    )
+    for phase in GateAPhase:
+        if phase in {GateAPhase.NEW, GateAPhase.FAILED}:
+            continue
+        selected = (
+            export_tool if phase in {
+                GateAPhase.SOURCE_VERIFIED, GateAPhase.SNAPSHOT_EXPORTED,
+                GateAPhase.DUMP_COMPLETED, GateAPhase.BACKUP_SNAPSHOT_CREATED,
+            } else restore_tool
+        )
+        evidence = (metadata_hash,) if phase is GateAPhase.COMPLETE else (H1,)
+        state, events = store.advance(
+            state, events, phase.value, timestamp=WHEN, tool=selected,
+            evidence_fingerprints=evidence,
+        )
+    return authority
+
+
+def test_gate_a_reader_uses_frozen_wp2_operation_prefixed_layout(tmp_path: Path) -> None:
+    preparation = tmp_path / "preparation"
+    preparation.mkdir()
+    authority = _write_complete_gate_a_authority(preparation)
+    state, events = module._load_complete_gate(
+        authority, gate=PreparationGate.ROLLBACK_QUALIFICATION,
+        candidate=CANDIDATE, owner_uid=os.geteuid(), owner_gid=os.getegid(),
+    )
+    assert state.phase == GateAPhase.COMPLETE.value
+    assert events[-1].evidence_fingerprints == (
+        rollback_metadata_fingerprint(rollback_metadata()),
+    )
+    wrong = preparation / OPERATION / "authority"
+    with pytest.raises(module.InertAssetInstallError) as error:
+        module._load_complete_gate(
+            wrong, gate=PreparationGate.ROLLBACK_QUALIFICATION,
+            candidate=CANDIDATE, owner_uid=os.geteuid(), owner_gid=os.getegid(),
+        )
+    assert error.value.code is FailureCode.ASSET_PREREQUISITE_INVALID
 
 
 class FakePrerequisites:

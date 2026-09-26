@@ -18,7 +18,9 @@ The installer fails closed unless all of these facts are independently read
 and validated:
 
 1. The explicit Gate A operation is `COMPLETE`; its full immutable journal,
-   rollback metadata, and active release pin agree.
+   rollback metadata, and active release pin agree. Gate C consumes the frozen
+   WP2 path `preparation/operation-<uuid>/authority`; the canonical operation
+   ID itself never contains the `operation-` filesystem prefix.
 2. The explicit Gate B operation is `COMPLETE`; its full immutable journal and
    final release fingerprint agree with the immutable candidate release.
 3. `/opt/pdi/current` still names the rollback-source release.
@@ -30,6 +32,20 @@ and validated:
 
 Caller input never supplies a Principal, database URL, secret, profile body,
 or enabled Scope ID.
+
+Every production systemd observation is a fixed read-only `systemctl show`,
+`is-enabled`, or `is-active` call. P3C timers must be exactly enabled and
+active. Before installation, a P3D timer may be exactly disabled/inactive or
+coherently absent; after installation it must be exactly disabled/inactive.
+Command failure, empty output, runtime enablement, transitional state, and
+failed state are all rejection states.
+
+The CLI also proves its own candidate authority before it creates the Gate C
+tool identity. The executing interpreter and imported installer must be inside
+the exact staged release, the installed module bytes must equal the candidate
+source bytes, the CLI script must be the candidate script, and read-only Git
+checks must prove exact HEAD and a clean worktree. Production additionally
+requires root installer authority with a non-root `pdi:pdi` runtime identity.
 
 ## Rendering and verification
 
@@ -71,3 +87,11 @@ marker is created without replacement under the explicit Gate C operation.
 Installing files is intentionally not activation. `daemon-reload`, enable,
 start, stop, restart, promotion, workload execution, and real systemd
 rehearsal belong to later, separately authorized gates.
+
+The disposable cross-gate qualification downloads the exact WP3 bundle, runs
+the frozen WP4 bootstrap to create the real Gate B authority and immutable
+release, writes a contract-valid synthetic Gate A authority with the frozen
+writers, and invokes this CLI with that staged release's own `.venv/bin/python`
+without workspace `PYTHONPATH`. It uses real PostgreSQL read-only evidence and
+real offline `systemd-analyze`; it does not mutate the live systemd manager or
+run a workload.
