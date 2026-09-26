@@ -132,6 +132,10 @@ def test_collect_evidence_cli_bypasses_all_stateful_control_paths(monkeypatch, c
         "P3D_COLLECT_EVIDENCE": "PASS",
         "CANDIDATE_SHA": candidate,
         "CONTEXT_FINGERPRINT": "1" * 64,
+        "PREPARATION_MARKER_FINGERPRINT": "5" * 64,
+        "GATE_A_AUTHORITY": "PASS",
+        "GATE_B_AUTHORITY": "PASS",
+        "GATE_C_AUTHORITY": "PASS",
         "P3C_EVIDENCE_REAL": "PASS",
         "GMAIL_EVIDENCE_REAL": "PASS",
         "ROUTED_DB_PREFLIGHT": "PASS",
@@ -141,6 +145,7 @@ def test_collect_evidence_cli_bypasses_all_stateful_control_paths(monkeypatch, c
         "ENABLED_SCOPE_FINGERPRINT": "3" * 64,
         "CANONICAL_PIPELINE_COUNT": "6",
         "ASSET_FINGERPRINT": "4" * 64,
+        "PRE_REHEARSAL_PREPARATION_CONTRACT": "PASS",
         "PRE_REHEARSAL_QUALIFICATION_PROOF": "PASS",
         "POST_REHEARSAL_RUNTIME_LEDGER_PROOF": "NOT_APPLICABLE_PRE_REHEARSAL",
         "RUNTIME_PIPELINE_COVERAGE": "0/6",
@@ -168,6 +173,9 @@ def test_collect_evidence_cli_bypasses_all_stateful_control_paths(monkeypatch, c
         "--release", f"/opt/pdi/releases/{candidate}",
         "--expected-sha", candidate,
         "--rollback-source-sha", rollback,
+        "--gate-a-operation-id", "11111111-1111-4111-8111-111111111111",
+        "--gate-b-operation-id", "22222222-2222-4222-8222-222222222222",
+        "--gate-c-operation-id", "33333333-3333-4333-8333-333333333333",
     ]) == 0
 
     assert len(calls) == 1
@@ -178,69 +186,107 @@ def test_collect_evidence_evaluates_static_proof_without_persistence(tmp_path, m
     module = _load_module()
     candidate = "c" * 40
     rollback = "a" * 40
-    config = tmp_path / "registry.toml"
-    config.write_text('[[principals]]\nid="synthetic-principal"\nenabled=true\n')
-    rollback_metadata = tmp_path / "rollback.env"
-    rollback_metadata.write_text("SYNTHETIC=YES\n")
-    routed = SimpleNamespace(database_url="postgresql://synthetic")
-    router = SimpleNamespace(resolve=lambda _principal: routed)
-    disposed = []
-
-    class Engine:
-        def dispose(self):
-            disposed.append(True)
-
-    class PersonalReader:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-    context = {
-        "release_sha": candidate,
-        "read_only_db_guarantee": True,
-        "enabled_scope_ids": ["scope-a", "scope-b"],
-        "db_identity_fingerprint": "d" * 64,
+    calls = []
+    mapping = {
+        "P3D_COLLECT_EVIDENCE": "PASS",
+        "CANDIDATE_SHA": candidate,
     }
 
-    class EvidenceReader:
-        def __init__(self, **_kwargs):
-            pass
+    class Result:
+        def to_sanitized_mapping(self):
+            return mapping
 
-        def collect_preflight(self):
-            return context
+    def collector(**kwargs):
+        calls.append(kwargs)
+        return Result()
 
-    proof = {
-        "pipeline_keys": module.CANONICAL_SCOPED_ENRICHMENTS,
-        "asset_fingerprint": "f" * 64,
-    }
-    proof_calls = []
-    monkeypatch.setattr(module, "RoutedPersonalDatabaseEvidenceReader", PersonalReader)
-    monkeypatch.setattr(
-        module,
-        "build_pre_rehearsal_qualification_proof",
-        lambda **kwargs: proof_calls.append(kwargs) or proof,
-    )
+    policy = SimpleNamespace(candidate_releases_root=Path("/opt/pdi/releases"))
+    systemd = object()
 
     result = module.collect_read_only_evidence(
         release=Path(f"/opt/pdi/releases/{candidate}"),
         expected_sha=candidate,
         rollback_source_sha=rollback,
-        current=Path("/opt/pdi/current"),
-        rollback=rollback_metadata,
-        config=config,
-        unit_dir=tmp_path / "units",
-        profile_dir=tmp_path / "profiles",
-        operator_config_loader=lambda *_args, **_kwargs: SimpleNamespace(router=router),
-        engine_factory=lambda _url: Engine(),
-        evidence_reader_factory=EvidenceReader,
-        protected_file_reader=lambda path: path.read_text(),
+        gate_a_operation_id="11111111-1111-4111-8111-111111111111",
+        gate_b_operation_id="22222222-2222-4222-8222-222222222222",
+        gate_c_operation_id="33333333-3333-4333-8333-333333333333",
+        policy=policy,
+        systemd=systemd,
+        collector=collector,
     )
 
     assert result["P3D_COLLECT_EVIDENCE"] == "PASS"
-    assert result["READ_ONLY_DB_GUARANTEE"] == "PASS"
-    assert result["RUNTIME_PIPELINE_COVERAGE"] == "0/6"
-    assert proof_calls[0]["context"] is context
-    assert disposed == [True]
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["registry.toml", "rollback.env"]
+    assert len(calls) == 1
+    assert calls[0]["policy"] is policy
+    assert calls[0]["systemd"] is systemd
+    assert calls[0]["inputs"].rollback_source_cross_check == rollback
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_collect_evidence_rollback_source_is_only_an_optional_cross_check(monkeypatch):
+    module = _load_module()
+    candidate = "c" * 40
+    captured = []
+
+    class Result:
+        def to_sanitized_mapping(self):
+            return {"P3D_COLLECT_EVIDENCE": "PASS"}
+
+    module.collect_read_only_evidence(
+        release=Path(f"/opt/pdi/releases/{candidate}"),
+        expected_sha=candidate,
+        gate_a_operation_id="11111111-1111-4111-8111-111111111111",
+        gate_b_operation_id="22222222-2222-4222-8222-222222222222",
+        gate_c_operation_id="33333333-3333-4333-8333-333333333333",
+        policy=SimpleNamespace(candidate_releases_root=Path("/opt/pdi/releases")),
+        systemd=object(),
+        collector=lambda **kwargs: captured.append(kwargs) or Result(),
+    )
+    assert captured[0]["inputs"].rollback_source_cross_check is None
+
+
+def test_collect_evidence_requires_all_three_explicit_operation_selectors(
+    monkeypatch, capsys,
+):
+    module = _load_module()
+    candidate = "c" * 40
+    invoked = []
+    monkeypatch.setattr(
+        module, "collect_read_only_evidence",
+        lambda **kwargs: invoked.append(kwargs) or {},
+    )
+    base = [
+        "collect-evidence", "--release", f"/opt/pdi/releases/{candidate}",
+        "--expected-sha", candidate,
+    ]
+    selectors = (
+        ("--gate-a-operation-id", "11111111-1111-4111-8111-111111111111"),
+        ("--gate-b-operation-id", "22222222-2222-4222-8222-222222222222"),
+        ("--gate-c-operation-id", "33333333-3333-4333-8333-333333333333"),
+    )
+    for missing in range(3):
+        argv = [*base]
+        for index, pair in enumerate(selectors):
+            if index != missing:
+                argv.extend(pair)
+        assert module.main(argv) == 1
+    assert invoked == []
+    assert capsys.readouterr().out.count(
+        "FAILURE_CATEGORY=EVIDENCE_REJECTED"
+    ) == 3
+
+
+def test_collect_evidence_help_has_no_caller_selected_identity_or_path_authority(capsys):
+    module = _load_module()
+    with pytest.raises(SystemExit, match="0"):
+        module.main(["--help"])
+    output = capsys.readouterr().out
+    assert "collect-evidence is read-only and non-persisting" in output
+    for forbidden in (
+        "--principal", "--database-url", "--scope-id", "--profile", "--secret",
+        "--gate-a-root", "--gate-b-root", "--gate-c-root",
+    ):
+        assert forbidden not in output
 
 
 def test_collect_evidence_rejects_test_or_control_path_overrides(capsys):
@@ -303,6 +349,10 @@ def test_sanitized_evidence_rejects_secret_in_allowlisted_value(capsys):
         "P3D_COLLECT_EVIDENCE": "PASS",
         "CANDIDATE_SHA": "c" * 40,
         "CONTEXT_FINGERPRINT": "1" * 64,
+        "PREPARATION_MARKER_FINGERPRINT": "5" * 64,
+        "GATE_A_AUTHORITY": "PASS",
+        "GATE_B_AUTHORITY": "PASS",
+        "GATE_C_AUTHORITY": "PASS",
         "P3C_EVIDENCE_REAL": "PASS",
         "GMAIL_EVIDENCE_REAL": "PASS",
         "ROUTED_DB_PREFLIGHT": "PASS",
@@ -312,6 +362,7 @@ def test_sanitized_evidence_rejects_secret_in_allowlisted_value(capsys):
         "ENABLED_SCOPE_FINGERPRINT": "3" * 64,
         "CANONICAL_PIPELINE_COUNT": "6",
         "ASSET_FINGERPRINT": "4" * 64,
+        "PRE_REHEARSAL_PREPARATION_CONTRACT": "PASS",
         "PRE_REHEARSAL_QUALIFICATION_PROOF": "PASS",
         "POST_REHEARSAL_RUNTIME_LEDGER_PROOF": "NOT_APPLICABLE_PRE_REHEARSAL",
         "RUNTIME_PIPELINE_COVERAGE": "0/6",

@@ -395,6 +395,109 @@ jobs:
               tests/test_p3d_inert_asset_install.py \
               tests/integration/test_p3d_inert_asset_install.py
 
+  p3d-pre-rehearsal-evidence-qualification:
+    name: P3D pre-rehearsal evidence qualification
+    needs: p3d-release-bundle
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PDI_TEST_DATABASE_URL: >-
+        postgresql+psycopg://pdi_wp6:pdi-wp6-synthetic@127.0.0.1:5432/pdi_wp6_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pdi_wp6_test
+          POSTGRES_USER: pdi_wp6
+          POSTGRES_PASSWORD: pdi-wp6-synthetic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pdi_wp6 -d pdi_wp6_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fail closed on candidate drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install qualification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m pip check
+      - name: Download exact candidate qualification bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/pdi-p3d-wp6-input
+      - name: Run root-owned A-B-C to read-only WP6 qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_executable="$(command -v python)"
+          bundle="$RUNNER_TEMP/pdi-p3d-wp6-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-wp6-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          test -f "$bundle"
+          test -f "$digests"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
+          runtime_source="${pythonLocation:?}"
+          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-wp6-runtime.XXXXXX)"
+          qualification_root="$(sudo mktemp -d /tmp/pdi-p3d-wp6-disposable.XXXXXX)"
+          case "$qualification_runtime" in
+            /tmp/pdi-p3d-wp6-runtime.*) ;;
+            *) exit 1 ;;
+          esac
+          case "$qualification_root" in
+            /tmp/pdi-p3d-wp6-disposable.*) ;;
+            *) exit 1 ;;
+          esac
+          cleanup() {
+            case "$qualification_runtime" in
+              /tmp/pdi-p3d-wp6-runtime.*) ;;
+              *) return 1 ;;
+            esac
+            case "$qualification_root" in
+              /tmp/pdi-p3d-wp6-disposable.*) ;;
+              *) return 1 ;;
+            esac
+            sudo rm -rf -- "$qualification_runtime" "$qualification_root"
+          }
+          trap cleanup EXIT
+          sudo cp -aL "$runtime_source/." "$qualification_runtime/"
+          sudo chown -R root:root "$qualification_runtime"
+          sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
+          test -z "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)"
+          system_python="$qualification_runtime/bin/python"
+          sudo test -x "$system_python"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONPATH="$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE" \
+            PDI_TEST_DATABASE_URL="$PDI_TEST_DATABASE_URL" \
+            PDI_P3D_WP6_BUNDLE="$bundle" \
+            PDI_P3D_WP6_DIGESTS="$digests" \
+            PDI_P3D_WP6_QUALIFICATION_ROOT="$qualification_root" \
+            PDI_P3D_WP6_SYSTEM_PYTHON="$system_python" \
+            PDI_P3D_WP6_CANDIDATE_SHA="$EXPECTED_CANDIDATE_SHA" \
+            "$python_executable" -m pytest -q \
+              tests/test_p3d_pre_rehearsal_evidence.py \
+              tests/integration/test_p3d_pre_rehearsal_evidence.py
+
   host-safe:
     name: Host safe
     runs-on: ubuntu-latest
