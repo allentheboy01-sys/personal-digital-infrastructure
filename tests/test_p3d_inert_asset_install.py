@@ -12,6 +12,7 @@ from uuid import UUID
 import pytest
 
 from pdi.production_ops import p3d_inert_asset_install as module
+from pdi.production_ops.contracts import QUALIFICATION
 from pdi.production_ops.p3d_preparation_contracts import (
     AtomicCreatePolicyV1,
     CANONICAL_P3D_INSTALL_PATHS,
@@ -795,6 +796,210 @@ def rollback_metadata() -> P3DRollbackMetadataV1:
     return P3DRollbackMetadataV1.from_mapping(mapping)
 
 
+def _p3c_pass_state() -> dict[str, object]:
+    return {
+        "phase": "PASS",
+        "sha": SOURCE,
+        "old_target": "/opt/pdi/releases/" + "c" * 40,
+        "context": "5" * 64,
+        "baseline": {"synthetic": "private-baseline"},
+        "qualified": list(QUALIFICATION),
+        "verified": {"synthetic": "private-verified"},
+    }
+
+
+def _write_p3c_state(
+    policy: module.InertAssetPolicy, state: dict[str, object] | None = None,
+) -> bytes:
+    payload = module.json.dumps(
+        _p3c_pass_state() if state is None else state,
+        sort_keys=True,
+    ).encode()
+    policy.p3c_state.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    current = policy.p3c_state.parent
+    while True:
+        current.chmod(0o700 if current == policy.p3c_state.parent else 0o755)
+        if current == policy.root:
+            break
+        current = current.parent
+    policy.p3c_state.write_bytes(payload)
+    policy.p3c_state.chmod(0o600)
+    return payload
+
+
+def test_frozen_p3c_pass_state_reader_returns_only_safe_hash_evidence(tmp_path: Path) -> None:
+    policy = prepare_root(tmp_path)
+    payload = _write_p3c_state(policy)
+    evidence = module._read_frozen_p3c_pass_state(
+        policy.p3c_state, policy=policy,
+        expected_sha=SOURCE, expected_context="5" * 64,
+    )
+    assert evidence.context_fingerprint == "5" * 64
+    assert evidence.state_sha256 == module._sha256(payload)
+    assert set(evidence.__dict__) == {"context_fingerprint", "state_sha256"}
+    assert "private-baseline" not in repr(evidence)
+    assert "private-verified" not in repr(evidence)
+
+
+@pytest.mark.parametrize("case", (
+    "missing", "legacy-jsonl", "symlink", "wrong-owner", "wrong-group", "wrong-mode",
+    "writable-parent",
+))
+def test_frozen_p3c_pass_state_reader_rejects_untrusted_filesystem(
+    tmp_path: Path, case: str,
+) -> None:
+    policy = prepare_root(tmp_path)
+    if case == "legacy-jsonl":
+        legacy = policy.p3c_state.with_name("journal.jsonl")
+        legacy.parent.mkdir(parents=True, mode=0o700)
+        legacy.write_text(
+            '{"phase":"PASS","release_sha":"' + SOURCE +
+            '","context_fingerprint":"' + "5" * 64 + '"}\n',
+            encoding="utf-8",
+        )
+        legacy.chmod(0o600)
+    elif case != "missing":
+        if case == "symlink":
+            target = tmp_path / "synthetic-state-target.json"
+            target.write_text(module.json.dumps(_p3c_pass_state()), encoding="utf-8")
+            target.chmod(0o600)
+            policy.p3c_state.parent.mkdir(parents=True, mode=0o700)
+            policy.p3c_state.symlink_to(target)
+        else:
+            _write_p3c_state(policy)
+            if case == "wrong-owner":
+                policy = module.InertAssetPolicy.qualification(
+                    policy.root, owner_uid=policy.owner_uid + 1,
+                    owner_gid=policy.owner_gid, runtime_uid=65534, runtime_gid=65534,
+                )
+            elif case == "wrong-group":
+                policy = module.InertAssetPolicy.qualification(
+                    policy.root, owner_uid=policy.owner_uid,
+                    owner_gid=policy.owner_gid + 1, runtime_uid=65534, runtime_gid=65534,
+                )
+            elif case == "wrong-mode":
+                policy.p3c_state.chmod(0o640)
+            elif case == "writable-parent":
+                policy.p3c_state.parent.chmod(0o770)
+    with pytest.raises(module.InertAssetInstallError) as error:
+        module._read_frozen_p3c_pass_state(
+            policy.p3c_state, policy=policy,
+            expected_sha=SOURCE, expected_context="5" * 64,
+        )
+    assert error.value.code is FailureCode.ASSET_PREREQUISITE_INVALID
+
+
+@pytest.mark.parametrize("case", (
+    "prepared", "activating", "aborted", "abort-incomplete", "wrong-sha",
+    "wrong-context", "qualified-missing", "qualified-extra", "qualified-order",
+    "qualified-type", "baseline-type", "baseline-empty", "verified-missing",
+    "verified-type", "verified-empty", "old-target-control", "extra-field",
+))
+def test_frozen_p3c_pass_state_reader_rejects_schema_or_authority_drift(
+    tmp_path: Path, case: str,
+) -> None:
+    policy = prepare_root(tmp_path)
+    state = _p3c_pass_state()
+    if case in {"prepared", "activating", "aborted", "abort-incomplete"}:
+        state["phase"] = case.replace("-", "_").upper()
+    elif case == "wrong-sha":
+        state["sha"] = CANDIDATE
+    elif case == "wrong-context":
+        state["context"] = "6" * 64
+    elif case == "qualified-missing":
+        state["qualified"] = list(QUALIFICATION[:-1])
+    elif case == "qualified-extra":
+        state["qualified"] = [*QUALIFICATION, "unexpected"]
+    elif case == "qualified-order":
+        state["qualified"] = list(reversed(QUALIFICATION))
+    elif case == "qualified-type":
+        state["qualified"] = ",".join(QUALIFICATION)
+    elif case == "baseline-type":
+        state["baseline"] = []
+    elif case == "baseline-empty":
+        state["baseline"] = {}
+    elif case == "verified-missing":
+        del state["verified"]
+    elif case == "verified-type":
+        state["verified"] = []
+    elif case == "verified-empty":
+        state["verified"] = {}
+    elif case == "old-target-control":
+        state["old_target"] = "/opt/pdi/releases/prior\nrelease"
+    elif case == "extra-field":
+        state["future"] = "not-authorized"
+    _write_p3c_state(policy, state)
+    with pytest.raises(module.InertAssetInstallError) as error:
+        module._read_frozen_p3c_pass_state(
+            policy.p3c_state, policy=policy,
+            expected_sha=SOURCE, expected_context="5" * 64,
+        )
+    assert error.value.code is FailureCode.ASSET_PREREQUISITE_INVALID
+
+
+def test_frozen_p3c_state_drift_is_rejected_before_complete_marker(tmp_path: Path) -> None:
+    policy = prepare_root(tmp_path)
+    payload = _write_p3c_state(policy)
+    metadata = rollback_metadata()
+    pin = RollbackReleasePinV1(
+        metadata.snapshot_id, SOURCE, metadata.source_release_fingerprint,
+        metadata.source_runtime_fingerprint, metadata.source_system_runtime_fingerprint,
+        rollback_metadata_fingerprint(metadata), metadata.qualified_at_utc,
+        ReleasePinState.ACTIVE,
+    )
+    evidence = module.PrerequisiteEvidence(
+        metadata, rollback_metadata_fingerprint(metadata), pin, H1,
+        f"/opt/pdi/releases/{SOURCE}", metadata.p3c_context_fingerprint,
+        module._sha256(payload), H1,
+    )
+    reader = module.ProtectedPrerequisiteReader(
+        policy, inputs(), module.SyntheticSystemdStateProvider(
+            module.SystemdSnapshot(H1, "2" * 64, True)
+        ),
+    )
+    changed = _p3c_pass_state()
+    changed["phase"] = "ABORTING"
+    _write_p3c_state(policy, changed)
+    with pytest.raises(module.InertAssetInstallError) as error:
+        reader.verify_p3c_state_unchanged(evidence)
+    assert error.value.code is FailureCode.ASSET_COMPLETE_MARKER_FAILED
+
+
+def test_p3c_state_drift_after_all_files_prevents_complete_marker(tmp_path: Path) -> None:
+    policy = prepare_root(tmp_path)
+    make_parents(policy)
+    payload = _write_p3c_state(policy)
+    metadata = rollback_metadata()
+    evidence = module.PrerequisiteEvidence(
+        metadata, rollback_metadata_fingerprint(metadata),
+        RollbackReleasePinV1(
+            metadata.snapshot_id, SOURCE, metadata.source_release_fingerprint,
+            metadata.source_runtime_fingerprint, metadata.source_system_runtime_fingerprint,
+            rollback_metadata_fingerprint(metadata), metadata.qualified_at_utc,
+            ReleasePinState.ACTIVE,
+        ),
+        H1, f"/opt/pdi/releases/{SOURCE}", metadata.p3c_context_fingerprint,
+        module._sha256(payload), H1,
+    )
+    store, state, events = offline_state(policy)
+    state, events, installed, _ = installer(policy)._install(
+        rendered(), store, state, events,
+    )
+    assert len(installed) == 13
+    changed = _p3c_pass_state()
+    changed["context"] = "6" * 64
+    _write_p3c_state(policy, changed)
+    reader = module.ProtectedPrerequisiteReader(
+        policy, inputs(), module.SyntheticSystemdStateProvider(
+            module.SystemdSnapshot(H1, "2" * 64, True)
+        ),
+    )
+    with pytest.raises(module.InertAssetInstallError) as error:
+        reader.verify_p3c_state_unchanged(evidence)
+    assert error.value.code is FailureCode.ASSET_COMPLETE_MARKER_FAILED
+    assert not (policy.gate_c_root / OPERATION / "complete.json").exists()
+
+
 def _write_complete_gate_a_authority(preparation_root: Path) -> Path:
     authority = preparation_root / f"operation-{OPERATION}" / "authority"
     authority.parent.mkdir(parents=True)
@@ -867,6 +1072,7 @@ class FakePrerequisites:
     def __init__(self, policy, gate_inputs, systemd):
         self.policy = policy
         self.systemd = systemd
+        self.revalidation_calls = 0
 
     def collect(self, *, home):
         metadata = rollback_metadata()
@@ -879,8 +1085,12 @@ class FakePrerequisites:
         snapshot = self.systemd.snapshot()
         return module.PrerequisiteEvidence(
             metadata, metadata_hash, pin, H1, f"/opt/pdi/releases/{SOURCE}",
-            metadata.p3c_context_fingerprint, snapshot.p3c_fingerprint,
+            metadata.p3c_context_fingerprint, "9" * 64, snapshot.p3c_fingerprint,
         )
+
+    def verify_p3c_state_unchanged(self, evidence):
+        assert evidence.p3c_state_sha256 == "9" * 64
+        self.revalidation_calls += 1
 
 
 class FakeStaticVerifier:
@@ -963,9 +1173,15 @@ def test_full_qualification_orchestration_completes_without_workload(tmp_path: P
         CANDIDATE, OPERATION, OPERATION,
         systemd_asset_fingerprint(systemd_assets), tool(),
     )
+    captured = {}
+
+    def prerequisite_factory(*args):
+        captured["reader"] = FakePrerequisites(*args)
+        return captured["reader"]
+
     result = module.InertAssetInstaller(
         inputs=gate_inputs, policy=policy, systemd=systemd,
-        prerequisite_reader_factory=FakePrerequisites,
+        prerequisite_reader_factory=prerequisite_factory,
         static_verifier=static,
         db_evidence_reader_factory=FakeDatabaseReader,
         engine_factory=lambda _url: FakeEngine(),
@@ -974,6 +1190,7 @@ def test_full_qualification_orchestration_completes_without_workload(tmp_path: P
     assert len(result.marker.installed_file_manifest) == 13
     assert static.calls == 2
     assert systemd.calls == 2
+    assert captured["reader"].revalidation_calls == 1
     assert policy.current.readlink() == Path(f"/opt/pdi/releases/{SOURCE}")
     authority_bytes = b"".join(
         path.read_bytes() for path in (policy.gate_c_root / result.operation_id).rglob("*")

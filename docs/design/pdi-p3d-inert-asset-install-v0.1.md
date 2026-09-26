@@ -24,7 +24,12 @@ and validated:
 2. The explicit Gate B operation is `COMPLETE`; its full immutable journal and
    final release fingerprint agree with the immutable candidate release.
 3. `/opt/pdi/current` still names the rollback-source release.
-4. The protected P3C PASS record matches the rollback source and P3C context.
+4. The frozen protected P3C authority at `/var/lib/pdi-p3c/state.json`
+   matches the rollback source and P3C context. Gate C requires the exact P3C
+   V0.1 successful-state field set (`phase`, `sha`, `old_target`, `context`,
+   `baseline`, `qualified`, and `verified`), exact frozen qualification order,
+   and a root-controlled regular 0600 file. The non-authoritative
+   `journal.jsonl` shape is never a fallback.
 5. P3C writer timers are healthy and P3D enrichment timers are already quiet.
 6. The protected environment and registry are trusted and unchanged.
 7. The selected Principal and enabled Scope IDs come from the routed Personal
@@ -81,8 +86,13 @@ failure never removes an already-created canonical file.
 
 Completion requires a freshly read exact 13-file manifest, unchanged P3C
 systemd evidence, six disabled/inactive P3D timers, unchanged current symlink,
-and unchanged registry/environment authorities. The root-owned 0600 complete
-marker is created without replacement under the explicit Gate C operation.
+and unchanged registry/environment authorities. Immediately before the
+complete marker, Gate C re-reads the frozen P3C PASS state and requires its
+SHA-256, release SHA, context, qualification coverage, and protected-file trust
+to remain unchanged. Only its context fingerprint and raw-state SHA-256 enter
+Gate C evidence; private `baseline`, `verified`, and `old_target` values do not.
+The root-owned 0600 complete marker is created without replacement under the
+explicit Gate C operation.
 
 Installing files is intentionally not activation. `daemon-reload`, enable,
 start, stop, restart, promotion, workload execution, and real systemd
@@ -91,7 +101,8 @@ rehearsal belong to later, separately authorized gates.
 The disposable cross-gate qualification downloads the exact WP3 bundle, runs
 the frozen WP4 bootstrap to create the real Gate B authority and immutable
 release, writes a contract-valid synthetic Gate A authority with the frozen
-writers, and invokes this CLI with that staged release's own `.venv/bin/python`
-without workspace `PYTHONPATH`. It uses real PostgreSQL read-only evidence and
-real offline `systemd-analyze`; it does not mutate the live systemd manager or
-run a workload.
+writers, persists the synthetic P3C PASS authority through frozen P3C
+`Host.save()` at the real `state.json` layout, and invokes this CLI with that
+staged release's own `.venv/bin/python` without workspace `PYTHONPATH`. It uses
+real PostgreSQL read-only evidence and real offline `systemd-analyze`; it does
+not mutate the live systemd manager or run a workload.

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import os
 import shutil
+import stat
 import subprocess
 from uuid import uuid4
 
@@ -16,6 +17,8 @@ from sqlalchemy import text
 
 from pdi.database import create_postgres_engine
 from pdi.production_ops import p3d_inert_asset_install as module
+from pdi.production_ops.contracts import QUALIFICATION
+from pdi.production_ops.cutover import Host as FrozenP3CHost, Paths as FrozenP3CPaths
 from pdi.production_ops.p3d_preparation_contracts import (
     AtomicCreatePolicyV1,
     GateAPhase,
@@ -118,8 +121,11 @@ class FakePrerequisiteReader:
         snapshot = self.systemd.snapshot()
         return module.PrerequisiteEvidence(
             metadata, rollback_metadata_fingerprint(metadata), _pin(metadata),
-            H2, f"/opt/pdi/releases/{SOURCE}", H5, snapshot.p3c_fingerprint,
+            H2, f"/opt/pdi/releases/{SOURCE}", H5, H6, snapshot.p3c_fingerprint,
         )
+
+    def verify_p3c_state_unchanged(self, evidence):
+        assert evidence.p3c_state_sha256 == H6
 
 
 def _clean(engine) -> None:
@@ -452,16 +458,38 @@ def test_exact_candidate_cli_consumes_real_gate_a_and_gate_b_authorities() -> No
 
         current.symlink_to(f"/opt/pdi/releases/{source}")
         current_before = os.readlink(current)
-        p3c_journal = root / "var/lib/pdi-p3c/journal.jsonl"
-        _write(
-            p3c_journal,
-            json.dumps({
-                "phase": "PASS",
-                "release_sha": source,
-                "context_fingerprint": metadata.p3c_context_fingerprint,
-            }, sort_keys=True) + "\n",
-            0o600, 0, 0,
+        p3c_state_root = root / "var/lib/pdi-p3c"
+        frozen_paths = FrozenP3CPaths(
+            staging=root / "p3c-unused/staging",
+            env=root / "p3c-unused/pdi.env",
+            recovery=root / "p3c-unused/recovery",
+            config=root / "p3c-unused/config",
+            units=root / "p3c-unused/units",
+            current=root / "p3c-unused/current",
+            releases=root / "p3c-unused/releases",
+            state=p3c_state_root,
+            control=root / "p3c-unused/control.lock",
+            sync=root / "p3c-unused/sync.lock",
         )
+        frozen_host = FrozenP3CHost(
+            frozen_paths, root / "p3c-unused/release", source,
+            "synthetic-host", H1, SOURCE,
+        )
+        frozen_host.save({
+            "phase": "PASS",
+            "sha": source,
+            "old_target": "/opt/pdi/releases/" + "c" * 40,
+            "context": metadata.p3c_context_fingerprint,
+            "baseline": {"synthetic": "private-baseline-evidence"},
+            "qualified": list(QUALIFICATION),
+            "verified": {"synthetic": "private-verified-evidence"},
+        })
+        p3c_state = p3c_state_root / "state.json"
+        assert p3c_state.is_file()
+        p3c_state_info = p3c_state.lstat()
+        assert p3c_state_info.st_uid == 0 and p3c_state_info.st_gid == 0
+        assert stat.S_IMODE(p3c_state_info.st_mode) == 0o600
+        assert not (p3c_state_root / "journal.jsonl").exists()
 
         environment = root / "etc/pdi/pdi.env"
         _write(
@@ -505,7 +533,7 @@ def test_exact_candidate_cli_consumes_real_gate_a_and_gate_b_authorities() -> No
         for path in (root / "etc", root / "etc/pdi", root / "etc/pdi/scoped"):
             os.chown(path, 0, 0)
             os.chmod(path, 0o755)
-        p3c_before = hashlib.sha256(p3c_journal.read_bytes()).hexdigest()
+        p3c_before = hashlib.sha256(p3c_state.read_bytes()).hexdigest()
         registry_before = hashlib.sha256(registry.read_bytes()).hexdigest()
         environment_before = hashlib.sha256(environment.read_bytes()).hexdigest()
         with engine.connect() as connection:
@@ -553,7 +581,8 @@ def test_exact_candidate_cli_consumes_real_gate_a_and_gate_b_authorities() -> No
         assert result["SYSTEMD_MUTATION"] == "NO"
         assert result["WORKLOAD_STARTED"] == "NO"
         assert os.readlink(current) == current_before
-        assert hashlib.sha256(p3c_journal.read_bytes()).hexdigest() == p3c_before
+        assert hashlib.sha256(p3c_state.read_bytes()).hexdigest() == p3c_before
+        assert not (p3c_state_root / "journal.jsonl").exists()
         assert hashlib.sha256(registry.read_bytes()).hexdigest() == registry_before
         assert hashlib.sha256(environment.read_bytes()).hexdigest() == environment_before
         assert not list(root.rglob("*.wants"))
@@ -563,6 +592,13 @@ def test_exact_candidate_cli_consumes_real_gate_a_and_gate_b_authorities() -> No
         ]) == 13
         gate_c_root = preparation_root / "inert-assets" / result["OPERATION_ID"]
         assert (gate_c_root / "complete.json").is_file()
+        gate_c_authority = b"".join(
+            path.read_bytes() for path in gate_c_root.rglob("*") if path.is_file()
+        )
+        assert p3c_before.encode() in gate_c_authority
+        assert b"private-baseline-evidence" not in gate_c_authority
+        assert b"private-verified-evidence" not in gate_c_authority
+        assert ("/opt/pdi/releases/" + "c" * 40).encode() not in gate_c_authority
         with engine.connect() as connection:
             db_after = tuple(connection.execute(text(
                 "SELECT "

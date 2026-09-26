@@ -26,12 +26,11 @@ from typing import Callable, Mapping, Protocol, Sequence
 from uuid import UUID, uuid4
 
 from pdi.database import create_postgres_engine
-from pdi.production_ops.contracts import ENV_KEYS, parse_env
+from pdi.production_ops.contracts import ENV_KEYS, QUALIFICATION, parse_env
 from pdi.production_ops.enrichment_cutover import P3D_TIMER_UNITS
 from pdi.production_ops.p3d_evidence import (
     PersonalDatabaseEvidence,
     RoutedPersonalDatabaseEvidenceReader,
-    read_p3c_journal,
 )
 from pdi.production_ops.p3d_preparation_contracts import (
     AtomicCreatePolicyV1,
@@ -266,8 +265,8 @@ class InertAssetPolicy:
         return self.physical("/etc/pdi/pdi.env")
 
     @property
-    def p3c_journal(self) -> Path:
-        return self.physical("/var/lib/pdi-p3c/journal.jsonl")
+    def p3c_state(self) -> Path:
+        return self.physical("/var/lib/pdi-p3c/state.json")
 
     @property
     def preparation_root(self) -> Path:
@@ -308,6 +307,7 @@ class PrerequisiteEvidence:
     gate_b_release_fingerprint: str
     current_target: str
     p3c_context_fingerprint: str
+    p3c_state_sha256: str
     p3c_systemd_before: str
 
 
@@ -488,6 +488,58 @@ def _read_json(path: Path) -> Mapping[str, object]:
         _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
 
 
+@dataclass(frozen=True)
+class FrozenP3CPassEvidence:
+    """Safe subset of one exact frozen P3C V0.1 PASS state."""
+
+    context_fingerprint: str
+    state_sha256: str
+
+
+_FROZEN_P3C_PASS_FIELDS = {
+    "phase", "sha", "old_target", "context", "baseline", "qualified", "verified",
+}
+
+
+def _read_frozen_p3c_pass_state(
+    path: Path, *, policy: InertAssetPolicy,
+    expected_sha: str, expected_context: str,
+) -> FrozenP3CPassEvidence:
+    """Read only the exact frozen P3C state schema; never expose private evidence."""
+    expected_sha = _safe_sha(expected_sha, git=True)
+    expected_context = _safe_sha(expected_context)
+    try:
+        _trusted_leaf(path, policy=policy, mode=0o600)
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != policy.owner_uid or
+                    info.st_gid != policy.owner_gid or stat.S_IMODE(info.st_mode) != 0o600):
+                raise OSError
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                payload = stream.read()
+        finally:
+            os.close(descriptor)
+        state = json.loads(payload.decode("utf-8"))
+        if type(state) is not dict or set(state) != _FROZEN_P3C_PASS_FIELDS:
+            raise ValueError
+        if (state["phase"] != "PASS" or state["sha"] != expected_sha or
+                state["context"] != expected_context or
+                type(state["qualified"]) is not list or
+                state["qualified"] != list(QUALIFICATION) or
+                type(state["baseline"]) is not dict or not state["baseline"] or
+                type(state["verified"]) is not dict or not state["verified"] or
+                not isinstance(state["old_target"], str) or not state["old_target"] or
+                any(ord(character) < 32 or 0x7f <= ord(character) <= 0x9f
+                    for character in state["old_target"])):
+            raise ValueError
+        return FrozenP3CPassEvidence(expected_context, _sha256(payload))
+    except InertAssetInstallError:
+        raise
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, TypeError):
+        _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
+
+
 def _load_complete_gate(
     root: Path, *, gate: PreparationGate, candidate: str,
     owner_uid: int, owner_gid: int,
@@ -614,22 +666,31 @@ class ProtectedPrerequisiteReader:
             _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
 
         current = self._current_target(metadata.source_release_sha)
-        try:
-            _trusted_leaf(self.policy.p3c_journal, policy=self.policy, mode=0o600)
-            p3c = read_p3c_journal(
-                self.policy.p3c_journal,
-                expected_sha=metadata.source_release_sha,
-                expected_context=metadata.p3c_context_fingerprint,
-            )
-        except Exception:
-            _fail(FailureCode.ASSET_PREREQUISITE_INVALID)
+        p3c = _read_frozen_p3c_pass_state(
+            self.policy.p3c_state, policy=self.policy,
+            expected_sha=metadata.source_release_sha,
+            expected_context=metadata.p3c_context_fingerprint,
+        )
         snapshot = self.systemd.snapshot(post_install=False)
         if not snapshot.p3d_quiet:
             _fail(FailureCode.ASSET_SYSTEMD_NOT_QUIET)
         return PrerequisiteEvidence(
             metadata, metadata_hash, pin, gate_b_fingerprint, current,
-            str(p3c["context_fingerprint"]), snapshot.p3c_fingerprint,
+            p3c.context_fingerprint, p3c.state_sha256, snapshot.p3c_fingerprint,
         )
+
+    def verify_p3c_state_unchanged(self, evidence: PrerequisiteEvidence) -> None:
+        """Re-read the frozen P3C authority immediately before Gate C completion."""
+        try:
+            current = _read_frozen_p3c_pass_state(
+                self.policy.p3c_state, policy=self.policy,
+                expected_sha=evidence.rollback_metadata.source_release_sha,
+                expected_context=evidence.rollback_metadata.p3c_context_fingerprint,
+            )
+            if current.state_sha256 != evidence.p3c_state_sha256:
+                _fail(FailureCode.ASSET_COMPLETE_MARKER_FAILED)
+        except InertAssetInstallError:
+            _fail(FailureCode.ASSET_COMPLETE_MARKER_FAILED)
 
 
 class GateCJournalStore:
@@ -1166,6 +1227,7 @@ class InertAssetInstaller:
             release_pin_fingerprint(prerequisites.release_pin),
             prerequisites.gate_b_release_fingerprint,
             prerequisites.p3c_context_fingerprint,
+            prerequisites.p3c_state_sha256,
             prerequisites.p3c_systemd_before,
         )
         if state.phase == GateCPhase.NEW.value:
@@ -1249,6 +1311,7 @@ class InertAssetInstaller:
                     _sha256(self.policy.environment.read_bytes()),
                 ) != env_before):
             _fail(FailureCode.ASSET_COMPLETE_MARKER_FAILED)
+        reader.verify_p3c_state_unchanged(prerequisites)
         marker = P3DAssetInstallationCompleteV1.from_mapping({
             "marker_version": 1,
             "candidate_sha": self.inputs.candidate_sha,
