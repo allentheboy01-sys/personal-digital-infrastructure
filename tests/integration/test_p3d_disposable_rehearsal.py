@@ -472,6 +472,60 @@ def _tool(candidate: str) -> OperatorToolIdentity:
     })
 
 
+def _build_nspawn_command(
+    machine: str,
+    root: Path,
+    system_python: Path,
+) -> tuple[str, ...]:
+    runtime_root = system_python.parent.parent
+    return (
+        str(SYSTEMD_NSPAWN), "--quiet", "--boot", "--register=yes",
+        f"--machine={machine}", f"--directory={root}",
+        "--bind-ro=/usr:/usr",
+        f"--bind-ro={runtime_root}:{runtime_root}",
+        "--console=pipe", "--link-journal=no", "--settings=no",
+        "--resolv-conf=off", "--timezone=off",
+    )
+
+
+def test_nspawn_command_uses_only_approved_options() -> None:
+    machine = "pdi-p3d-1234567812344234"
+    root = Path("/tmp/pdi-p3d-rehearsal-synthetic")
+    system_python = Path("/opt/synthetic-runtime/bin/python3.13")
+    assert _build_nspawn_command(machine, root, system_python) == (
+        str(SYSTEMD_NSPAWN),
+        "--quiet",
+        "--boot",
+        "--register=yes",
+        f"--machine={machine}",
+        f"--directory={root}",
+        "--bind-ro=/usr:/usr",
+        "--bind-ro=/opt/synthetic-runtime:/opt/synthetic-runtime",
+        "--console=pipe",
+        "--link-journal=no",
+        "--settings=no",
+        "--resolv-conf=off",
+        "--timezone=off",
+    )
+    assert "--unit=basic.target" not in _build_nspawn_command(
+        machine,
+        root,
+        system_python,
+    )
+
+
+def test_rootfs_default_target_remains_basic_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(os, "chown", lambda *args: None)
+    root = tmp_path / "root"
+    _prepare_rootfs(root, 65534, 65534)
+    default_target = root / "etc/systemd/system/default.target"
+    assert default_target.is_symlink()
+    assert os.readlink(default_target) == "/usr/lib/systemd/system/basic.target"
+
+
 def _secure_diagnostic_stream(path: Path):
     parent = path.parent
     if parent.exists() or parent.is_symlink():
@@ -1118,14 +1172,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
 
             rehearsal_operation = str(uuid4())
             machine = machine_name_for(rehearsal_operation)
-            command = (
-                str(SYSTEMD_NSPAWN), "--quiet", "--boot", "--register=yes",
-                f"--machine={machine}", f"--directory={root}",
-                "--bind-ro=/usr:/usr",
-                f"--bind-ro={system_python.parent.parent}:{system_python.parent.parent}",
-                "--console=pipe", "--link-journal=no", "--settings=no",
-                "--resolv-conf=off", "--timezone=off", "--unit=basic.target",
-            )
+            command = _build_nspawn_command(machine, root, system_python)
             diagnostic_root = root / "var/lib/pdi-p3d/rehearsal-diagnostics"
             nspawn_stdout = diagnostic_root / "nspawn.stdout"
             nspawn_stderr = diagnostic_root / "nspawn.stderr"
