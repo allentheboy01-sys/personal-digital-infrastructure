@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from contextlib import contextmanager
+from dataclasses import dataclass
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import pwd
 import grp
+import re
 import shutil
 import signal
 import stat
@@ -62,6 +64,48 @@ IMMICH_ACCOUNT_ID = "33333333-3333-4333-8333-333333333333"
 PRINCIPAL_ID = "44444444-4444-4444-8444-444444444444"
 SYSTEMD_NSPAWN = Path("/usr/bin/systemd-nspawn")
 MACHINECTL = Path("/usr/bin/machinectl")
+_DIAGNOSTIC_LIMIT = 64 * 1024
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b(DATABASE__URL|PASSWORD|API[_-]?KEY|ACCESS[_-]?TOKEN|"
+    r"REFRESH[_-]?TOKEN|OAUTH|SECRET)\b\s*[:=]\s*"
+    r"(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s\r\n]+)"
+)
+
+
+@dataclass(frozen=True)
+class _ManagerStartupDiagnostic:
+    failure_class: str
+    diagnostic_class: str
+    nspawn_exit_code: int | None
+    nspawn_stdout_sha256: str
+    nspawn_stderr_sha256: str
+    machinectl_return_code: int
+    machinectl_stdout_sha256: str
+    machinectl_stderr_sha256: str
+    sanitized_nspawn_stdout: str
+    sanitized_nspawn_stderr: str
+    sanitized_machinectl_stdout: str
+    sanitized_machinectl_stderr: str
+
+    def safe_message(self) -> str:
+        exit_code = -1 if self.nspawn_exit_code is None else self.nspawn_exit_code
+        return "\n".join((
+            self.failure_class,
+            f"NSPAWN_EXIT_CODE={exit_code}",
+            f"NSPAWN_FAILURE_CLASS={self.failure_class}",
+            f"NSPAWN_DIAGNOSTIC_CLASS={self.diagnostic_class}",
+            f"NSPAWN_STDOUT_SHA256={self.nspawn_stdout_sha256}",
+            f"NSPAWN_STDERR_SHA256={self.nspawn_stderr_sha256}",
+            f"MACHINECTL_RETURN_CODE={self.machinectl_return_code}",
+            f"MACHINECTL_STDOUT_SHA256={self.machinectl_stdout_sha256}",
+            f"MACHINECTL_STDERR_SHA256={self.machinectl_stderr_sha256}",
+        ))
+
+
+class _ManagerStartupError(AssertionError):
+    def __init__(self, diagnostic: _ManagerStartupDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.safe_message())
 
 
 def _environment() -> tuple[Path, Path, Path, Path, str]:
@@ -410,17 +454,285 @@ def _tool(candidate: str) -> OperatorToolIdentity:
     })
 
 
-def _wait_for_machine(machine: str, timeout: float = 30) -> int:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        result = subprocess.run(
+def _secure_diagnostic_stream(path: Path):
+    parent = path.parent
+    if parent.exists() or parent.is_symlink():
+        existing = parent.lstat()
+        assert stat.S_ISDIR(existing.st_mode) and not parent.is_symlink()
+    else:
+        parent.mkdir(mode=0o700)
+    os.chown(parent, 0, 0)
+    os.chmod(parent, 0o700)
+    parent_info = parent.lstat()
+    assert stat.S_ISDIR(parent_info.st_mode) and not parent.is_symlink()
+    assert parent_info.st_uid == 0 and parent_info.st_gid == 0
+    assert stat.S_IMODE(parent_info.st_mode) == 0o700
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        info = os.fstat(descriptor)
+        assert stat.S_ISREG(info.st_mode)
+        assert info.st_uid == 0 and info.st_gid == 0
+        assert stat.S_IMODE(info.st_mode) == 0o600
+        return os.fdopen(descriptor, "wb", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _sanitize_diagnostic(value: str, secret_values: tuple[str, ...]) -> str:
+    sanitized = value
+    for secret in sorted((item for item in secret_values if item), key=len, reverse=True):
+        sanitized = sanitized.replace(secret, "[REDACTED]")
+    return _SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        sanitized,
+    )
+
+
+def _read_diagnostic(
+    path: Path,
+    secret_values: tuple[str, ...],
+) -> tuple[str, str]:
+    payload = path.read_bytes()
+    digest = sha256(payload).hexdigest()
+    excerpt = payload[-_DIAGNOSTIC_LIMIT:].decode("utf-8", errors="replace")
+    return digest, _sanitize_diagnostic(excerpt, secret_values)
+
+
+def _diagnostic_class(*values: str) -> str:
+    combined = "\n".join(values).casefold()
+    categories = (
+        ("MOUNT_OR_BIND_FAILURE", ("mount", "bind")),
+        ("ROOTFS_FAILURE", ("rootfs", "root directory", "os tree")),
+        ("NAMESPACE_FAILURE", ("namespace", "clone", "unshare")),
+        ("SYSTEMD_BOOT_FAILURE", ("failed to boot", "systemd", "pid 1")),
+        ("MACHINE_REGISTRATION_UNAVAILABLE", ("no machine", "not registered")),
+    )
+    for category, markers in categories:
+        if any(marker in combined for marker in markers):
+            return category
+    return "UNCLASSIFIED"
+
+
+def _manager_startup_error(
+    failure_class: str,
+    *,
+    machine_process,
+    nspawn_stdout: Path,
+    nspawn_stderr: Path,
+    last_machinectl,
+    secret_values: tuple[str, ...],
+) -> _ManagerStartupError:
+    stdout_sha, sanitized_stdout = _read_diagnostic(nspawn_stdout, secret_values)
+    stderr_sha, sanitized_stderr = _read_diagnostic(nspawn_stderr, secret_values)
+    machinectl_return_code = -1
+    machinectl_stdout = ""
+    machinectl_stderr = ""
+    if last_machinectl is not None:
+        machinectl_return_code = last_machinectl.returncode
+        machinectl_stdout = _sanitize_diagnostic(last_machinectl.stdout, secret_values)
+        machinectl_stderr = _sanitize_diagnostic(last_machinectl.stderr, secret_values)
+    diagnostic = _ManagerStartupDiagnostic(
+        failure_class=failure_class,
+        diagnostic_class=_diagnostic_class(
+            sanitized_stdout,
+            sanitized_stderr,
+            machinectl_stdout,
+            machinectl_stderr,
+        ),
+        nspawn_exit_code=machine_process.poll(),
+        nspawn_stdout_sha256=stdout_sha,
+        nspawn_stderr_sha256=stderr_sha,
+        machinectl_return_code=machinectl_return_code,
+        machinectl_stdout_sha256=sha256(machinectl_stdout.encode()).hexdigest(),
+        machinectl_stderr_sha256=sha256(machinectl_stderr.encode()).hexdigest(),
+        sanitized_nspawn_stdout=sanitized_stdout,
+        sanitized_nspawn_stderr=sanitized_stderr,
+        sanitized_machinectl_stdout=machinectl_stdout,
+        sanitized_machinectl_stderr=machinectl_stderr,
+    )
+    return _ManagerStartupError(diagnostic)
+
+
+def _wait_for_machine(
+    machine: str,
+    machine_process,
+    *,
+    nspawn_stdout: Path,
+    nspawn_stderr: Path,
+    secret_values: tuple[str, ...] = (),
+    timeout: float = 30,
+    runner=subprocess.run,
+    monotonic=time.monotonic,
+    sleeper=time.sleep,
+) -> int:
+    deadline = monotonic() + timeout
+    last_machinectl = None
+    while monotonic() < deadline:
+        if machine_process.poll() is not None:
+            raise _manager_startup_error(
+                "DISPOSABLE_SYSTEMD_MANAGER_EXITED_EARLY",
+                machine_process=machine_process,
+                nspawn_stdout=nspawn_stdout,
+                nspawn_stderr=nspawn_stderr,
+                last_machinectl=last_machinectl,
+                secret_values=secret_values,
+            )
+        result = runner(
             (str(MACHINECTL), "show", machine, "--property=Leader", "--value"),
             capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
         )
+        last_machinectl = result
         if result.returncode == 0 and result.stdout.strip().isdigit():
             return int(result.stdout.strip())
-        time.sleep(0.25)
-    raise AssertionError("DISPOSABLE_SYSTEMD_MANAGER_NOT_READY")
+        sleeper(0.25)
+    if machine_process.poll() is not None:
+        raise _manager_startup_error(
+            "DISPOSABLE_SYSTEMD_MANAGER_EXITED_EARLY",
+            machine_process=machine_process,
+            nspawn_stdout=nspawn_stdout,
+            nspawn_stderr=nspawn_stderr,
+            last_machinectl=last_machinectl,
+            secret_values=secret_values,
+        )
+    raise _manager_startup_error(
+        "DISPOSABLE_SYSTEMD_MANAGER_REGISTRATION_TIMEOUT",
+        machine_process=machine_process,
+        nspawn_stdout=nspawn_stdout,
+        nspawn_stderr=nspawn_stderr,
+        last_machinectl=last_machinectl,
+        secret_values=secret_values,
+    )
+
+
+class _SyntheticProcess:
+    def __init__(self, returncode: int | None) -> None:
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
+def _synthetic_diagnostics(tmp_path: Path) -> tuple[Path, Path]:
+    stdout = tmp_path / "nspawn.stdout"
+    stderr = tmp_path / "nspawn.stderr"
+    stdout.write_text("", encoding="utf-8")
+    stderr.write_text("", encoding="utf-8")
+    return stdout, stderr
+
+
+def test_wait_for_machine_detects_early_exit_with_sanitized_diagnostics(
+    tmp_path: Path,
+) -> None:
+    stdout, stderr = _synthetic_diagnostics(tmp_path)
+    secret = "postgresql://synthetic:do-not-print@127.0.0.1/test"
+    stderr.write_text(
+        f"Failed to mount rootfs DATABASE__URL={secret}\n",
+        encoding="utf-8",
+    )
+
+    def unexpected_runner(*args, **kwargs):
+        raise AssertionError("machinectl must not run after child exit")
+
+    with pytest.raises(_ManagerStartupError) as raised:
+        _wait_for_machine(
+            "pdi-p3d-synthetic",
+            _SyntheticProcess(1),
+            nspawn_stdout=stdout,
+            nspawn_stderr=stderr,
+            secret_values=(secret, "do-not-print"),
+            runner=unexpected_runner,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.failure_class == "DISPOSABLE_SYSTEMD_MANAGER_EXITED_EARLY"
+    assert diagnostic.nspawn_exit_code == 1
+    assert diagnostic.diagnostic_class == "MOUNT_OR_BIND_FAILURE"
+    assert diagnostic.machinectl_return_code == -1
+    assert "[REDACTED]" in diagnostic.sanitized_nspawn_stderr
+    assert secret not in diagnostic.sanitized_nspawn_stderr
+    assert secret not in str(raised.value)
+
+
+def test_wait_for_machine_distinguishes_registration_timeout(tmp_path: Path) -> None:
+    stdout, stderr = _synthetic_diagnostics(tmp_path)
+    clock = [0.0]
+    calls = []
+
+    def monotonic():
+        return clock[0]
+
+    def sleeper(interval):
+        clock[0] += interval
+
+    def runner(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 1, "", "No machine known\n")
+
+    with pytest.raises(_ManagerStartupError) as raised:
+        _wait_for_machine(
+            "pdi-p3d-synthetic",
+            _SyntheticProcess(None),
+            nspawn_stdout=stdout,
+            nspawn_stderr=stderr,
+            timeout=0.5,
+            runner=runner,
+            monotonic=monotonic,
+            sleeper=sleeper,
+        )
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic.failure_class == (
+        "DISPOSABLE_SYSTEMD_MANAGER_REGISTRATION_TIMEOUT"
+    )
+    assert diagnostic.nspawn_exit_code is None
+    assert diagnostic.diagnostic_class == "MACHINE_REGISTRATION_UNAVAILABLE"
+    assert diagnostic.machinectl_return_code == 1
+    assert diagnostic.sanitized_machinectl_stderr == "No machine known\n"
+    assert len(calls) == 2
+
+
+def test_wait_for_machine_accepts_successful_registration(tmp_path: Path) -> None:
+    stdout, stderr = _synthetic_diagnostics(tmp_path)
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, "4321\n", "")
+
+    assert _wait_for_machine(
+        "pdi-p3d-synthetic",
+        _SyntheticProcess(None),
+        nspawn_stdout=stdout,
+        nspawn_stderr=stderr,
+        runner=runner,
+    ) == 4321
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="root ownership assertion")
+def test_nspawn_diagnostic_stream_is_root_only(tmp_path: Path) -> None:
+    stdout = tmp_path / "diagnostics/nspawn.stdout"
+    stderr = tmp_path / "diagnostics/nspawn.stderr"
+    streams = (
+        _secure_diagnostic_stream(stdout),
+        _secure_diagnostic_stream(stderr),
+    )
+    try:
+        for path in (stdout, stderr):
+            info = path.lstat()
+            assert stat.S_ISREG(info.st_mode) and not path.is_symlink()
+            assert info.st_uid == 0 and info.st_gid == 0
+            assert stat.S_IMODE(info.st_mode) == 0o600
+        parent = stdout.parent.lstat()
+        assert parent.st_uid == 0 and parent.st_gid == 0
+        assert stat.S_IMODE(parent.st_mode) == 0o700
+    finally:
+        for stream in streams:
+            stream.close()
 
 
 def _terminate_machine(machine: str, process: subprocess.Popen) -> bool:
@@ -469,6 +781,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     host_systemd_before = _host_systemd_snapshot()
     engine = None
     machine_process = None
+    diagnostic_streams = []
     machine = ""
     complete_fingerprint = None
     manager_cleaned = False
@@ -626,12 +939,29 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                 "--console=pipe", "--link-journal=no", "--settings=no",
                 "--resolv-conf=off", "--timezone=off", "--unit=basic.target",
             )
+            diagnostic_root = root / "var/lib/pdi-p3d/rehearsal-diagnostics"
+            nspawn_stdout = diagnostic_root / "nspawn.stdout"
+            nspawn_stderr = diagnostic_root / "nspawn.stderr"
+            diagnostic_streams.append(_secure_diagnostic_stream(nspawn_stdout))
+            diagnostic_streams.append(_secure_diagnostic_stream(nspawn_stderr))
             machine_process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=diagnostic_streams[0], stderr=diagnostic_streams[1],
                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
             )
-            leader = _wait_for_machine(machine)
+            database_password = make_url(url).password or ""
+            leader = _wait_for_machine(
+                machine,
+                machine_process,
+                nspawn_stdout=nspawn_stdout,
+                nspawn_stderr=nspawn_stderr,
+                secret_values=(
+                    url,
+                    database_password,
+                    "synthetic-nextcloud-password",
+                    "synthetic-immich-api-key",
+                ),
+            )
             lock = Path(f"/proc/{leader}/root/run/lock/pdi-sync.lock")
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.touch(exist_ok=False)
@@ -687,6 +1017,8 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     finally:
         if machine_process is not None:
             manager_cleaned = _terminate_machine(machine, machine_process)
+        for stream in diagnostic_streams:
+            stream.close()
         if engine is not None:
             _clean_rehearsal_database(engine)
             with engine.connect() as connection:
