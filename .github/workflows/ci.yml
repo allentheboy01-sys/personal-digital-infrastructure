@@ -498,6 +498,155 @@ jobs:
               tests/test_p3d_pre_rehearsal_evidence.py \
               tests/integration/test_p3d_pre_rehearsal_evidence.py
 
+  p3d-disposable-rehearsal:
+    name: P3D disposable real-systemd rehearsal
+    needs: p3d-release-bundle
+    runs-on: ubuntu-latest
+    env:
+      EXPECTED_CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PDI_TEST_DATABASE_URL: >-
+        postgresql+psycopg://pdi_wp7:pdi-wp7-synthetic@127.0.0.1:5432/pdi_wp7_runtime_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pdi_wp7_runtime_test
+          POSTGRES_USER: pdi_wp7
+          POSTGRES_PASSWORD: pdi-wp7-synthetic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pdi_wp7 -d pdi_wp7_runtime_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out exact reviewed candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Fail closed on candidate drift
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Install disposable systemd-nspawn host capability
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes systemd-container
+          test "$(ps -p 1 -o comm= | xargs)" = systemd
+          test -x /usr/bin/systemd-nspawn
+          test -x /usr/bin/machinectl
+      - name: Set up Python 3.13
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install qualification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test]'
+          python -m pip check
+      - name: Download exact candidate qualification bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: pdi-p3d-release-input-${{ env.EXPECTED_CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/pdi-p3d-wp7-input
+      - name: Run exact six services in one isolated real systemd manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_executable="$(command -v python)"
+          bundle="$RUNNER_TEMP/pdi-p3d-wp7-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.tar"
+          digests="$RUNNER_TEMP/pdi-p3d-wp7-input/pdi-p3d-release-input-$EXPECTED_CANDIDATE_SHA.digests.json"
+          test -f "$bundle"
+          test -f "$digests"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["CANDIDATE_SHA"])' "$digests")" = "$EXPECTED_CANDIDATE_SHA"
+          if ! getent group pdi >/dev/null; then
+            sudo groupadd --system pdi
+          fi
+          if ! getent passwd pdi >/dev/null; then
+            sudo useradd --system --gid pdi --no-create-home \
+              --home-dir /nonexistent --shell /usr/sbin/nologin pdi
+          fi
+          test "$(id -u pdi)" -gt 0
+          test "$(id -g pdi)" -gt 0
+          runtime_source="${pythonLocation:?}"
+          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-wp7-runtime.XXXXXX)"
+          rehearsal_root="$(sudo mktemp -d /tmp/pdi-p3d-rehearsal-XXXXXXXX)"
+          sudo rmdir "$rehearsal_root"
+          case "$qualification_runtime" in
+            /tmp/pdi-p3d-wp7-runtime.*) ;;
+            *) exit 1 ;;
+          esac
+          case "$rehearsal_root" in
+            /tmp/pdi-p3d-rehearsal-*) ;;
+            *) exit 1 ;;
+          esac
+          cleanup() {
+            case "$qualification_runtime" in
+              /tmp/pdi-p3d-wp7-runtime.*) ;;
+              *) return 1 ;;
+            esac
+            case "$rehearsal_root" in
+              /tmp/pdi-p3d-rehearsal-*) ;;
+              *) return 1 ;;
+            esac
+            sudo rm -rf -- "$qualification_runtime" "$rehearsal_root"
+          }
+          trap cleanup EXIT
+          sudo cp -aL "$runtime_source/." "$qualification_runtime/"
+          sudo chown -R root:root "$qualification_runtime"
+          sudo find "$qualification_runtime" -type d -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
+          sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
+          test -z "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)"
+          system_python="$qualification_runtime/bin/python"
+          sudo test -x "$system_python"
+          rehearsal_log="$RUNNER_TEMP/pdi-p3d-wp7-rehearsal.log"
+          rehearsal_report="$RUNNER_TEMP/pdi-p3d-wp7-rehearsal.xml"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            HOME=/root \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            PYTHONPATH="$GITHUB_WORKSPACE/src:$GITHUB_WORKSPACE" \
+            PDI_TEST_DATABASE_URL="$PDI_TEST_DATABASE_URL" \
+            PDI_P3D_WP7_DISPOSABLE=1 \
+            PDI_P3D_WP7_BUNDLE="$bundle" \
+            PDI_P3D_WP7_DIGESTS="$digests" \
+            PDI_P3D_WP7_REHEARSAL_ROOT="$rehearsal_root" \
+            PDI_P3D_WP7_SYSTEM_PYTHON="$system_python" \
+            PDI_P3D_WP7_CANDIDATE_SHA="$EXPECTED_CANDIDATE_SHA" \
+            "$python_executable" -m pytest -q -s \
+              --junitxml="$rehearsal_report" \
+              tests/integration/test_p3d_disposable_rehearsal.py \
+              2>&1 | tee "$rehearsal_log"
+          python - "$rehearsal_report" <<'PY'
+          import sys
+          from xml.etree import ElementTree
+
+          root = ElementTree.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          totals = {
+              name: sum(int(suite.attrib.get(name, "0")) for suite in suites)
+              for name in ("tests", "failures", "errors", "skipped")
+          }
+          assert totals == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}, totals
+          PY
+          grep -Fx 'P3D_DISPOSABLE_REHEARSAL=PASS' "$rehearsal_log"
+          grep -Fx 'SYSTEMD_MANAGER_REAL=PASS' "$rehearsal_log"
+          grep -Fx 'SYSTEMD_MANAGER_ISOLATED=PASS' "$rehearsal_log"
+          grep -Fx 'P3D_SERVICE_START_COUNT=6' "$rehearsal_log"
+          grep -Fx 'P3D_TIMER_ENABLE_COUNT=0' "$rehearsal_log"
+          grep -Fx 'POSTGRESQL_MAJOR=16' "$rehearsal_log"
+          grep -Fx 'RUNTIME_PIPELINE_COVERAGE=6/6' "$rehearsal_log"
+          grep -Fx 'POST_REHEARSAL_RUNTIME_LEDGER_PROOF=PASS' "$rehearsal_log"
+          grep -Fx 'TIMERS_FINAL_STATE=DISABLED_INACTIVE' "$rehearsal_log"
+          grep -Fx 'PRODUCTION_TOUCHED=NO' "$rehearsal_log"
+          rm -f -- "$rehearsal_log" "$rehearsal_report"
+
   host-safe:
     name: Host safe
     runs-on: ubuntu-latest

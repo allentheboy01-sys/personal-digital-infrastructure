@@ -1,0 +1,715 @@
+from __future__ import annotations
+
+from base64 import b64encode
+from contextlib import contextmanager
+from hashlib import sha256
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
+import json
+import os
+from pathlib import Path
+import pwd
+import grp
+import shutil
+import signal
+import stat
+import subprocess
+import threading
+import time
+from uuid import UUID, uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
+
+from alembic import command
+from alembic.config import Config
+import pytest
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+
+from pdi.database import create_postgres_engine
+from pdi.production_ops.contracts import QUALIFICATION, parse_env
+from pdi.production_ops.cutover import Host as FrozenP3CHost, Paths as FrozenP3CPaths
+from pdi.production_ops.p3d_disposable_rehearsal import (
+    CANONICAL_PIPELINES,
+    SERVICE_UNITS,
+    machine_name_for,
+)
+from pdi.production_ops.enrichment_cutover import P3D_TIMER_UNITS
+from pdi.production_ops.p3d_preparation_contracts import (
+    OperatorToolIdentity,
+    ToolName,
+)
+from pdi.production_ops.p3d_release_bootstrap import (
+    BootstrapInputs,
+    BootstrapPolicy,
+    QualificationHostRuntimeAuthorityProvider,
+    ReleaseBootstrap,
+    resolve_runtime_identity,
+)
+from pdi.provider_identity import PostgreSQLProviderIdentityRepository
+from pdi.scope_sync_state import PostgreSQLScopeSyncStateRepository
+from tests.integration.database_guard import require_safe_test_database_url
+from tests.integration.test_p3d_inert_asset_install import (
+    _clean,
+    _create_complete_gate_a,
+    _write,
+)
+
+
+ROOT = Path(__file__).resolve().parents[2]
+H1 = "1" * 64
+SOURCE = "b" * 40
+IMMICH_ACCOUNT_ID = "33333333-3333-4333-8333-333333333333"
+PRINCIPAL_ID = "44444444-4444-4444-8444-444444444444"
+SYSTEMD_NSPAWN = Path("/usr/bin/systemd-nspawn")
+MACHINECTL = Path("/usr/bin/machinectl")
+
+
+def _environment() -> tuple[Path, Path, Path, Path, str]:
+    names = (
+        "PDI_P3D_WP7_BUNDLE",
+        "PDI_P3D_WP7_DIGESTS",
+        "PDI_P3D_WP7_REHEARSAL_ROOT",
+        "PDI_P3D_WP7_SYSTEM_PYTHON",
+        "PDI_P3D_WP7_CANDIDATE_SHA",
+    )
+    if any(not os.environ.get(name) for name in names):
+        pytest.skip("dedicated WP7 disposable real-systemd qualification only")
+    return (
+        Path(os.environ[names[0]]),
+        Path(os.environ[names[1]]),
+        Path(os.environ[names[2]]),
+        Path(os.environ[names[3]]),
+        os.environ[names[4]],
+    )
+
+
+def _docx(content: str) -> bytes:
+    output = BytesIO()
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/'
+        'wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>'
+        f"{content}"
+        "</w:t></w:r></w:p></w:body></w:document>"
+    ).encode()
+    with ZipFile(output, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document)
+    return output.getvalue()
+
+
+class _ProviderFixtureHandler(BaseHTTPRequestHandler):
+    text_content = b"Synthetic scoped Nextcloud text\n"
+    document_content = _docx("Synthetic scoped Nextcloud document")
+    nextcloud_authorization = "Basic " + b64encode(
+        b"synthetic:synthetic-nextcloud-password"
+    ).decode()
+    immich_key = "synthetic-immich-api-key"
+    calls: list[str] = []
+
+    def log_message(self, format, *args):  # noqa: A002 - stdlib override
+        return
+
+    def _send(self, status: int, payload: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_PROPFIND(self):  # noqa: N802 - HTTP handler API
+        if self.headers.get("Authorization") != self.nextcloud_authorization:
+            self._send(401, b"", "text/plain")
+            return
+        self.calls.append("nextcloud-propfind")
+        payload = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+            '<d:response><d:href>/remote.php/dav/files/synthetic/</d:href>'
+            '<d:propstat><d:prop><oc:id>synthetic-root</oc:id>'
+            '<oc:fileid>synthetic-root</oc:fileid>'
+            '<d:resourcetype><d:collection/></d:resourcetype>'
+            '</d:prop></d:propstat></d:response></d:multistatus>'
+        ).encode()
+        self._send(207, payload, "application/xml")
+
+    def do_GET(self):  # noqa: N802 - HTTP handler API
+        if self.path.startswith("/content/"):
+            if self.headers.get("Authorization") != self.nextcloud_authorization:
+                self._send(401, b"", "text/plain")
+                return
+            self.calls.append("nextcloud-content")
+            payload = (
+                self.text_content
+                if self.path == "/content/notes.md"
+                else self.document_content
+            )
+            self._send(200, payload, "application/octet-stream")
+            return
+        if self.headers.get("x-api-key") != self.immich_key:
+            self._send(401, b"{}", "application/json")
+            return
+        if self.path == "/api/users/me":
+            self.calls.append("immich-account")
+            self._send(
+                200,
+                json.dumps({"id": IMMICH_ACCOUNT_ID}).encode(),
+                "application/json",
+            )
+            return
+        if self.path == f"/api/assets/{IMMICH_ACCOUNT_ID}/ocr":
+            self.calls.append("immich-ocr")
+            self._send(
+                200,
+                json.dumps([{"text": "Synthetic OCR evidence"}]).encode(),
+                "application/json",
+            )
+            return
+        self._send(404, b"{}", "application/json")
+
+
+@contextmanager
+def _provider_fixture():
+    _ProviderFixtureHandler.calls = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ProviderFixtureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], _ProviderFixtureHandler
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _seed_database(url: str):
+    engine = create_postgres_engine(url)
+    with engine.connect() as connection:
+        config = Config(str(ROOT / "alembic.ini"))
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
+    _clean(engine)
+    identities = PostgreSQLProviderIdentityRepository(engine)
+    scopes = {}
+    for provider, enabled in (
+        ("nextcloud", True),
+        ("immich", True),
+        ("gmail", False),
+        ("integration-test", False),
+    ):
+        instance = identities.create_instance(
+            provider_type=provider,
+            instance_key=f"wp7-{provider}",
+            enabled=enabled,
+        )
+        account = None
+        if enabled:
+            account = identities.create_account(
+                provider_instance_id=instance.id,
+                account_key=f"wp7-{provider}",
+                provider_native_id=(
+                    IMMICH_ACCOUNT_ID if provider == "immich" else "synthetic-nextcloud"
+                ),
+                enabled=True,
+            )
+        scopes[provider] = identities.create_scope(
+            provider_instance_id=instance.id,
+            provider_account_id=None if account is None else account.id,
+            scope_key=f"wp7-{provider}",
+            enabled=enabled,
+        )
+
+    text_content = _ProviderFixtureHandler.text_content
+    document_content = _ProviderFixtureHandler.document_content
+    resources = (
+        (
+            "nextcloud", scopes["nextcloud"].id, "nextcloud-text",
+            text_content, "text/markdown", "notes.md", "/content/notes.md",
+            {"href": "/content/notes.md", "getlastmodified": "Sat, 26 Sep 2026 01:00:00 GMT"},
+        ),
+        (
+            "nextcloud", scopes["nextcloud"].id, "nextcloud-document",
+            document_content,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "document.docx", "/content/document.docx",
+            {"href": "/content/document.docx", "getlastmodified": "Sat, 26 Sep 2026 01:00:00 GMT"},
+        ),
+        (
+            "immich", scopes["immich"].id, IMMICH_ACCOUNT_ID,
+            b"synthetic-image", "image/jpeg", "image.jpg", None,
+            {
+                "fileModifiedAt": "2026-09-26T01:00:00Z",
+                "exif": {
+                    "dateTimeOriginal": "2026-09-26T01:00:00Z",
+                    "latitude": 1.25,
+                    "longitude": 103.8,
+                    "country": "Synthetic Country",
+                    "state": "Synthetic State",
+                    "city": "Synthetic City",
+                    "make": "Synthetic Camera",
+                    "model": "Synthetic Model",
+                },
+            },
+        ),
+        (
+            "gmail", scopes["gmail"].id, "synthetic-gmail-preserved",
+            b"g", "message/rfc822", "message.eml", None, {},
+        ),
+        (
+            "integration-test", scopes["integration-test"].id,
+            "synthetic-integration-quarantine", b"i", "application/octet-stream",
+            "quarantine.bin", None, {},
+        ),
+    )
+    with engine.begin() as connection:
+        for provider, scope_id, external_id, content, mime, name, href, metadata in resources:
+            asset_id, blob_id, source_id = uuid4(), uuid4(), uuid4()
+            connection.execute(text(
+                "INSERT INTO assets(id,resource_type,title,metadata,created_at,updated_at) "
+                "VALUES (:id,'file',:title,'{}'::jsonb,now(),now())"
+            ), {"id": asset_id, "title": f"Synthetic {provider}"})
+            connection.execute(text(
+                "INSERT INTO blobs(id,asset_id,hash,size,mime_type) "
+                "VALUES (:id,:asset,:hash,:size,:mime)"
+            ), {
+                "id": blob_id,
+                "asset": asset_id,
+                "hash": sha256(content).hexdigest(),
+                "size": len(content),
+                "mime": mime,
+            })
+            connection.execute(text(
+                "INSERT INTO asset_sources("
+                "id,blob_id,provider,external_id,observation_scope_id,path,name,"
+                "version_tag,provider_mime_type,provider_size,metadata,is_active) "
+                "VALUES (:id,:blob,:provider,:external,:scope,:path,:name,'synthetic-v1',"
+                ":mime,:size,CAST(:metadata AS jsonb),true)"
+            ), {
+                "id": source_id,
+                "blob": blob_id,
+                "provider": provider,
+                "external": external_id,
+                "scope": scope_id,
+                "path": name,
+                "name": name,
+                "mime": mime,
+                "size": len(content),
+                "metadata": json.dumps(metadata),
+            })
+    sync = PostgreSQLScopeSyncStateRepository(engine)
+    for provider, mechanism in (
+        ("nextcloud", "activity_v2_hint_v1"),
+        ("immich", "metadata_updated_at_v1"),
+    ):
+        row = sync.get_or_create(scopes[provider].id, mechanism)
+        assert sync.compare_and_swap_checkpoint(
+            scopes[provider].id,
+            mechanism,
+            expected_version=row.version,
+            checkpoint=f"synthetic-{provider}",
+        ) is not None
+    return engine, scopes
+
+
+def _clean_rehearsal_database(engine) -> None:
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM resource_statements"))
+        connection.execute(text("DELETE FROM resource_enrichments"))
+    _clean(engine)
+
+
+def _tree_snapshot(paths: tuple[Path, ...]) -> str:
+    facts = []
+    for root in paths:
+        if not root.exists() and not root.is_symlink():
+            facts.append((str(root), "absent"))
+            continue
+        members = (root, *sorted(root.rglob("*"))) if root.is_dir() else (root,)
+        for path in members:
+            info = path.lstat()
+            relative = str(path)
+            if stat.S_ISREG(info.st_mode):
+                facts.append((relative, "file", stat.S_IMODE(info.st_mode), sha256(path.read_bytes()).hexdigest()))
+            elif stat.S_ISLNK(info.st_mode):
+                facts.append((relative, "symlink", os.readlink(path)))
+            elif stat.S_ISDIR(info.st_mode):
+                facts.append((relative, "directory", stat.S_IMODE(info.st_mode)))
+    return sha256(json.dumps(facts, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _host_systemd_snapshot() -> str:
+    facts = []
+    units = tuple(SERVICE_UNITS.values()) + tuple(
+        P3D_TIMER_UNITS[key] for key in CANONICAL_PIPELINES
+    )
+    for unit in units:
+        result = subprocess.run(
+            (
+                "/usr/bin/systemctl", "--no-pager", "show", unit,
+                "--property=LoadState", "--property=ActiveState",
+                "--property=SubState", "--property=UnitFileState",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            shell=False,
+        )
+        facts.append((unit, result.returncode, result.stdout))
+    return sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()
+
+
+def _prepare_rootfs(root: Path, runtime_uid: int, runtime_gid: int) -> None:
+    for relative, mode in (
+        ("usr", 0o755), ("etc", 0o755), ("etc/systemd", 0o755),
+        ("etc/systemd/system", 0o755), ("opt", 0o755), ("opt/pdi", 0o755),
+        ("var", 0o755), ("var/lib", 0o755), ("var/lib/pdi-p3d", 0o700),
+        ("run", 0o755), ("run/lock", 0o755), ("tmp", 0o1777), ("root", 0o700),
+    ):
+        path = root / relative
+        path.mkdir(parents=True, exist_ok=True)
+        os.chown(path, 0, 0)
+        os.chmod(path, mode)
+    for name, target in (
+        ("bin", "usr/bin"), ("sbin", "usr/sbin"),
+        ("lib", "usr/lib"), ("lib64", "usr/lib64"),
+    ):
+        path = root / name
+        if not path.exists() and not path.is_symlink():
+            path.symlink_to(target)
+    (root / "etc/os-release").symlink_to("../usr/lib/os-release")
+    _write(
+        root / "etc/passwd",
+        "root:x:0:0:root:/root:/bin/bash\n"
+        f"pdi:x:{runtime_uid}:{runtime_gid}:pdi:/nonexistent:/usr/sbin/nologin\n"
+        "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
+        0o644, 0, 0,
+    )
+    _write(
+        root / "etc/group",
+        "root:x:0:\n"
+        f"pdi:x:{runtime_gid}:\n"
+        "nogroup:x:65534:\n",
+        0o644, 0, 0,
+    )
+    _write(root / "etc/nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n", 0o644, 0, 0)
+    _write(root / "etc/hosts", "127.0.0.1 localhost\n::1 localhost\n", 0o644, 0, 0)
+    _write(root / "etc/machine-id", "", 0o644, 0, 0)
+    default_target = root / "etc/systemd/system/default.target"
+    default_target.symlink_to("/usr/lib/systemd/system/basic.target")
+
+
+def _tool(candidate: str) -> OperatorToolIdentity:
+    source = Path(__import__(
+        "pdi.production_ops.p3d_release_bootstrap", fromlist=["__file__"]
+    ).__file__)
+    return OperatorToolIdentity.from_mapping({
+        "TOOL_NAME": ToolName.RELEASE_BOOTSTRAP.value,
+        "TOOL_VERSION": "1.0.0",
+        "TOOL_ARTIFACT_SHA256": sha256(source.read_bytes()).hexdigest(),
+        "TOOL_SOURCE_SHA": candidate,
+    })
+
+
+def _wait_for_machine(machine: str, timeout: float = 30) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            (str(MACHINECTL), "show", machine, "--property=Leader", "--value"),
+            capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        if result.returncode == 0 and result.stdout.strip().isdigit():
+            return int(result.stdout.strip())
+        time.sleep(0.25)
+    raise AssertionError("DISPOSABLE_SYSTEMD_MANAGER_NOT_READY")
+
+
+def _terminate_machine(machine: str, process: subprocess.Popen) -> bool:
+    subprocess.run(
+        (str(MACHINECTL), "terminate", machine),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, timeout=30,
+    )
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.send_signal(signal.SIGRTMIN + 3)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
+    return process.poll() is not None
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="WP7 requires disposable root authority")
+def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
+    bundle, digest_path, root, system_python, candidate = _environment()
+    assert os.environ.get("PDI_P3D_WP7_DISPOSABLE") == "1"
+    assert root != Path("/") and str(root).startswith("/tmp/pdi-p3d-rehearsal-")
+    assert SYSTEMD_NSPAWN.is_file() and MACHINECTL.is_file()
+    assert bundle.is_file() and digest_path.is_file() and system_python.is_file()
+    assert not root.exists()
+    root.mkdir(mode=0o755)
+    os.chown(root, 0, 0)
+    os.chmod(root, 0o755)
+    account = pwd.getpwnam("pdi")
+    group = grp.getgrnam("pdi")
+    assert account.pw_uid > 0 and group.gr_gid > 0 and account.pw_gid == group.gr_gid
+    _prepare_rootfs(root, account.pw_uid, group.gr_gid)
+    digests = json.loads(digest_path.read_text(encoding="utf-8"))
+    assert digests["CANDIDATE_SHA"] == candidate
+    assert len(candidate) == 40
+    url = require_safe_test_database_url()
+    assert (make_url(url).database or "").startswith("pdi_wp7_")
+    host_paths = (
+        Path("/opt/pdi"), Path("/etc/pdi"), Path("/var/lib/pdi-p3d"),
+        Path("/etc/systemd/system/pdi-scoped-pipeline@.service"),
+    )
+    host_before = _tree_snapshot(host_paths)
+    host_systemd_before = _host_systemd_snapshot()
+    engine = None
+    machine_process = None
+    machine = ""
+    complete_fingerprint = None
+    manager_cleaned = False
+    db_cleaned = False
+    filesystem_cleaned = False
+    try:
+        with _provider_fixture() as (provider_port, fixture):
+            engine, scopes = _seed_database(url)
+            releases_root = root / "opt/pdi/releases"
+            preparation_root = root / "var/lib/pdi-p3d/preparation"
+            bootstrap_lock = root / "run/lock/pdi/p3d-release-bootstrap.lock"
+            current = root / "opt/pdi/current"
+            bootstrap = ReleaseBootstrap(
+                inputs=BootstrapInputs(
+                    bundle.absolute(), candidate, digests["BUNDLE_SHA256"],
+                    digests["OS_RUNTIME_MANIFEST_SHA256"], "QUALIFICATION_ONLY",
+                    _tool(candidate), releases_root, preparation_root,
+                    bootstrap_lock, current, "pdi", "pdi",
+                ),
+                policy=BootstrapPolicy.qualification(
+                    disposable_root=root, owner_uid=0, owner_gid=0,
+                    runtime_uid=account.pw_uid, runtime_gid=group.gr_gid,
+                ),
+                host_runtime_provider=QualificationHostRuntimeAuthorityProvider(
+                    system_python, digests["OS_RUNTIME_MANIFEST_SHA256"],
+                ),
+            ).run()
+            assert bootstrap.final_state.phase == "COMPLETE"
+            release = releases_root / candidate
+
+            gate_a_operation = str(uuid4())
+            rollback_metadata, _ = _create_complete_gate_a(
+                preparation_root,
+                operation_id=gate_a_operation,
+                candidate=candidate,
+                source=SOURCE,
+            )
+            current.symlink_to(f"/opt/pdi/releases/{SOURCE}")
+
+            p3c_state_root = root / "var/lib/pdi-p3c"
+            frozen_host = FrozenP3CHost(
+                FrozenP3CPaths(
+                    staging=root / "p3c-unused/staging",
+                    env=root / "p3c-unused/pdi.env",
+                    recovery=root / "p3c-unused/recovery",
+                    config=root / "p3c-unused/config",
+                    units=root / "p3c-unused/units",
+                    current=root / "p3c-unused/current",
+                    releases=root / "p3c-unused/releases",
+                    state=p3c_state_root,
+                    control=root / "p3c-unused/control.lock",
+                    sync=root / "p3c-unused/sync.lock",
+                ),
+                root / "p3c-unused/release", SOURCE,
+                "synthetic-host", H1, SOURCE,
+            )
+            frozen_host.save({
+                "phase": "PASS",
+                "sha": SOURCE,
+                "old_target": "/opt/pdi/releases/" + "c" * 40,
+                "context": rollback_metadata.p3c_context_fingerprint,
+                "baseline": {"synthetic": "private-baseline-evidence"},
+                "qualified": list(QUALIFICATION),
+                "verified": {"synthetic": "private-verified-evidence"},
+            })
+
+            endpoint = f"http://127.0.0.1:{provider_port}"
+            environment = root / "etc/pdi/pdi.env"
+            _write(
+                environment,
+                f'DATABASE__URL="{url}"\n'
+                f'NEXTCLOUD__URL="{endpoint}"\n'
+                'NEXTCLOUD__USER="synthetic"\n'
+                'NEXTCLOUD__PASSWORD="synthetic-nextcloud-password"\n'
+                f'IMMICH__URL="{endpoint}"\n'
+                'IMMICH__API_KEY="synthetic-immich-api-key"\n',
+                0o600, 0, 0,
+            )
+            registry = root / "etc/pdi/scoped/registry.toml"
+            _write(
+                registry,
+                '[[principals]]\n'
+                f'id = "{PRINCIPAL_ID}"\n'
+                'database_ref = "wp7-personal-db"\n'
+                'enabled = true\n\n'
+                '[[databases]]\nref = "wp7-personal-db"\n'
+                'url_env = "DATABASE__URL"\n\n'
+                '[[provider_bindings]]\n'
+                f'principal_id = "{PRINCIPAL_ID}"\n'
+                f'scope_id = "{scopes["nextcloud"].id}"\n'
+                'provider_type = "nextcloud"\n'
+                f'endpoint = "{endpoint}"\n'
+                'secret_env = "NEXTCLOUD__PASSWORD"\n'
+                'username = "synthetic"\n\n'
+                '[[provider_bindings]]\n'
+                f'principal_id = "{PRINCIPAL_ID}"\n'
+                f'scope_id = "{scopes["immich"].id}"\n'
+                'provider_type = "immich"\n'
+                f'endpoint = "{endpoint}"\n'
+                'secret_env = "IMMICH__API_KEY"\n',
+                0o640, 0, group.gr_gid,
+            )
+            profiles = root / "etc/pdi/scoped/units"
+            profiles.mkdir(mode=0o700)
+            os.chown(profiles, 0, 0)
+            os.chmod(profiles, 0o700)
+
+            gate_c = subprocess.run(
+                (
+                    str(release / ".venv/bin/python"),
+                    str(release / "scripts/pdi_p3d_inert_asset_install.py"),
+                    "--mode", "QUALIFICATION",
+                    "--expected-candidate-sha", candidate,
+                    "--gate-a-operation-id", gate_a_operation,
+                    "--gate-b-operation-id", bootstrap.operation_id,
+                    "--expected-systemd-asset-fingerprint",
+                    digests["SYSTEMD_ASSET_FINGERPRINT"],
+                    "--qualification-root", str(root),
+                    "--qualification-runtime-user", "pdi",
+                    "--qualification-runtime-group", "pdi",
+                ),
+                cwd=release,
+                env={
+                    "PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                    "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+                },
+                capture_output=True, text=True, timeout=300, shell=False,
+            )
+            assert gate_c.returncode == 0, "GATE_C_FAILED"
+            gate_c_result = json.loads(gate_c.stdout)
+            assert gate_c_result["PHASE"] == "COMPLETE"
+            for key in CANONICAL_PIPELINES:
+                profile = profiles / f"{key}.env"
+                info = profile.lstat()
+                assert info.st_uid == 0 and info.st_gid == 0
+                assert stat.S_IMODE(info.st_mode) == 0o600
+                values = parse_env(profile.read_text(encoding="utf-8"))
+                expected_keys = {
+                    "PDI_PRINCIPAL_REF", "PDI_SCOPED_PIPELINE_KEY",
+                    "DATABASE__URL",
+                }
+                if key.startswith("enrichment.nextcloud_"):
+                    expected_keys.add("NEXTCLOUD__PASSWORD")
+                elif key == "enrichment.immich_ocr":
+                    expected_keys.add("IMMICH__API_KEY")
+                assert set(values) == expected_keys
+
+            rehearsal_operation = str(uuid4())
+            machine = machine_name_for(rehearsal_operation)
+            command = (
+                str(SYSTEMD_NSPAWN), "--quiet", "--boot", "--register=yes",
+                f"--machine={machine}", f"--directory={root}",
+                "--bind-ro=/usr:/usr",
+                f"--bind-ro={system_python.parent.parent}:{system_python.parent.parent}",
+                "--console=pipe", "--link-journal=no", "--settings=no",
+                "--resolv-conf=off", "--timezone=off", "--unit=basic.target",
+            )
+            machine_process = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+            leader = _wait_for_machine(machine)
+            lock = Path(f"/proc/{leader}/root/run/lock/pdi-sync.lock")
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.touch(exist_ok=False)
+            os.chown(lock, account.pw_uid, group.gr_gid)
+            os.chmod(lock, 0o600)
+
+            wp7 = subprocess.run(
+                (
+                    str(release / ".venv/bin/python"),
+                    str(release / "scripts/pdi_p3d_disposable_rehearsal.py"),
+                    "run",
+                    "--expected-candidate-sha", candidate,
+                    "--gate-a-operation-id", gate_a_operation,
+                    "--gate-b-operation-id", bootstrap.operation_id,
+                    "--gate-c-operation-id", gate_c_result["OPERATION_ID"],
+                    "--rehearsal-operation-id", rehearsal_operation,
+                    "--rehearsal-root", str(root),
+                ),
+                cwd=release,
+                env={
+                    "PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                    "PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1",
+                },
+                capture_output=True, text=True, timeout=1800, shell=False,
+            )
+            assert wp7.returncode == 0, wp7.stdout
+            assert wp7.stderr == ""
+            result = json.loads(wp7.stdout)
+            assert result["P3D_DISPOSABLE_REHEARSAL"] == "PASS"
+            assert result["P3D_SERVICE_START_COUNT"] == 6
+            assert result["P3D_TIMER_ENABLE_COUNT"] == 0
+            assert result["P3D_TIMER_START_COUNT"] == 0
+            assert result["POSTGRESQL_MAJOR"] == 16
+            assert result["RUNTIME_PIPELINE_COVERAGE"] == "6/6"
+            assert result["POST_REHEARSAL_RUNTIME_LEDGER_PROOF"] == "PASS"
+            assert result["TIMERS_FINAL_STATE"] == "DISABLED_INACTIVE"
+            complete_fingerprint = result["REHEARSAL_COMPLETE_MARKER_FINGERPRINT"]
+            assert len(complete_fingerprint) == 64
+            assert fixture.calls.count("nextcloud-propfind") >= 2
+            assert fixture.calls.count("nextcloud-content") >= 2
+            assert fixture.calls.count("immich-account") >= 1
+            assert fixture.calls.count("immich-ocr") >= 1
+            assert os.readlink(current) == f"/opt/pdi/releases/{candidate}"
+            with engine.connect() as connection:
+                assert connection.scalar(text("SELECT count(*) FROM pipeline_runs")) == 6
+                assert connection.scalar(text(
+                    "SELECT count(*) FROM pipeline_runs WHERE status='completed' "
+                    "AND finished_at IS NOT NULL AND error_code IS NULL"
+                )) == 6
+                assert connection.scalar(text(
+                    "SELECT count(DISTINCT pipeline_key) FROM pipeline_runs"
+                )) == 6
+    finally:
+        if machine_process is not None:
+            manager_cleaned = _terminate_machine(machine, machine_process)
+        if engine is not None:
+            _clean_rehearsal_database(engine)
+            with engine.connect() as connection:
+                db_cleaned = connection.scalar(text("SELECT count(*) FROM pipeline_runs")) == 0
+            engine.dispose()
+        if root.exists():
+            shutil.rmtree(root)
+        filesystem_cleaned = not root.exists()
+
+    assert complete_fingerprint is not None
+    assert manager_cleaned
+    assert db_cleaned
+    assert filesystem_cleaned
+    assert _tree_snapshot(host_paths) == host_before
+    assert _host_systemd_snapshot() == host_systemd_before
+    print("P3D_DISPOSABLE_REHEARSAL=PASS")
+    print("SYSTEMD_MANAGER_REAL=PASS")
+    print("SYSTEMD_MANAGER_ISOLATED=PASS")
+    print("P3D_SERVICE_START_COUNT=6")
+    print("P3D_TIMER_ENABLE_COUNT=0")
+    print("POSTGRESQL_MAJOR=16")
+    print("RUNTIME_PIPELINE_COVERAGE=6/6")
+    print("POST_REHEARSAL_RUNTIME_LEDGER_PROOF=PASS")
+    print("TIMERS_FINAL_STATE=DISABLED_INACTIVE")
+    print(f"REHEARSAL_COMPLETE_MARKER_FINGERPRINT={complete_fingerprint}")
+    print("PRODUCTION_TOUCHED=NO")
