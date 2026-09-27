@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime
+import hashlib
 import os
 from pathlib import Path
 import stat
@@ -26,7 +27,9 @@ from pdi.production_ops.p3d_disposable_rehearsal import (
     machine_name_for,
 )
 from pdi.production_ops.p3d_pre_rehearsal_evidence import (
+    PreRehearsalEvidenceError,
     PreRehearsalEvidenceResult,
+    verify_candidate_evidence_runtime,
 )
 
 
@@ -58,6 +61,65 @@ def _policy(root: Path, inputs: RehearsalInputs) -> RehearsalPolicy:
         65534,
         machine_name_for(inputs.rehearsal_operation_id),
     )
+
+
+def _runtime_layout(tmp_path: Path):
+    inputs = _inputs()
+    root = tmp_path / "root"
+    root.mkdir()
+    policy = _policy(root, inputs)
+    release = policy.releases / CANDIDATE
+    source_root = release / "src/pdi/production_ops"
+    installed_root = (
+        release / ".venv/lib/python3.13/site-packages/pdi/production_ops"
+    )
+    scripts = release / "scripts"
+    python = release / ".venv/bin/python"
+    for directory in (source_root, installed_root, scripts, python.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+    wp7_bytes = b"exact wp7 module\n"
+    wp6_bytes = b"exact frozen wp6 module\n"
+    wp7_source = source_root / "p3d_disposable_rehearsal.py"
+    wp7_installed = installed_root / "p3d_disposable_rehearsal.py"
+    wp6_source = source_root / "p3d_pre_rehearsal_evidence.py"
+    wp6_installed = installed_root / "p3d_pre_rehearsal_evidence.py"
+    wp7_script = scripts / "pdi_p3d_disposable_rehearsal.py"
+    wp6_script = scripts / "mu13_p3d_cutover.py"
+    for path, payload in (
+        (wp7_source, wp7_bytes),
+        (wp7_installed, wp7_bytes),
+        (wp6_source, wp6_bytes),
+        (wp6_installed, wp6_bytes),
+        (wp7_script, b"wp7 script\n"),
+        (wp6_script, b"wp6 script\n"),
+        (python, b"python\n"),
+    ):
+        path.write_bytes(payload)
+        path.chmod(0o644)
+    return SimpleNamespace(
+        inputs=inputs,
+        policy=policy,
+        preparation_policy=policy.preparation_policy,
+        release=release,
+        python=python,
+        wp7_source=wp7_source,
+        wp7_installed=wp7_installed,
+        wp6_source=wp6_source,
+        wp6_installed=wp6_installed,
+        wp7_script=wp7_script,
+        wp6_script=wp6_script,
+    )
+
+
+def _git_runner(candidate: str = CANDIDATE, *, dirty: bool = False):
+    def runner(argv, **kwargs):
+        assert kwargs["env"] == module.GIT_READ_ONLY_ENV
+        assert kwargs["shell"] is False
+        if argv[-2:] == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(argv, 0, candidate + "\n", "")
+        return subprocess.CompletedProcess(argv, 0, "dirty\n" if dirty else "", "")
+
+    return runner
 
 
 def _protected_files(policy: RehearsalPolicy) -> None:
@@ -288,6 +350,145 @@ def test_policy_rejects_host_root() -> None:
             runtime_uid=65534, runtime_gid=65534,
             operation_id=str(uuid4()),
         )
+
+
+def test_embedded_preparation_runtime_binds_exact_wp7_and_installed_wp6(
+    tmp_path: Path,
+) -> None:
+    layout = _runtime_layout(tmp_path)
+    result = module.verify_embedded_preparation_runtime(
+        layout.preparation_policy,
+        CANDIDATE,
+        rehearsal_policy=layout.policy,
+        rehearsal_candidate_sha=CANDIDATE,
+        executable=layout.python,
+        module_file=layout.wp7_installed,
+        script_file=layout.wp7_script,
+        preparation_module_file=layout.wp6_installed,
+        runner=_git_runner(),
+    )
+    assert result == hashlib.sha256(layout.wp6_installed.read_bytes()).hexdigest()
+
+
+def test_frozen_wp6_standalone_runtime_still_rejects_wp7_script(
+    tmp_path: Path,
+) -> None:
+    layout = _runtime_layout(tmp_path)
+    with pytest.raises(PreRehearsalEvidenceError, match="RUNTIME_INVALID"):
+        verify_candidate_evidence_runtime(
+            layout.preparation_policy,
+            CANDIDATE,
+            executable=layout.python,
+            module_file=layout.wp6_installed,
+            script_file=layout.wp7_script,
+            runner=_git_runner(),
+        )
+
+
+def test_embedded_preparation_runtime_rejects_cross_root_and_wrong_candidate(
+    tmp_path: Path,
+) -> None:
+    layout = _runtime_layout(tmp_path)
+    other_root = tmp_path / "other-root"
+    other_root.mkdir()
+    other_policy = _policy(other_root, layout.inputs)
+    for preparation_policy, candidate in (
+        (other_policy.preparation_policy, CANDIDATE),
+        (layout.preparation_policy, "c" * 40),
+    ):
+        with pytest.raises(DisposableRehearsalError, match="PREPARATION_INVALID"):
+            module.verify_embedded_preparation_runtime(
+                preparation_policy,
+                candidate,
+                rehearsal_policy=layout.policy,
+                rehearsal_candidate_sha=CANDIDATE,
+                executable=layout.python,
+                module_file=layout.wp7_installed,
+                script_file=layout.wp7_script,
+                preparation_module_file=layout.wp6_installed,
+                runner=_git_runner(),
+            )
+
+
+def test_embedded_preparation_runtime_rejects_stale_or_external_wp6_module(
+    tmp_path: Path,
+) -> None:
+    layout = _runtime_layout(tmp_path)
+    stale = layout.wp6_installed.read_bytes()
+    layout.wp6_installed.write_bytes(stale + b"stale\n")
+    with pytest.raises(DisposableRehearsalError, match="PREPARATION_INVALID"):
+        module.verify_embedded_preparation_runtime(
+            layout.preparation_policy,
+            CANDIDATE,
+            rehearsal_policy=layout.policy,
+            rehearsal_candidate_sha=CANDIDATE,
+            executable=layout.python,
+            module_file=layout.wp7_installed,
+            script_file=layout.wp7_script,
+            preparation_module_file=layout.wp6_installed,
+            runner=_git_runner(),
+        )
+
+    layout.wp6_installed.write_bytes(stale)
+    external = tmp_path / "p3d_pre_rehearsal_evidence.py"
+    external.write_bytes(stale)
+    with pytest.raises(DisposableRehearsalError, match="PREPARATION_INVALID"):
+        module.verify_embedded_preparation_runtime(
+            layout.preparation_policy,
+            CANDIDATE,
+            rehearsal_policy=layout.policy,
+            rehearsal_candidate_sha=CANDIDATE,
+            executable=layout.python,
+            module_file=layout.wp7_installed,
+            script_file=layout.wp7_script,
+            preparation_module_file=external,
+            runner=_git_runner(),
+        )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ("stale-wp7", "workspace-script", "wrong-head", "dirty", "wrong-python"),
+)
+def test_embedded_preparation_runtime_rejects_inexact_wp7_runtime(
+    tmp_path: Path, change: str,
+) -> None:
+    layout = _runtime_layout(tmp_path)
+    executable = layout.python
+    module_file = layout.wp7_installed
+    script_file = layout.wp7_script
+    runner = _git_runner()
+    if change == "stale-wp7":
+        module_file.write_bytes(b"stale wp7 module\n")
+    elif change == "workspace-script":
+        script_file = Path(__file__).parents[1] / "scripts/pdi_p3d_disposable_rehearsal.py"
+    elif change == "wrong-head":
+        runner = _git_runner("d" * 40)
+    elif change == "dirty":
+        runner = _git_runner(dirty=True)
+    else:
+        executable = tmp_path / "python"
+    with pytest.raises(DisposableRehearsalError, match="RUNTIME_INVALID"):
+        module.verify_embedded_preparation_runtime(
+            layout.preparation_policy,
+            CANDIDATE,
+            rehearsal_policy=layout.policy,
+            rehearsal_candidate_sha=CANDIDATE,
+            executable=executable,
+            module_file=module_file,
+            script_file=script_file,
+            preparation_module_file=layout.wp6_installed,
+            runner=runner,
+        )
+
+
+def test_wp7_cli_explicitly_uses_embedded_preparation_runtime_boundary() -> None:
+    source = (
+        Path(__file__).parents[1] / "scripts/pdi_p3d_disposable_rehearsal.py"
+    ).read_text(encoding="utf-8")
+    assert "runtime_verifier=(" in source
+    assert "verify_embedded_preparation_runtime(" in source
+    assert "P3D_REHEARSAL_PREPARATION_INVALID" in source
 
 
 def test_systemd_backend_always_targets_machine_and_only_starts_service() -> None:

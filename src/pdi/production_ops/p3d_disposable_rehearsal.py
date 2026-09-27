@@ -27,6 +27,7 @@ from uuid import UUID
 from sqlalchemy import Engine, text
 from sqlalchemy.engine import make_url
 
+import pdi.production_ops.p3d_pre_rehearsal_evidence as p3d_pre_rehearsal_evidence
 from pdi.database import create_postgres_engine
 from pdi.production_ops.contracts import parse_env
 from pdi.production_ops.enrichment_cutover import P3D_TIMER_UNITS
@@ -846,6 +847,74 @@ def verify_rehearsal_runtime(
         return _sha256(resolved_module.read_bytes())
     except (OSError, subprocess.TimeoutExpired):
         _fail("P3D_REHEARSAL_RUNTIME_INVALID")
+
+
+def verify_embedded_preparation_runtime(
+    preparation_policy: InertAssetPolicy,
+    candidate_sha: str,
+    *,
+    rehearsal_policy: RehearsalPolicy,
+    rehearsal_candidate_sha: str,
+    executable: Path | None = None,
+    module_file: Path | None = None,
+    script_file: Path | None = None,
+    preparation_module_file: Path | None = None,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> str:
+    """Bind an embedded frozen-WP6 read to the exact WP7 operator runtime."""
+
+    candidate = _git_sha(candidate_sha)
+    expected_candidate = _git_sha(rehearsal_candidate_sha)
+    if (
+        candidate != expected_candidate
+        or preparation_policy.root != rehearsal_policy.root
+        or preparation_policy.candidate_releases_root != rehearsal_policy.releases
+    ):
+        _fail("P3D_REHEARSAL_PREPARATION_INVALID")
+
+    verify_rehearsal_runtime(
+        rehearsal_policy,
+        candidate,
+        executable=executable,
+        module_file=module_file,
+        script_file=script_file,
+        runner=runner,
+    )
+
+    release = rehearsal_policy.releases / candidate
+    expected_source = (
+        release / "src/pdi/production_ops/p3d_pre_rehearsal_evidence.py"
+    )
+    imported = Path(
+        p3d_pre_rehearsal_evidence.__file__
+        if preparation_module_file is None
+        else preparation_module_file
+    ).absolute()
+    try:
+        imported_info = imported.lstat()
+        source_info = expected_source.lstat()
+        installed_root = (release / ".venv").resolve(strict=True)
+        resolved_imported = imported.resolve(strict=True)
+        resolved_source = expected_source.resolve(strict=True)
+        if (
+            stat.S_ISLNK(imported_info.st_mode)
+            or not stat.S_ISREG(imported_info.st_mode)
+            or imported_info.st_uid != rehearsal_policy.owner_uid
+            or imported_info.st_gid != rehearsal_policy.owner_gid
+            or imported_info.st_mode & 0o022
+            or stat.S_ISLNK(source_info.st_mode)
+            or not stat.S_ISREG(source_info.st_mode)
+            or source_info.st_uid != rehearsal_policy.owner_uid
+            or source_info.st_gid != rehearsal_policy.owner_gid
+            or source_info.st_mode & 0o022
+            or installed_root not in resolved_imported.parents
+            or resolved_source != expected_source
+            or resolved_imported.read_bytes() != resolved_source.read_bytes()
+        ):
+            raise OSError
+        return _sha256(resolved_imported.read_bytes())
+    except OSError:
+        _fail("P3D_REHEARSAL_PREPARATION_INVALID")
 
 
 def verify_candidate_release(

@@ -16,6 +16,7 @@ from pdi.production_ops.p3d_disposable_rehearsal import (
     RehearsalInputs,
     RehearsalPolicy,
     rootfs_pdi_identity,
+    verify_embedded_preparation_runtime,
     verify_rehearsal_runtime,
 )
 from pdi.production_ops.p3d_inert_asset_install import (
@@ -24,6 +25,7 @@ from pdi.production_ops.p3d_inert_asset_install import (
 )
 from pdi.production_ops.p3d_pre_rehearsal_evidence import (
     PreparationEvidenceInputs,
+    PreRehearsalEvidenceError,
     collect_pre_rehearsal_evidence,
 )
 from pdi.production_ops.p3d_preparation_contracts import contract_fingerprint
@@ -91,11 +93,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         ))
 
         def collect_preparation():
-            return collect_pre_rehearsal_evidence(
-                policy=policy.preparation_policy,
-                inputs=preparation_inputs,
-                systemd=preparation_systemd,
-            )
+            try:
+                return collect_pre_rehearsal_evidence(
+                    policy=policy.preparation_policy,
+                    inputs=preparation_inputs,
+                    systemd=preparation_systemd,
+                    runtime_verifier=(
+                        lambda preparation_policy, candidate_sha:
+                        verify_embedded_preparation_runtime(
+                            preparation_policy,
+                            candidate_sha,
+                            rehearsal_policy=policy,
+                            rehearsal_candidate_sha=inputs.candidate_sha,
+                            script_file=Path(__file__),
+                        )
+                    ),
+                )
+            except PreRehearsalEvidenceError:
+                raise DisposableRehearsalError(
+                    "P3D_REHEARSAL_PREPARATION_INVALID"
+                ) from None
 
         result = DisposableRehearsal(
             inputs=inputs,
