@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
+import json
 import os
 from pathlib import Path
 import stat
@@ -152,6 +153,9 @@ class FakeSystemd:
         self.timer_start_count = 0
         self.started: list[str] = []
         self.events: list[object] = []
+        self.last_start_pipeline_key = None
+        self.last_start_unit = None
+        self.last_start_return_code = None
 
     def manager_identity(self, policy):
         self.events.append("manager")
@@ -172,6 +176,20 @@ class FakeSystemd:
         self.service_start_count += 1
         self.started.append(key)
         self.events.append(("start", key))
+        self.last_start_pipeline_key = key
+        self.last_start_unit = f"pdi-scoped-pipeline@{key}.service"
+        self.last_start_return_code = 0
+
+    def show_service_failure_state(self, key):
+        assert key in CANONICAL_PIPELINES
+        return {
+            "LoadState": "loaded",
+            "ActiveState": "failed",
+            "SubState": "failed",
+            "Result": "exit-code",
+            "ExecMainStatus": "1",
+            "ExecMainCode": "1",
+        }
 
     def stop_all_services(self):
         self.events.append("cleanup")
@@ -524,6 +542,103 @@ def test_systemd_backend_always_targets_machine_and_only_starts_service() -> Non
     assert not any(command[-1].endswith(".timer") and "start" in command for command in commands)
     with pytest.raises(DisposableRehearsalError, match="PIPELINE_SET_INVALID"):
         backend.start_service("provider.arbitrary.sync")
+
+
+def test_systemd_backend_retains_only_fixed_service_start_result() -> None:
+    commands = []
+
+    def runner(argv, **kwargs):
+        commands.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 17, "", "sensitive ignored")
+
+    backend = MachineSystemdBackend(
+        "pdi-p3d-1234567812344234", runner=runner,
+    )
+    key = CANONICAL_PIPELINES[0]
+    with pytest.raises(DisposableRehearsalError, match="SERVICE_FAILED"):
+        backend.start_service(key)
+    assert backend.last_start_pipeline_key == key
+    assert backend.last_start_unit == f"pdi-scoped-pipeline@{key}.service"
+    assert backend.last_start_return_code == 17
+    assert commands == [(
+        "/usr/bin/systemctl", "--machine=pdi-p3d-1234567812344234",
+        "--no-pager", "start", f"pdi-scoped-pipeline@{key}.service",
+    )]
+
+
+def test_service_failure_state_queries_only_allowlisted_properties() -> None:
+    values = {
+        "LoadState": "loaded",
+        "ActiveState": "failed",
+        "SubState": "failed",
+        "Result": "exit-code",
+        "ExecMainStatus": "1",
+        "ExecMainCode": "1",
+    }
+    commands = []
+
+    def runner(argv, **kwargs):
+        commands.append(tuple(argv))
+        return subprocess.CompletedProcess(
+            argv, 0, "".join(f"{key}={value}\n" for key, value in values.items()), "",
+        )
+
+    backend = MachineSystemdBackend(
+        "pdi-p3d-1234567812344234", runner=runner,
+    )
+    assert backend.show_service_failure_state(CANONICAL_PIPELINES[0]) == values
+    command = commands[0]
+    assert command[:4] == (
+        "/usr/bin/systemctl", "--machine=pdi-p3d-1234567812344234",
+        "--no-pager", "show",
+    )
+    assert command[4] == (
+        "pdi-scoped-pipeline@enrichment.nextcloud_text.service"
+    )
+    assert set(command[5:]) == {
+        "--property=LoadState", "--property=ActiveState",
+        "--property=SubState", "--property=Result",
+        "--property=ExecMainStatus", "--property=ExecMainCode",
+    }
+    assert not any(
+        marker in " ".join(command)
+        for marker in ("Environment", "ExecStart", "Password", "Token")
+    )
+
+
+def test_service_failure_journal_retains_fixed_start_result(tmp_path: Path) -> None:
+    subject, policy, backend, _, _ = _subject(tmp_path)
+    key = CANONICAL_PIPELINES[0]
+
+    def fail_start(actual_key):
+        assert actual_key == key
+        backend.service_start_count += 1
+        backend.last_start_pipeline_key = actual_key
+        backend.last_start_unit = f"pdi-scoped-pipeline@{actual_key}.service"
+        backend.last_start_return_code = 1
+        raise DisposableRehearsalError("P3D_REHEARSAL_SERVICE_FAILED")
+
+    backend.start_service = fail_start
+    with pytest.raises(DisposableRehearsalError, match="SERVICE_FAILED"):
+        subject.run()
+    journals = sorted((
+        policy.rehearsal_authority_root
+        / subject.inputs.rehearsal_operation_id
+    ).glob("journal-*.json"))
+    failed = json.loads(journals[-1].read_text(encoding="utf-8"))
+    assert failed["event"] == "FAILED"
+    assert failed["evidence"] == {
+        "failure_code": "P3D_REHEARSAL_SERVICE_FAILED",
+        "last_start_pipeline_key": key,
+        "last_start_return_code": 1,
+        "last_start_unit": f"pdi-scoped-pipeline@{key}.service",
+        "service_active_state": "failed",
+        "service_exec_main_code": "1",
+        "service_exec_main_status": "1",
+        "service_load_state": "loaded",
+        "service_result": "exit-code",
+        "service_sub_state": "failed",
+    }
 
 
 def test_manager_identity_requires_real_isolated_pid1(tmp_path: Path) -> None:

@@ -290,6 +290,31 @@ class MachineSystemdBackend:
         "WorkingDirectory", "ExecStart", "FragmentPath", "DropInPaths",
         "ActiveState", "SubState", "Result", "ExecMainStatus",
     )
+    _FAILURE_SHOW_PROPERTIES = (
+        "LoadState", "ActiveState", "SubState", "Result",
+        "ExecMainStatus", "ExecMainCode",
+    )
+    _FAILURE_PROPERTY_VALUES = {
+        "LoadState": {
+            "loaded", "not-found", "bad-setting", "error", "masked",
+            "stub", "merged",
+        },
+        "ActiveState": {
+            "active", "reloading", "inactive", "failed", "activating",
+            "deactivating", "maintenance",
+        },
+        "SubState": {
+            "dead", "condition", "start-pre", "start", "start-post",
+            "running", "exited", "reload", "stop", "stop-watchdog",
+            "stop-sigterm", "stop-sigkill", "stop-post", "final-sigterm",
+            "final-sigkill", "failed", "auto-restart", "cleaning",
+        },
+        "Result": {
+            "success", "resources", "timeout", "exit-code", "signal",
+            "core-dump", "watchdog", "start-limit-hit", "protocol",
+            "oom-kill", "exec-condition", "skipped",
+        },
+    }
 
     def __init__(
         self,
@@ -307,6 +332,9 @@ class MachineSystemdBackend:
         self.timer_enable_count = 0
         self.timer_start_count = 0
         self.commands: list[tuple[str, ...]] = []
+        self.last_start_pipeline_key: str | None = None
+        self.last_start_unit: str | None = None
+        self.last_start_return_code: int | None = None
 
     def _systemctl(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         command = (
@@ -479,10 +507,55 @@ class MachineSystemdBackend:
     def start_service(self, pipeline_key: str) -> None:
         if pipeline_key not in SERVICE_UNITS:
             _fail("P3D_REHEARSAL_PIPELINE_SET_INVALID")
-        result = self._systemctl("start", SERVICE_UNITS[pipeline_key])
+        unit = SERVICE_UNITS[pipeline_key]
+        result = self._systemctl("start", unit)
         self.service_start_count += 1
+        self.last_start_pipeline_key = pipeline_key
+        self.last_start_unit = unit
+        self.last_start_return_code = result.returncode
         if result.returncode != 0:
             _fail("P3D_REHEARSAL_SERVICE_FAILED")
+
+    def show_service_failure_state(self, pipeline_key: str) -> dict[str, str]:
+        """Read only fixed, non-secret status properties for one service."""
+
+        try:
+            unit = SERVICE_UNITS[pipeline_key]
+        except KeyError:
+            _fail("P3D_REHEARSAL_PIPELINE_SET_INVALID")
+        arguments = ["show", unit]
+        arguments.extend(
+            f"--property={name}" for name in self._FAILURE_SHOW_PROPERTIES
+        )
+        result = self._systemctl(*arguments)
+        if result.returncode != 0:
+            _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
+        values: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            name, separator, value = line.partition("=")
+            if separator:
+                values[name] = value
+        self.validate_service_failure_state(values)
+        return values
+
+    @classmethod
+    def validate_service_failure_state(cls, values: Mapping[str, object]) -> None:
+        """Fail closed unless every diagnostic value is a fixed safe enum."""
+
+        if set(values) != set(cls._FAILURE_SHOW_PROPERTIES):
+            _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
+        if any(
+            values[name] not in accepted
+            for name, accepted in cls._FAILURE_PROPERTY_VALUES.items()
+        ):
+            _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
+        for name in ("ExecMainStatus", "ExecMainCode"):
+            try:
+                value = int(values[name])
+            except (TypeError, ValueError):
+                _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
+            if not 0 <= value <= 255 or str(value) != values[name]:
+                _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
 
     def stop_all_services(self) -> bool:
         success = True
@@ -1198,7 +1271,45 @@ class DisposableRehearsal:
             )
         except DisposableRehearsalError as error:
             try:
-                journal.append("FAILED", {"failure_code": error.code})
+                evidence: dict[str, object] = {"failure_code": error.code}
+                last_key = getattr(self.systemd, "last_start_pipeline_key", None)
+                last_unit = getattr(self.systemd, "last_start_unit", None)
+                last_return_code = getattr(
+                    self.systemd, "last_start_return_code", None,
+                )
+                if (
+                    last_key in SERVICE_UNITS
+                    and last_unit == SERVICE_UNITS[last_key]
+                    and isinstance(last_return_code, int)
+                    and not isinstance(last_return_code, bool)
+                    and 0 <= last_return_code <= 255
+                ):
+                    evidence.update({
+                        "last_start_pipeline_key": last_key,
+                        "last_start_unit": last_unit,
+                        "last_start_return_code": last_return_code,
+                    })
+                    if error.code == "P3D_REHEARSAL_SERVICE_FAILED":
+                        try:
+                            service_state = self.systemd.show_service_failure_state(
+                                last_key
+                            )
+                        except DisposableRehearsalError:
+                            service_state = None
+                        if service_state is not None:
+                            evidence.update({
+                                "service_load_state": service_state["LoadState"],
+                                "service_active_state": service_state["ActiveState"],
+                                "service_sub_state": service_state["SubState"],
+                                "service_result": service_state["Result"],
+                                "service_exec_main_status": service_state[
+                                    "ExecMainStatus"
+                                ],
+                                "service_exec_main_code": service_state[
+                                    "ExecMainCode"
+                                ],
+                            })
+                journal.append("FAILED", evidence)
             except Exception:
                 pass
             raise

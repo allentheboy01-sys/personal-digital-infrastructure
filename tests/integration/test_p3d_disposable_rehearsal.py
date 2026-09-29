@@ -32,6 +32,8 @@ from pdi.production_ops.contracts import QUALIFICATION, parse_env
 from pdi.production_ops.cutover import Host as FrozenP3CHost, Paths as FrozenP3CPaths
 from pdi.production_ops.p3d_disposable_rehearsal import (
     CANONICAL_PIPELINES,
+    DisposableRehearsalError,
+    MachineSystemdBackend,
     SERVICE_UNITS,
     machine_name_for,
 )
@@ -124,6 +126,103 @@ class _ManagerStartupError(AssertionError):
     def __init__(self, diagnostic: _ManagerStartupDiagnostic) -> None:
         self.diagnostic = diagnostic
         super().__init__(diagnostic.safe_message())
+
+
+@dataclass(frozen=True)
+class _RehearsalFailureJournalDiagnostic:
+    last_event: str
+    verified_pipelines: tuple[str, ...]
+    failed_pipeline_key: str
+    failed_service_unit: str
+    systemctl_start_return_code: int
+    service_state: dict[str, str]
+
+
+@dataclass(frozen=True)
+class _PipelineRunFailureDiagnostic:
+    total: int
+    completed: int
+    failed: int
+    failed_pipeline_present: bool
+    failed_pipeline_status: str | None
+    failed_pipeline_finished: bool | None
+    failed_pipeline_error_code: str | None
+
+
+@dataclass(frozen=True)
+class _ServiceFailureDiagnostic:
+    journal: _RehearsalFailureJournalDiagnostic
+    service_state: dict[str, str]
+    pipeline_runs: _PipelineRunFailureDiagnostic
+    provider_counts: dict[str, int]
+    classification: str
+
+    def safe_message(self) -> str:
+        run = self.pipeline_runs
+        values: tuple[tuple[str, str], ...] = (
+            ("WP7_LAST_REHEARSAL_EVENT", self.journal.last_event),
+            ("WP7_VERIFIED_PIPELINE_COUNT", str(len(self.journal.verified_pipelines))),
+            (
+                "PIPELINES_VERIFIED_BEFORE_FAILURE",
+                ",".join(self.journal.verified_pipelines) or "NONE",
+            ),
+            ("FAILED_PIPELINE_KEY", self.journal.failed_pipeline_key),
+            ("FAILED_SERVICE_UNIT", self.journal.failed_service_unit),
+            (
+                "SYSTEMCTL_START_RETURN_CODE",
+                str(self.journal.systemctl_start_return_code),
+            ),
+            ("FAILED_SERVICE_LOAD_STATE", self.service_state["LoadState"]),
+            ("FAILED_SERVICE_ACTIVE_STATE", self.service_state["ActiveState"]),
+            ("FAILED_SERVICE_SUB_STATE", self.service_state["SubState"]),
+            ("FAILED_SERVICE_RESULT", self.service_state["Result"]),
+            (
+                "FAILED_SERVICE_EXEC_MAIN_STATUS",
+                self.service_state["ExecMainStatus"],
+            ),
+            ("FAILED_SERVICE_EXEC_MAIN_CODE", self.service_state["ExecMainCode"]),
+            ("FRESH_PIPELINE_RUN_COUNT", str(run.total)),
+            ("FRESH_COMPLETED_PIPELINE_RUN_COUNT", str(run.completed)),
+            ("FRESH_FAILED_PIPELINE_RUN_COUNT", str(run.failed)),
+            (
+                "FAILED_PIPELINE_RUN_PRESENT",
+                "YES" if run.failed_pipeline_present else "NO",
+            ),
+            (
+                "FAILED_PIPELINE_RUN_STATUS",
+                run.failed_pipeline_status or "NONE",
+            ),
+            (
+                "FAILED_PIPELINE_RUN_FINISHED",
+                (
+                    "YES" if run.failed_pipeline_finished
+                    else "NO" if run.failed_pipeline_finished is False
+                    else "NONE"
+                ),
+            ),
+            (
+                "FAILED_PIPELINE_RUN_ERROR_CODE",
+                run.failed_pipeline_error_code or "NONE",
+            ),
+            (
+                "NEXTCLOUD_PROPFIND_CALL_COUNT",
+                str(self.provider_counts["nextcloud-propfind"]),
+            ),
+            (
+                "NEXTCLOUD_CONTENT_CALL_COUNT",
+                str(self.provider_counts["nextcloud-content"]),
+            ),
+            (
+                "IMMICH_ACCOUNT_CALL_COUNT",
+                str(self.provider_counts["immich-account"]),
+            ),
+            (
+                "IMMICH_OCR_CALL_COUNT",
+                str(self.provider_counts["immich-ocr"]),
+            ),
+            ("SERVICE_FAILURE_CLASS", self.classification),
+        )
+        return "\n".join(f"{name}={value}" for name, value in values)
 
 
 def _environment() -> tuple[Path, Path, Path, Path, str]:
@@ -241,6 +340,223 @@ def _provider_fixture():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def _read_failure_journal(
+    root: Path,
+    operation_id: str,
+    *,
+    owner_uid: int = 0,
+    owner_gid: int = 0,
+) -> _RehearsalFailureJournalDiagnostic:
+    authority = root / "var/lib/pdi-p3d/rehearsal" / operation_id
+    try:
+        root_info = authority.lstat()
+        if (
+            stat.S_ISLNK(root_info.st_mode)
+            or not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_uid != owner_uid
+            or root_info.st_gid != owner_gid
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+        ):
+            raise ValueError
+        files = sorted(authority.glob("journal-*.json"))
+        if not files or set(authority.iterdir()) != set(files):
+            raise ValueError
+        events: list[tuple[str, dict[str, object]]] = []
+        for expected_sequence, path in enumerate(files, start=1):
+            if path.name != f"journal-{expected_sequence:06d}.json":
+                raise ValueError
+            info = path.lstat()
+            if (
+                stat.S_ISLNK(info.st_mode)
+                or not stat.S_ISREG(info.st_mode)
+                or info.st_uid != owner_uid
+                or info.st_gid != owner_gid
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise ValueError
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                set(value) != {
+                    "version", "sequence", "rehearsal_operation_id",
+                    "event", "timestamp", "evidence",
+                }
+                or value["version"] != 1
+                or value["sequence"] != expected_sequence
+                or value["rehearsal_operation_id"] != operation_id
+                or not isinstance(value["event"], str)
+                or not isinstance(value["evidence"], dict)
+            ):
+                raise ValueError
+            events.append((value["event"], value["evidence"]))
+
+        required_prefix = (
+            "NEW", "PREPARATION_VERIFIED", "SYSTEMD_MANAGER_VERIFIED",
+            "CANDIDATE_PROMOTED", "SYSTEMD_RELOADED", "SERVICES_VERIFIED",
+        )
+        names = tuple(event for event, _ in events)
+        if (
+            len(events) < len(required_prefix) + 1
+            or names[:len(required_prefix)] != required_prefix
+            or names[-1] != "FAILED"
+            or any(
+                name != "PIPELINE_VERIFIED"
+                for name in names[len(required_prefix):-1]
+            )
+        ):
+            raise ValueError
+        verified = tuple(
+            str(evidence.get("pipeline_key"))
+            for name, evidence in events
+            if name == "PIPELINE_VERIFIED"
+        )
+        if (
+            len(verified) >= len(CANONICAL_PIPELINES)
+            or verified != CANONICAL_PIPELINES[:len(verified)]
+        ):
+            raise ValueError
+        failed_pipeline = CANONICAL_PIPELINES[len(verified)]
+        failed_unit = SERVICE_UNITS[failed_pipeline]
+        failed_evidence = events[-1][1]
+        start_return_code = failed_evidence.get("last_start_return_code")
+        if (
+            failed_evidence.get("failure_code") != "P3D_REHEARSAL_SERVICE_FAILED"
+            or failed_evidence.get("last_start_pipeline_key") != failed_pipeline
+            or failed_evidence.get("last_start_unit") != failed_unit
+            or not isinstance(start_return_code, int)
+            or isinstance(start_return_code, bool)
+            or not 0 <= start_return_code <= 255
+        ):
+            raise ValueError
+        service_state = {
+            "LoadState": failed_evidence.get("service_load_state"),
+            "ActiveState": failed_evidence.get("service_active_state"),
+            "SubState": failed_evidence.get("service_sub_state"),
+            "Result": failed_evidence.get("service_result"),
+            "ExecMainStatus": failed_evidence.get("service_exec_main_status"),
+            "ExecMainCode": failed_evidence.get("service_exec_main_code"),
+        }
+        MachineSystemdBackend.validate_service_failure_state(service_state)
+        return _RehearsalFailureJournalDiagnostic(
+            names[-2], verified, failed_pipeline, failed_unit, start_return_code,
+            service_state,
+        )
+    except (
+        OSError, ValueError, TypeError, json.JSONDecodeError,
+        DisposableRehearsalError,
+    ):
+        raise AssertionError("WP7_FAILURE_JOURNAL_DIAGNOSTIC_REJECTED") from None
+
+
+def _read_failed_service_state(
+    machine: str,
+    pipeline_key: str,
+    *,
+    runner=subprocess.run,
+) -> dict[str, str]:
+    backend = MachineSystemdBackend(machine, runner=runner)
+    return backend.show_service_failure_state(pipeline_key)
+
+
+def _read_pipeline_run_failure(
+    engine,
+    boundary,
+    failed_pipeline: str,
+) -> _PipelineRunFailureDiagnostic:
+    if failed_pipeline not in CANONICAL_PIPELINES:
+        raise AssertionError("WP7_PIPELINE_RUN_DIAGNOSTIC_REJECTED")
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT pipeline_key,status,finished_at IS NOT NULL,error_code "
+            "FROM pipeline_runs WHERE started_at > :after "
+            "ORDER BY started_at,id"
+        ), {"after": boundary}).all()
+    statuses = {"running", "completed", "failed"}
+    error_codes = {None, "execution_failed", "interrupted_previous_run"}
+    if any(
+        row[0] not in CANONICAL_PIPELINES
+        or row[1] not in statuses
+        or not isinstance(row[2], bool)
+        or row[3] not in error_codes
+        for row in rows
+    ):
+        raise AssertionError("WP7_PIPELINE_RUN_DIAGNOSTIC_REJECTED")
+    selected = [row for row in rows if row[0] == failed_pipeline]
+    if len(selected) > 1:
+        raise AssertionError("WP7_PIPELINE_RUN_DIAGNOSTIC_REJECTED")
+    row = selected[0] if selected else None
+    return _PipelineRunFailureDiagnostic(
+        len(rows),
+        sum(value[1] == "completed" for value in rows),
+        sum(value[1] == "failed" for value in rows),
+        row is not None,
+        None if row is None else row[1],
+        None if row is None else row[2],
+        None if row is None else row[3],
+    )
+
+
+def _provider_call_counts(calls: tuple[str, ...]) -> dict[str, int]:
+    allowed = (
+        "nextcloud-propfind", "nextcloud-content",
+        "immich-account", "immich-ocr",
+    )
+    if any(value not in allowed for value in calls):
+        raise AssertionError("WP7_PROVIDER_DIAGNOSTIC_REJECTED")
+    return {value: calls.count(value) for value in allowed}
+
+
+def _service_failure_class(
+    journal: _RehearsalFailureJournalDiagnostic,
+    service_state: dict[str, str],
+    pipeline_runs: _PipelineRunFailureDiagnostic,
+) -> str:
+    if journal.systemctl_start_return_code != 0:
+        return "SERVICE_START_COMMAND_FAILED"
+    if (
+        service_state["Result"] != "success"
+        or service_state["ExecMainStatus"] != "0"
+    ):
+        return "SERVICE_PROCESS_EXITED_NONZERO"
+    if (
+        pipeline_runs.failed_pipeline_present
+        and pipeline_runs.failed_pipeline_status == "failed"
+    ):
+        return "SERVICE_LEDGER_FAILED"
+    if (
+        pipeline_runs.failed_pipeline_present
+        and pipeline_runs.failed_pipeline_status == "completed"
+    ):
+        return "SERVICE_EFFECT_VALIDATION_FAILED"
+    if (
+        service_state["LoadState"] != "loaded"
+        or service_state["ActiveState"] not in {"inactive", "failed"}
+    ):
+        return "SERVICE_STATUS_INCONSISTENT"
+    return "UNCLASSIFIED_SERVICE_FAILURE"
+
+
+def _collect_service_failure_diagnostic(
+    *,
+    root: Path,
+    operation_id: str,
+    engine,
+    boundary,
+    provider_calls: tuple[str, ...],
+) -> _ServiceFailureDiagnostic:
+    journal = _read_failure_journal(root, operation_id)
+    pipeline_runs = _read_pipeline_run_failure(
+        engine, boundary, journal.failed_pipeline_key,
+    )
+    provider_counts = _provider_call_counts(provider_calls)
+    return _ServiceFailureDiagnostic(
+        journal,
+        journal.service_state,
+        pipeline_runs,
+        provider_counts,
+        _service_failure_class(journal, journal.service_state, pipeline_runs),
+    )
 
 
 def _seed_database(url: str):
@@ -1110,6 +1426,248 @@ def test_nspawn_diagnostic_stream_is_root_only(tmp_path: Path) -> None:
             stream.close()
 
 
+def _write_failure_journal_fixture(
+    root: Path,
+    operation_id: str,
+    verified: tuple[str, ...],
+) -> None:
+    authority = root / "var/lib/pdi-p3d/rehearsal" / operation_id
+    authority.mkdir(parents=True)
+    authority.chmod(0o700)
+    events: list[tuple[str, dict[str, object]]] = [
+        ("NEW", {"candidate_sha": "a" * 40}),
+        ("PREPARATION_VERIFIED", {}),
+        ("SYSTEMD_MANAGER_VERIFIED", {}),
+        ("CANDIDATE_PROMOTED", {}),
+        ("SYSTEMD_RELOADED", {}),
+        ("SERVICES_VERIFIED", {}),
+        *(("PIPELINE_VERIFIED", {"pipeline_key": key}) for key in verified),
+    ]
+    failed = CANONICAL_PIPELINES[len(verified)]
+    events.append(("FAILED", {
+        "failure_code": "P3D_REHEARSAL_SERVICE_FAILED",
+        "last_start_pipeline_key": failed,
+        "last_start_unit": SERVICE_UNITS[failed],
+        "last_start_return_code": 1,
+        "service_load_state": "loaded",
+        "service_active_state": "failed",
+        "service_sub_state": "failed",
+        "service_result": "exit-code",
+        "service_exec_main_status": "1",
+        "service_exec_main_code": "1",
+    }))
+    for sequence, (event, evidence) in enumerate(events, start=1):
+        path = authority / f"journal-{sequence:06d}.json"
+        path.write_text(json.dumps({
+            "version": 1,
+            "sequence": sequence,
+            "rehearsal_operation_id": operation_id,
+            "event": event,
+            "timestamp": "2026-09-29T00:00:00Z",
+            "evidence": evidence,
+        }), encoding="utf-8")
+        path.chmod(0o600)
+
+
+@pytest.mark.parametrize("verified_count", range(6))
+def test_failure_journal_derives_exact_next_canonical_pipeline(
+    tmp_path: Path,
+    verified_count: int,
+) -> None:
+    operation_id = str(uuid4())
+    verified = CANONICAL_PIPELINES[:verified_count]
+    _write_failure_journal_fixture(tmp_path, operation_id, verified)
+    result = _read_failure_journal(
+        tmp_path,
+        operation_id,
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+    assert result.verified_pipelines == verified
+    assert result.failed_pipeline_key == CANONICAL_PIPELINES[verified_count]
+    assert result.failed_service_unit == SERVICE_UNITS[result.failed_pipeline_key]
+    assert result.systemctl_start_return_code == 1
+    assert result.service_state == {
+        "LoadState": "loaded",
+        "ActiveState": "failed",
+        "SubState": "failed",
+        "Result": "exit-code",
+        "ExecMainStatus": "1",
+        "ExecMainCode": "1",
+    }
+    assert result.last_event == (
+        "SERVICES_VERIFIED" if verified_count == 0 else "PIPELINE_VERIFIED"
+    )
+
+
+def test_failure_journal_rejects_noncanonical_pipeline_sequence(
+    tmp_path: Path,
+) -> None:
+    operation_id = str(uuid4())
+    _write_failure_journal_fixture(
+        tmp_path, operation_id, (CANONICAL_PIPELINES[1],),
+    )
+    with pytest.raises(AssertionError, match="JOURNAL_DIAGNOSTIC_REJECTED"):
+        _read_failure_journal(
+            tmp_path,
+            operation_id,
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+
+
+def test_failed_service_query_uses_only_safe_property_allowlist() -> None:
+    values = {
+        "LoadState": "loaded",
+        "ActiveState": "failed",
+        "SubState": "failed",
+        "Result": "exit-code",
+        "ExecMainStatus": "1",
+        "ExecMainCode": "1",
+    }
+    commands = []
+
+    def runner(argv, **kwargs):
+        commands.append(tuple(argv))
+        return subprocess.CompletedProcess(
+            argv, 0, "".join(f"{key}={value}\n" for key, value in values.items()), "",
+        )
+
+    result = _read_failed_service_state(
+        "pdi-p3d-1234567812345678",
+        CANONICAL_PIPELINES[0],
+        runner=runner,
+    )
+    assert result == values
+    command = commands[0]
+    assert command[3:5] == (
+        "show", "pdi-scoped-pipeline@enrichment.nextcloud_text.service",
+    )
+    assert set(command[5:]) == {
+        "--property=LoadState", "--property=ActiveState",
+        "--property=SubState", "--property=Result",
+        "--property=ExecMainStatus", "--property=ExecMainCode",
+    }
+    assert all(
+        forbidden not in " ".join(command)
+        for forbidden in ("Environment", "EnvironmentFiles", "ExecStart")
+    )
+
+
+def test_failed_service_query_rejects_extra_or_freeform_properties() -> None:
+    output = (
+        "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+        "Result=exit-code\nExecMainStatus=1\nExecMainCode=1\n"
+        "Environment=PASSWORD=unsafe\n"
+    )
+    with pytest.raises(DisposableRehearsalError, match="DIAGNOSTIC_INVALID"):
+        _read_failed_service_state(
+            "pdi-p3d-1234567812345678",
+            CANONICAL_PIPELINES[0],
+            runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+                argv, 0, output, "",
+            ),
+        )
+
+
+class _FailureRows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def all(self):
+        return list(self.rows)
+
+
+class _FailureConnection:
+    def __init__(self, rows):
+        self.rows = rows
+        self.statements = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, statement, parameters):
+        self.statements.append((str(statement), parameters))
+        return _FailureRows(self.rows)
+
+
+class _FailureEngine:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def connect(self):
+        return self.connection
+
+
+def test_pipeline_run_failure_diagnostic_is_select_only_and_aggregate() -> None:
+    key = CANONICAL_PIPELINES[1]
+    connection = _FailureConnection((
+        (CANONICAL_PIPELINES[0], "completed", True, None),
+        (key, "failed", True, "execution_failed"),
+    ))
+    result = _read_pipeline_run_failure(
+        _FailureEngine(connection),
+        "synthetic-boundary",
+        key,
+    )
+    assert result == _PipelineRunFailureDiagnostic(
+        2, 1, 1, True, "failed", True, "execution_failed",
+    )
+    sql, parameters = connection.statements[0]
+    assert sql.lstrip().upper().startswith("SELECT ")
+    assert all(
+        keyword not in sql.upper()
+        for keyword in ("INSERT ", "UPDATE ", "DELETE ", "ALTER ", "DROP ")
+    )
+    assert parameters == {"after": "synthetic-boundary"}
+
+
+def test_pipeline_run_failure_diagnostic_reports_absent_failed_run() -> None:
+    connection = _FailureConnection(())
+    result = _read_pipeline_run_failure(
+        _FailureEngine(connection),
+        "synthetic-boundary",
+        CANONICAL_PIPELINES[0],
+    )
+    assert result == _PipelineRunFailureDiagnostic(
+        0, 0, 0, False, None, None, None,
+    )
+
+
+def test_provider_and_combined_failure_diagnostic_emit_counts_and_allowlists_only() -> None:
+    counts = _provider_call_counts((
+        "nextcloud-propfind", "nextcloud-content", "nextcloud-content",
+    ))
+    state = {
+        "LoadState": "loaded", "ActiveState": "failed",
+        "SubState": "failed", "Result": "exit-code",
+        "ExecMainStatus": "1", "ExecMainCode": "1",
+    }
+    journal = _RehearsalFailureJournalDiagnostic(
+        "SERVICES_VERIFIED", (), CANONICAL_PIPELINES[0],
+        SERVICE_UNITS[CANONICAL_PIPELINES[0]], 1, state,
+    )
+    runs = _PipelineRunFailureDiagnostic(0, 0, 0, False, None, None, None)
+    diagnostic = _ServiceFailureDiagnostic(
+        journal, state, runs, counts,
+        _service_failure_class(journal, state, runs),
+    ).safe_message()
+    assert "NEXTCLOUD_PROPFIND_CALL_COUNT=1" in diagnostic
+    assert "NEXTCLOUD_CONTENT_CALL_COUNT=2" in diagnostic
+    assert "IMMICH_ACCOUNT_CALL_COUNT=0" in diagnostic
+    assert "IMMICH_OCR_CALL_COUNT=0" in diagnostic
+    assert "SERVICE_FAILURE_CLASS=SERVICE_START_COMMAND_FAILED" in diagnostic
+    assert all(secret not in diagnostic for secret in (
+        "DATABASE__URL", "PASSWORD", "IMMICH__API_KEY",
+        "synthetic-nextcloud-password", "raw journal", "traceback",
+    ))
+    with pytest.raises(AssertionError, match="PROVIDER_DIAGNOSTIC_REJECTED"):
+        _provider_call_counts(("Authorization: secret",))
+
+
 def _terminate_machine(machine: str, process: subprocess.Popen) -> bool:
     subprocess.run(
         (str(MACHINECTL), "terminate", machine),
@@ -1337,6 +1895,11 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
             os.chown(lock, account.pw_uid, group.gr_gid)
             os.chmod(lock, 0o600)
 
+            with engine.connect() as connection:
+                rehearsal_boundary = connection.scalar(text(
+                    "SELECT clock_timestamp()"
+                ))
+
             wp7 = subprocess.run(
                 (
                     str(release / ".venv/bin/python"),
@@ -1356,6 +1919,27 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                 },
                 capture_output=True, text=True, timeout=1800, shell=False,
             )
+            if wp7.returncode != 0:
+                if (
+                    wp7.stderr != ""
+                    or wp7.stdout.splitlines() != [
+                        "P3D_DISPOSABLE_REHEARSAL=FAIL",
+                        "FAILURE_CODE=P3D_REHEARSAL_SERVICE_FAILED",
+                    ]
+                ):
+                    raise AssertionError("WP7_FAILURE_OUTPUT_INVALID")
+                diagnostic = _collect_service_failure_diagnostic(
+                    root=root,
+                    operation_id=rehearsal_operation,
+                    engine=engine,
+                    boundary=rehearsal_boundary,
+                    provider_calls=tuple(fixture.calls),
+                )
+                raise AssertionError(
+                    "P3D_DISPOSABLE_REHEARSAL=FAIL\n"
+                    "FAILURE_CODE=P3D_REHEARSAL_SERVICE_FAILED\n"
+                    + diagnostic.safe_message()
+                )
             assert wp7.returncode == 0, wp7.stdout
             assert wp7.stderr == ""
             result = json.loads(wp7.stdout)
