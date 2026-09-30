@@ -292,7 +292,7 @@ class MachineSystemdBackend:
     )
     _FAILURE_SHOW_PROPERTIES = (
         "LoadState", "ActiveState", "SubState", "Result",
-        "ExecMainStatus", "ExecMainCode",
+        "ExecMainStatus", "ExecMainCode", "StatusErrno",
     )
     _FAILURE_PROPERTY_VALUES = {
         "LoadState": {
@@ -549,12 +549,13 @@ class MachineSystemdBackend:
             for name, accepted in cls._FAILURE_PROPERTY_VALUES.items()
         ):
             _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
-        for name in ("ExecMainStatus", "ExecMainCode"):
+        for name in ("ExecMainStatus", "ExecMainCode", "StatusErrno"):
             try:
                 value = int(values[name])
             except (TypeError, ValueError):
                 _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
-            if not 0 <= value <= 255 or str(value) != values[name]:
+            upper_bound = 4095 if name == "StatusErrno" else 255
+            if not 0 <= value <= upper_bound or str(value) != values[name]:
                 _fail("P3D_REHEARSAL_SERVICE_DIAGNOSTIC_INVALID")
 
     def stop_all_services(self) -> bool:
@@ -1307,6 +1308,9 @@ class DisposableRehearsal:
                                 ],
                                 "service_exec_main_code": service_state[
                                     "ExecMainCode"
+                                ],
+                                "service_status_errno": service_state[
+                                    "StatusErrno"
                                 ],
                             })
                 journal.append("FAILED", evidence)

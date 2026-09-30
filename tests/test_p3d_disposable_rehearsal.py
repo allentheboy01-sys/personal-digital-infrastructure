@@ -189,6 +189,7 @@ class FakeSystemd:
             "Result": "exit-code",
             "ExecMainStatus": "1",
             "ExecMainCode": "1",
+            "StatusErrno": "0",
         }
 
     def stop_all_services(self):
@@ -574,6 +575,7 @@ def test_service_failure_state_queries_only_allowlisted_properties() -> None:
         "Result": "exit-code",
         "ExecMainStatus": "1",
         "ExecMainCode": "1",
+        "StatusErrno": "0",
     }
     commands = []
 
@@ -599,6 +601,7 @@ def test_service_failure_state_queries_only_allowlisted_properties() -> None:
         "--property=LoadState", "--property=ActiveState",
         "--property=SubState", "--property=Result",
         "--property=ExecMainStatus", "--property=ExecMainCode",
+        "--property=StatusErrno",
     }
     assert not any(
         marker in " ".join(command)
@@ -635,6 +638,7 @@ def test_service_failure_journal_retains_fixed_start_result(tmp_path: Path) -> N
         "service_active_state": "failed",
         "service_exec_main_code": "1",
         "service_exec_main_status": "1",
+        "service_status_errno": "0",
         "service_load_state": "loaded",
         "service_result": "exit-code",
         "service_sub_state": "failed",

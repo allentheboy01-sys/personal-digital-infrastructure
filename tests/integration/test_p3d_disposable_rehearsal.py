@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -12,6 +12,7 @@ from pathlib import Path
 import pwd
 import grp
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -66,6 +67,12 @@ IMMICH_ACCOUNT_ID = "33333333-3333-4333-8333-333333333333"
 PRINCIPAL_ID = "44444444-4444-4444-8444-444444444444"
 SYSTEMD_NSPAWN = Path("/usr/bin/systemd-nspawn")
 MACHINECTL = Path("/usr/bin/machinectl")
+NSENTER = Path("/usr/bin/nsenter")
+SETPRIV = Path("/usr/bin/setpriv")
+SYSTEMD_RUN = Path("/usr/bin/systemd-run")
+SYSTEMCTL = Path("/usr/bin/systemctl")
+READELF = Path("/usr/bin/readelf")
+LDD = Path("/usr/bin/ldd")
 _DIAGNOSTIC_LIMIT = 64 * 1024
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(DATABASE__URL|PASSWORD|API[_-]?KEY|ACCESS[_-]?TOKEN|"
@@ -77,6 +84,19 @@ _PROTECTED_SECRET_MARKERS = (
     "NEXTCLOUD__PASSWORD",
     "IMMICH__API_KEY",
 )
+_LIBRARY_BASENAME = re.compile(r"[A-Za-z0-9_.+-]+")
+_ELF_INTERPRETER = re.compile(
+    r"\[Requesting program interpreter: ([/A-Za-z0-9_.+-]+)\]"
+)
+_PATH_CLASSES = {"APPROVED_RUNTIME", "CANDIDATE_RELEASE", "OTHER", "ABSENT"}
+_INTERPRETER_FAILURE_CLASSES = {
+    "BASE_RUNTIME_NOT_EXECUTABLE_IN_CONTAINER",
+    "CANDIDATE_VENV_NOT_EXECUTABLE_IN_CONTAINER",
+    "SYSTEMD_SANDBOX_RUNTIME_FAILURE",
+    "DYNAMIC_LIBRARY_RESOLUTION_FAILURE",
+    "PHYSICAL_LOGICAL_RUNTIME_PATH_MISMATCH",
+    "INTERPRETER_FAILURE_UNCLASSIFIED",
+}
 
 
 @dataclass(frozen=True)
@@ -150,12 +170,157 @@ class _PipelineRunFailureDiagnostic:
 
 
 @dataclass(frozen=True)
+class _ElfDependencyDiagnostic:
+    dynamic: bool
+    interpreter_present: bool
+    missing_libraries: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _PyVenvAuthorityDiagnostic:
+    home_class: str
+    executable_class: str
+    tmp_reference: bool
+    run_reference: bool
+    rehearsal_root_reference: bool
+
+
+@dataclass(frozen=True)
+class _InterpreterFailureDiagnostic:
+    candidate_probe_rc: int
+    base_probe_rc: int
+    sandbox_probe_rc: int
+    candidate_elf: _ElfDependencyDiagnostic
+    base_elf: _ElfDependencyDiagnostic
+    pyvenv: _PyVenvAuthorityDiagnostic
+    physical_reference_count: int
+    logical_reference_count: int
+    classification: str
+
+    @classmethod
+    def unavailable(cls) -> "_InterpreterFailureDiagnostic":
+        empty_elf = _ElfDependencyDiagnostic(False, False, ())
+        empty_venv = _PyVenvAuthorityDiagnostic(
+            "ABSENT", "ABSENT", False, False, False,
+        )
+        return cls(
+            -1, -1, -1, empty_elf, empty_elf, empty_venv, 0, 0,
+            "INTERPRETER_FAILURE_UNCLASSIFIED",
+        )
+
+    def safe_values(self) -> tuple[tuple[str, str], ...]:
+        if (
+            self.classification not in _INTERPRETER_FAILURE_CLASSES
+            or self.pyvenv.home_class not in _PATH_CLASSES
+            or self.pyvenv.executable_class not in _PATH_CLASSES
+            or any(
+                not isinstance(value, bool)
+                for value in (
+                    self.candidate_elf.dynamic,
+                    self.candidate_elf.interpreter_present,
+                    self.base_elf.dynamic,
+                    self.base_elf.interpreter_present,
+                    self.pyvenv.tmp_reference,
+                    self.pyvenv.run_reference,
+                    self.pyvenv.rehearsal_root_reference,
+                )
+            )
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not -255 <= value <= 255
+                for value in (
+                    self.candidate_probe_rc,
+                    self.base_probe_rc,
+                    self.sandbox_probe_rc,
+                )
+            )
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+                for value in (
+                    self.physical_reference_count,
+                    self.logical_reference_count,
+                )
+            )
+            or any(
+                _LIBRARY_BASENAME.fullmatch(name) is None
+                for name in (
+                    *self.candidate_elf.missing_libraries,
+                    *self.base_elf.missing_libraries,
+                )
+            )
+            or self.candidate_elf.missing_libraries
+            != tuple(sorted(set(self.candidate_elf.missing_libraries)))
+            or self.base_elf.missing_libraries
+            != tuple(sorted(set(self.base_elf.missing_libraries)))
+        ):
+            raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED")
+        candidate_missing = self.candidate_elf.missing_libraries
+        base_missing = self.base_elf.missing_libraries
+        return (
+            ("CONTAINER_CANDIDATE_PYTHON_PROBE_RC", str(self.candidate_probe_rc)),
+            ("CONTAINER_BASE_PYTHON_PROBE_RC", str(self.base_probe_rc)),
+            (
+                "SYSTEMD_SANDBOX_CANDIDATE_PYTHON_PROBE_RC",
+                str(self.sandbox_probe_rc),
+            ),
+            (
+                "CANDIDATE_PYTHON_ELF_DYNAMIC",
+                "YES" if self.candidate_elf.dynamic else "NO",
+            ),
+            (
+                "CANDIDATE_PYTHON_INTERPRETER_PRESENT",
+                "YES" if self.candidate_elf.interpreter_present else "NO",
+            ),
+            (
+                "CANDIDATE_PYTHON_MISSING_LIBRARY_COUNT",
+                str(len(candidate_missing)),
+            ),
+            (
+                "CANDIDATE_PYTHON_MISSING_LIBRARIES",
+                ",".join(candidate_missing) or "NONE",
+            ),
+            ("BASE_PYTHON_MISSING_LIBRARY_COUNT", str(len(base_missing))),
+            (
+                "BASE_PYTHON_MISSING_LIBRARIES",
+                ",".join(base_missing) or "NONE",
+            ),
+            ("PYVENV_HOME_CLASS", self.pyvenv.home_class),
+            ("PYVENV_EXECUTABLE_CLASS", self.pyvenv.executable_class),
+            (
+                "PYVENV_TMP_REFERENCE",
+                "YES" if self.pyvenv.tmp_reference else "NO",
+            ),
+            (
+                "PYVENV_RUN_REFERENCE",
+                "YES" if self.pyvenv.run_reference else "NO",
+            ),
+            (
+                "PYVENV_REHEARSAL_ROOT_REFERENCE",
+                "YES" if self.pyvenv.rehearsal_root_reference else "NO",
+            ),
+            (
+                "CANDIDATE_RUNTIME_PHYSICAL_REHEARSAL_PATH_REFERENCE_COUNT",
+                str(self.physical_reference_count),
+            ),
+            (
+                "CANDIDATE_RUNTIME_LOGICAL_RELEASE_PATH_REFERENCE_COUNT",
+                str(self.logical_reference_count),
+            ),
+            ("INTERPRETER_FAILURE_CLASS", self.classification),
+        )
+
+
+@dataclass(frozen=True)
 class _ServiceFailureDiagnostic:
     journal: _RehearsalFailureJournalDiagnostic
     service_state: dict[str, str]
     pipeline_runs: _PipelineRunFailureDiagnostic
     provider_counts: dict[str, int]
     classification: str
+    interpreter: _InterpreterFailureDiagnostic | None = None
 
     def safe_message(self) -> str:
         run = self.pipeline_runs
@@ -181,6 +346,7 @@ class _ServiceFailureDiagnostic:
                 self.service_state["ExecMainStatus"],
             ),
             ("FAILED_SERVICE_EXEC_MAIN_CODE", self.service_state["ExecMainCode"]),
+            ("FAILED_SERVICE_STATUS_ERRNO", self.service_state["StatusErrno"]),
             ("FRESH_PIPELINE_RUN_COUNT", str(run.total)),
             ("FRESH_COMPLETED_PIPELINE_RUN_COUNT", str(run.completed)),
             ("FRESH_FAILED_PIPELINE_RUN_COUNT", str(run.failed)),
@@ -222,6 +388,8 @@ class _ServiceFailureDiagnostic:
             ),
             ("SERVICE_FAILURE_CLASS", self.classification),
         )
+        if self.interpreter is not None:
+            values += self.interpreter.safe_values()
         return "\n".join(f"{name}={value}" for name, value in values)
 
 
@@ -552,6 +720,7 @@ def _read_failure_journal(
             "Result": failed_evidence.get("service_result"),
             "ExecMainStatus": failed_evidence.get("service_exec_main_status"),
             "ExecMainCode": failed_evidence.get("service_exec_main_code"),
+            "StatusErrno": failed_evidence.get("service_status_errno"),
         }
         MachineSystemdBackend.validate_service_failure_state(service_state)
         return _RehearsalFailureJournalDiagnostic(
@@ -623,6 +792,457 @@ def _provider_call_counts(calls: tuple[str, ...]) -> dict[str, int]:
     return {value: calls.count(value) for value in allowed}
 
 
+def _safe_return_code(value: object) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not -255 <= value <= 255
+    ):
+        raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED")
+    return value
+
+
+def _namespace_command(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    command: tuple[str, ...],
+) -> tuple[str, ...]:
+    if (
+        not isinstance(leader, int)
+        or isinstance(leader, bool)
+        or leader <= 1
+        or runtime_uid <= 0
+        or runtime_gid <= 0
+        or not command
+        or any(not isinstance(item, str) or not item for item in command)
+    ):
+        raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED")
+    return (
+        str(NSENTER), "--target", str(leader), "--mount", "--root", "--wd",
+        "--", str(SETPRIV), f"--reuid={runtime_uid}",
+        f"--regid={runtime_gid}", "--clear-groups", "--no-new-privs", "--",
+        "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LC_ALL=C",
+        "PYTHONDONTWRITEBYTECODE=1", "PYTHONNOUSERSITE=1", *command,
+    )
+
+
+def _container_python_probe(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    python: Path,
+    *,
+    runner=subprocess.run,
+) -> int:
+    command = _namespace_command(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(python), "-c", "import sys; raise SystemExit(0)"),
+    )
+    try:
+        result = runner(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return -1
+    return _safe_return_code(result.returncode)
+
+
+def _systemd_sandbox_python_probe(
+    machine: str,
+    operation_id: str,
+    *,
+    runner=subprocess.run,
+) -> int:
+    try:
+        suffix = UUID(operation_id).hex[:16]
+    except (TypeError, ValueError, AttributeError):
+        raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED") from None
+    if re.fullmatch(r"pdi-p3d-[0-9a-f]{16}", machine) is None:
+        raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED")
+    unit = f"pdi-p3d-wp7-python-probe-{suffix}.service"
+    command = (
+        str(SYSTEMD_RUN), f"--machine={machine}", "--quiet", "--wait",
+        "--collect", f"--unit={unit}", "--uid=pdi", "--gid=pdi",
+        "--working-directory=/opt/pdi/current",
+        "--property=Type=oneshot",
+        "--property=NoNewPrivileges=yes",
+        "--property=PrivateTmp=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes",
+        "--property=ReadWritePaths=/run/lock",
+        "--setenv=PYTHONDONTWRITEBYTECODE=1",
+        "--setenv=PYTHONPATH=/opt/pdi/current/src",
+        "--", "/opt/pdi/current/.venv/bin/python", "-c",
+        "raise SystemExit(0)",
+    )
+    result_code = -1
+    try:
+        result = runner(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            shell=False,
+        )
+        result_code = _safe_return_code(result.returncode)
+    except (OSError, subprocess.TimeoutExpired):
+        result_code = -1
+    finally:
+        for action in ("stop", "reset-failed"):
+            try:
+                runner(
+                    (
+                        str(SYSTEMCTL), f"--machine={machine}", "--no-pager",
+                        action, unit,
+                    ),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                    shell=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        try:
+            cleaned = runner(
+                (
+                    str(SYSTEMCTL), f"--machine={machine}", "--no-pager",
+                    "show", unit, "--property=LoadState", "--value",
+                ),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                shell=False,
+            )
+            if cleaned.returncode != 0 or cleaned.stdout.strip() != "not-found":
+                result_code = -1
+        except (OSError, subprocess.TimeoutExpired, AttributeError):
+            result_code = -1
+    return result_code
+
+
+def _namespace_capture(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    command: tuple[str, ...],
+    *,
+    runner=subprocess.run,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = runner(
+            _namespace_command(leader, runtime_uid, runtime_gid, command),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED") from exc
+    if len(result.stdout) + len(result.stderr) > _DIAGNOSTIC_LIMIT:
+        raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED")
+    _safe_return_code(result.returncode)
+    return result
+
+
+def _parse_missing_libraries(payload: str) -> tuple[str, ...]:
+    if (
+        "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+        or _SECRET_ASSIGNMENT.search(payload)
+    ):
+        raise AssertionError("ELF_DIAGNOSTIC_REJECTED")
+    missing: set[str] = set()
+    for line in payload.splitlines():
+        if "not found" not in line:
+            continue
+        matched = re.fullmatch(
+            r"\s*([A-Za-z0-9_.+-]+)\s+=>\s+not found\s*",
+            line,
+        )
+        if matched is None:
+            raise AssertionError("ELF_DIAGNOSTIC_REJECTED")
+        name = matched.group(1)
+        if _LIBRARY_BASENAME.fullmatch(name) is None:
+            raise AssertionError("ELF_DIAGNOSTIC_REJECTED")
+        missing.add(name)
+    return tuple(sorted(missing))
+
+
+def _elf_dependency_diagnostic(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    binary: Path,
+    *,
+    runner=subprocess.run,
+) -> _ElfDependencyDiagnostic:
+    headers = _namespace_capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(READELF), "--program-headers", "--wide", str(binary)),
+        runner=runner,
+    )
+    if headers.returncode != 0:
+        raise AssertionError("ELF_DIAGNOSTIC_REJECTED")
+    interpreters = _ELF_INTERPRETER.findall(headers.stdout)
+    if len(interpreters) > 1:
+        raise AssertionError("ELF_DIAGNOSTIC_REJECTED")
+    dynamic = len(interpreters) == 1
+    interpreter_present = False
+    if dynamic:
+        interpreter = interpreters[0]
+        present = _namespace_capture(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            ("/usr/bin/test", "-e", interpreter),
+            runner=runner,
+        )
+        if present.returncode not in {0, 1}:
+            raise AssertionError("ELF_DIAGNOSTIC_REJECTED")
+        interpreter_present = present.returncode == 0
+    missing: tuple[str, ...] = ()
+    if dynamic:
+        dependencies = _namespace_capture(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            (str(LDD), str(binary)),
+            runner=runner,
+        )
+        missing = _parse_missing_libraries(
+            dependencies.stdout + "\n" + dependencies.stderr
+        )
+    return _ElfDependencyDiagnostic(dynamic, interpreter_present, missing)
+
+
+def _lexically_inside(path: Path, root: Path) -> bool:
+    if not path.is_absolute() or ".." in path.parts:
+        return False
+    return path == root or root in path.parents
+
+
+def _path_class(
+    value: str | None,
+    *,
+    runtime_root: Path,
+    candidate: str,
+) -> str:
+    if value is None:
+        return "ABSENT"
+    path = Path(value)
+    if _lexically_inside(path, runtime_root):
+        return "APPROVED_RUNTIME"
+    if any(_lexically_inside(path, root) for root in (
+        Path("/opt/pdi/current"),
+        Path("/opt/pdi/releases") / candidate,
+    )):
+        return "CANDIDATE_RELEASE"
+    return "OTHER"
+
+
+def _pyvenv_authority_diagnostic(
+    payload: str,
+    *,
+    runtime_root: Path,
+    candidate: str,
+    rehearsal_root: Path,
+) -> _PyVenvAuthorityDiagnostic:
+    if (
+        len(payload.encode("utf-8")) > _DIAGNOSTIC_LIMIT
+        or "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+        or _SECRET_ASSIGNMENT.search(payload)
+    ):
+        raise AssertionError("PYVENV_DIAGNOSTIC_REJECTED")
+    selected: dict[str, str] = {}
+    for line in payload.splitlines():
+        name, separator, value = line.partition("=")
+        name = name.strip().lower()
+        if separator and name in {"home", "executable", "command"}:
+            if name in selected:
+                raise AssertionError("PYVENV_DIAGNOSTIC_REJECTED")
+            selected[name] = value.strip()
+    try:
+        command_parts = shlex.split(selected.get("command", ""), posix=True)
+    except ValueError as exc:
+        raise AssertionError("PYVENV_DIAGNOSTIC_REJECTED") from exc
+    paths = [
+        Path(value)
+        for value in (
+            selected.get("home"),
+            selected.get("executable"),
+            *(part for part in command_parts if part.startswith("/")),
+        )
+        if value
+    ]
+    if any(".." in path.parts for path in paths):
+        raise AssertionError("PYVENV_DIAGNOSTIC_REJECTED")
+    return _PyVenvAuthorityDiagnostic(
+        _path_class(
+            selected.get("home"),
+            runtime_root=runtime_root,
+            candidate=candidate,
+        ),
+        _path_class(
+            selected.get("executable"),
+            runtime_root=runtime_root,
+            candidate=candidate,
+        ),
+        any(
+            _lexically_inside(path, root)
+            for path in paths
+            for root in (Path("/tmp"), Path("/var/tmp"))
+        ),
+        any(_lexically_inside(path, runtime_root) for path in paths),
+        any(_lexically_inside(path, rehearsal_root) for path in paths),
+    )
+
+
+def _runtime_reference_counts(
+    release: Path,
+    rehearsal_root: Path,
+    candidate: str,
+) -> tuple[int, int]:
+    if re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+        raise AssertionError("RUNTIME_REFERENCE_DIAGNOSTIC_REJECTED")
+    venv = release / ".venv"
+    selected: set[Path] = {venv / "pyvenv.cfg"}
+    try:
+        selected.update(venv.joinpath("bin").iterdir())
+        selected.update(venv.rglob("*.pth"))
+        selected.update(venv.rglob("*.dist-info/RECORD"))
+        physical = str(rehearsal_root).encode()
+        logical = (
+            f"/opt/pdi/releases/{candidate}".encode(),
+            b"/opt/pdi/current",
+        )
+        physical_count = 0
+        logical_count = 0
+        for path in sorted(selected):
+            info = path.lstat()
+            if stat.S_ISREG(info.st_mode):
+                payload = path.read_bytes()
+            elif stat.S_ISLNK(info.st_mode):
+                payload = os.fsencode(os.readlink(path))
+            elif stat.S_ISDIR(info.st_mode):
+                continue
+            else:
+                raise OSError
+            physical_count += payload.count(physical)
+            logical_count += sum(payload.count(marker) for marker in logical)
+    except OSError as exc:
+        raise AssertionError("RUNTIME_REFERENCE_DIAGNOSTIC_REJECTED") from exc
+    return physical_count, logical_count
+
+
+def _classify_interpreter_failure(
+    *,
+    candidate_rc: int,
+    base_rc: int,
+    sandbox_rc: int,
+    candidate_elf: _ElfDependencyDiagnostic,
+    base_elf: _ElfDependencyDiagnostic,
+    physical_reference_count: int,
+    logical_reference_count: int,
+) -> str:
+    if (
+        candidate_elf.missing_libraries
+        or base_elf.missing_libraries
+        or (candidate_elf.dynamic and not candidate_elf.interpreter_present)
+        or (base_elf.dynamic and not base_elf.interpreter_present)
+    ):
+        return "DYNAMIC_LIBRARY_RESOLUTION_FAILURE"
+    if physical_reference_count > 0 and logical_reference_count == 0:
+        return "PHYSICAL_LOGICAL_RUNTIME_PATH_MISMATCH"
+    if base_rc == 127:
+        return "BASE_RUNTIME_NOT_EXECUTABLE_IN_CONTAINER"
+    if candidate_rc == 127 and base_rc == 0:
+        return "CANDIDATE_VENV_NOT_EXECUTABLE_IN_CONTAINER"
+    if candidate_rc == 0 and sandbox_rc == 127:
+        return "SYSTEMD_SANDBOX_RUNTIME_FAILURE"
+    return "INTERPRETER_FAILURE_UNCLASSIFIED"
+
+
+def _collect_interpreter_failure_diagnostic(
+    *,
+    leader: int,
+    machine: str,
+    operation_id: str,
+    runtime_uid: int,
+    runtime_gid: int,
+    system_python: Path,
+    release: Path,
+    rehearsal_root: Path,
+    candidate: str,
+) -> _InterpreterFailureDiagnostic:
+    candidate_python = Path("/opt/pdi/current/.venv/bin/python")
+    candidate_rc = _container_python_probe(
+        leader, runtime_uid, runtime_gid, candidate_python,
+    )
+    base_rc = _container_python_probe(
+        leader, runtime_uid, runtime_gid, system_python,
+    )
+    sandbox_rc = (
+        _systemd_sandbox_python_probe(machine, operation_id)
+        if candidate_rc == 0
+        else -1
+    )
+    candidate_elf = _elf_dependency_diagnostic(
+        leader, runtime_uid, runtime_gid, candidate_python,
+    )
+    base_elf = _elf_dependency_diagnostic(
+        leader, runtime_uid, runtime_gid, system_python,
+    )
+    pyvenv = _pyvenv_authority_diagnostic(
+        (release / ".venv/pyvenv.cfg").read_text(encoding="utf-8"),
+        runtime_root=system_python.parent.parent,
+        candidate=candidate,
+        rehearsal_root=rehearsal_root,
+    )
+    physical_count, logical_count = _runtime_reference_counts(
+        release, rehearsal_root, candidate,
+    )
+    classification = _classify_interpreter_failure(
+        candidate_rc=candidate_rc,
+        base_rc=base_rc,
+        sandbox_rc=sandbox_rc,
+        candidate_elf=candidate_elf,
+        base_elf=base_elf,
+        physical_reference_count=physical_count,
+        logical_reference_count=logical_count,
+    )
+    return _InterpreterFailureDiagnostic(
+        candidate_rc,
+        base_rc,
+        sandbox_rc,
+        candidate_elf,
+        base_elf,
+        pyvenv,
+        physical_count,
+        logical_count,
+        classification,
+    )
+
+
 def _service_failure_class(
     journal: _RehearsalFailureJournalDiagnostic,
     service_state: dict[str, str],
@@ -672,6 +1292,13 @@ def _collect_service_failure_diagnostic(
         pipeline_runs,
         provider_counts,
         _service_failure_class(journal, journal.service_state, pipeline_runs),
+    )
+
+
+def _interpreter_probe_required(diagnostic: _ServiceFailureDiagnostic) -> bool:
+    return (
+        diagnostic.service_state["ExecMainStatus"] == "127"
+        and diagnostic.pipeline_runs.total == 0
     )
 
 
@@ -1649,6 +2276,7 @@ def _write_failure_journal_fixture(
         "service_result": "exit-code",
         "service_exec_main_status": "1",
         "service_exec_main_code": "1",
+        "service_status_errno": "0",
     }))
     for sequence, (event, evidence) in enumerate(events, start=1):
         path = authority / f"journal-{sequence:06d}.json"
@@ -1688,6 +2316,7 @@ def test_failure_journal_derives_exact_next_canonical_pipeline(
         "Result": "exit-code",
         "ExecMainStatus": "1",
         "ExecMainCode": "1",
+        "StatusErrno": "0",
     }
     assert result.last_event == (
         "SERVICES_VERIFIED" if verified_count == 0 else "PIPELINE_VERIFIED"
@@ -1718,6 +2347,7 @@ def test_failed_service_query_uses_only_safe_property_allowlist() -> None:
         "Result": "exit-code",
         "ExecMainStatus": "1",
         "ExecMainCode": "1",
+        "StatusErrno": "0",
     }
     commands = []
 
@@ -1741,6 +2371,7 @@ def test_failed_service_query_uses_only_safe_property_allowlist() -> None:
         "--property=LoadState", "--property=ActiveState",
         "--property=SubState", "--property=Result",
         "--property=ExecMainStatus", "--property=ExecMainCode",
+        "--property=StatusErrno",
     }
     assert all(
         forbidden not in " ".join(command)
@@ -1751,7 +2382,7 @@ def test_failed_service_query_uses_only_safe_property_allowlist() -> None:
 def test_failed_service_query_rejects_extra_or_freeform_properties() -> None:
     output = (
         "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
-        "Result=exit-code\nExecMainStatus=1\nExecMainCode=1\n"
+        "Result=exit-code\nExecMainStatus=1\nExecMainCode=1\nStatusErrno=0\n"
         "Environment=PASSWORD=unsafe\n"
     )
     with pytest.raises(DisposableRehearsalError, match="DIAGNOSTIC_INVALID"):
@@ -1762,6 +2393,17 @@ def test_failed_service_query_rejects_extra_or_freeform_properties() -> None:
                 argv, 0, output, "",
             ),
         )
+
+
+def test_failed_service_query_rejects_invalid_status_errno() -> None:
+    values = {
+        "LoadState": "loaded", "ActiveState": "failed",
+        "SubState": "failed", "Result": "exit-code",
+        "ExecMainStatus": "127", "ExecMainCode": "1",
+        "StatusErrno": "4096",
+    }
+    with pytest.raises(DisposableRehearsalError, match="DIAGNOSTIC_INVALID"):
+        MachineSystemdBackend.validate_service_failure_state(values)
 
 
 class _FailureRows:
@@ -1838,7 +2480,7 @@ def test_provider_and_combined_failure_diagnostic_emit_counts_and_allowlists_onl
     state = {
         "LoadState": "loaded", "ActiveState": "failed",
         "SubState": "failed", "Result": "exit-code",
-        "ExecMainStatus": "1", "ExecMainCode": "1",
+        "ExecMainStatus": "1", "ExecMainCode": "1", "StatusErrno": "0",
     }
     journal = _RehearsalFailureJournalDiagnostic(
         "SERVICES_VERIFIED", (), CANONICAL_PIPELINES[0],
@@ -1854,12 +2496,258 @@ def test_provider_and_combined_failure_diagnostic_emit_counts_and_allowlists_onl
     assert "IMMICH_ACCOUNT_CALL_COUNT=0" in diagnostic
     assert "IMMICH_OCR_CALL_COUNT=0" in diagnostic
     assert "SERVICE_FAILURE_CLASS=SERVICE_START_COMMAND_FAILED" in diagnostic
+    assert "FAILED_SERVICE_STATUS_ERRNO=0" in diagnostic
     assert all(secret not in diagnostic for secret in (
         "DATABASE__URL", "PASSWORD", "IMMICH__API_KEY",
         "synthetic-nextcloud-password", "raw journal", "traceback",
     ))
     with pytest.raises(AssertionError, match="PROVIDER_DIAGNOSTIC_REJECTED"):
         _provider_call_counts(("Authorization: secret",))
+
+
+_ELF_OK = _ElfDependencyDiagnostic(True, True, ())
+
+
+@pytest.mark.parametrize(
+    "candidate_rc,base_rc,sandbox_rc,candidate_elf,base_elf,physical,logical,expected",
+    (
+        (
+            127, 0, -1, _ELF_OK, _ELF_OK, 0, 0,
+            "CANDIDATE_VENV_NOT_EXECUTABLE_IN_CONTAINER",
+        ),
+        (
+            127, 127, -1, _ELF_OK, _ELF_OK, 0, 0,
+            "BASE_RUNTIME_NOT_EXECUTABLE_IN_CONTAINER",
+        ),
+        (
+            0, 0, 127, _ELF_OK, _ELF_OK, 0, 0,
+            "SYSTEMD_SANDBOX_RUNTIME_FAILURE",
+        ),
+        (
+            127, 0, -1,
+            _ElfDependencyDiagnostic(True, True, ("libpython3.13.so.1.0",)),
+            _ELF_OK, 0, 0, "DYNAMIC_LIBRARY_RESOLUTION_FAILURE",
+        ),
+        (
+            127, 0, -1, _ELF_OK, _ELF_OK, 3, 0,
+            "PHYSICAL_LOGICAL_RUNTIME_PATH_MISMATCH",
+        ),
+    ),
+)
+def test_interpreter_failure_classification_is_fixed_and_evidence_driven(
+    candidate_rc: int,
+    base_rc: int,
+    sandbox_rc: int,
+    candidate_elf: _ElfDependencyDiagnostic,
+    base_elf: _ElfDependencyDiagnostic,
+    physical: int,
+    logical: int,
+    expected: str,
+) -> None:
+    assert _classify_interpreter_failure(
+        candidate_rc=candidate_rc,
+        base_rc=base_rc,
+        sandbox_rc=sandbox_rc,
+        candidate_elf=candidate_elf,
+        base_elf=base_elf,
+        physical_reference_count=physical,
+        logical_reference_count=logical,
+    ) == expected
+
+
+def test_container_python_probe_uses_only_mount_view_and_runtime_identity() -> None:
+    commands = []
+
+    def runner(argv, **kwargs):
+        commands.append((tuple(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 127)
+
+    result = _container_python_probe(
+        4321, 998, 997, Path("/opt/pdi/current/.venv/bin/python"),
+        runner=runner,
+    )
+    assert result == 127
+    command, kwargs = commands[0]
+    assert command[:7] == (
+        "/usr/bin/nsenter", "--target", "4321", "--mount", "--root",
+        "--wd", "--",
+    )
+    assert "--pid" not in command and "--net" not in command
+    assert "--user" not in command and "--ipc" not in command
+    assert "--reuid=998" in command and "--regid=997" in command
+    assert "--clear-groups" in command and "--no-new-privs" in command
+    assert command[-3:] == (
+        "/opt/pdi/current/.venv/bin/python", "-c",
+        "import sys; raise SystemExit(0)",
+    )
+    assert kwargs["stdout"] is subprocess.DEVNULL
+    assert kwargs["stderr"] is subprocess.DEVNULL
+    assert kwargs["shell"] is False
+
+
+def test_sandbox_probe_mirrors_contract_without_affecting_six_service_count() -> None:
+    commands = []
+
+    def runner(argv, **kwargs):
+        commands.append(tuple(argv))
+        if len(commands) == 1:
+            return subprocess.CompletedProcess(argv, 127)
+        if tuple(argv)[3] == "show":
+            return subprocess.CompletedProcess(argv, 0, "not-found\n", "")
+        return subprocess.CompletedProcess(argv, 0)
+
+    backend = MachineSystemdBackend("pdi-p3d-1234567812345678")
+    result = _systemd_sandbox_python_probe(
+        "pdi-p3d-1234567812345678",
+        "12345678-1234-4234-8234-123456789abc",
+        runner=runner,
+    )
+    assert result == 127
+    assert backend.service_start_count == 0
+    command = commands[0]
+    assert command[0] == "/usr/bin/systemd-run"
+    assert "--uid=pdi" in command and "--gid=pdi" in command
+    assert "--working-directory=/opt/pdi/current" in command
+    assert set(item for item in command if item.startswith("--property=")) == {
+        "--property=Type=oneshot",
+        "--property=NoNewPrivileges=yes",
+        "--property=PrivateTmp=yes",
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=yes",
+        "--property=ReadWritePaths=/run/lock",
+    }
+    assert "--setenv=PYTHONDONTWRITEBYTECODE=1" in command
+    assert "--setenv=PYTHONPATH=/opt/pdi/current/src" in command
+    assert all(unit not in " ".join(command) for unit in SERVICE_UNITS.values())
+    assert not any("EnvironmentFile" in item for item in command)
+    assert [command[3] for command in commands[1:]] == [
+        "stop", "reset-failed", "show",
+    ]
+
+
+def test_missing_library_parser_emits_only_validated_basenames() -> None:
+    payload = (
+        "linux-vdso.so.1 (0x0000)\n"
+        "libpython3.13.so.1.0 => not found\n"
+        "libz.so.1 => not found\n"
+    )
+    assert _parse_missing_libraries(payload) == (
+        "libpython3.13.so.1.0", "libz.so.1",
+    )
+    with pytest.raises(AssertionError, match="ELF_DIAGNOSTIC_REJECTED"):
+        _parse_missing_libraries("/tmp/libunsafe.so => not found\n")
+    with pytest.raises(AssertionError, match="ELF_DIAGNOSTIC_REJECTED"):
+        _parse_missing_libraries("DATABASE__URL=secret-value\n")
+
+
+def test_pyvenv_authority_is_classified_without_emitting_paths() -> None:
+    runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
+    rehearsal = Path("/tmp/pdi-p3d-rehearsal-12345678")
+    candidate = "a" * 40
+    payload = (
+        f"home = {runtime}/bin\n"
+        f"executable = {runtime}/bin/python3.13\n"
+        f"command = {runtime}/bin/python -m venv --copies "
+        f"{rehearsal}/opt/pdi/releases/{candidate}/.venv\n"
+    )
+    result = _pyvenv_authority_diagnostic(
+        payload,
+        runtime_root=runtime,
+        candidate=candidate,
+        rehearsal_root=rehearsal,
+    )
+    assert result == _PyVenvAuthorityDiagnostic(
+        "APPROVED_RUNTIME", "APPROVED_RUNTIME", True, True, True,
+    )
+    logical = _pyvenv_authority_diagnostic(
+        f"home = /opt/pdi/releases/{candidate}/.venv\n",
+        runtime_root=runtime,
+        candidate=candidate,
+        rehearsal_root=rehearsal,
+    )
+    assert logical.home_class == "CANDIDATE_RELEASE"
+
+
+def test_runtime_reference_counts_only_selected_candidate_metadata(
+    tmp_path: Path,
+) -> None:
+    candidate = "b" * 40
+    root = tmp_path / "pdi-p3d-rehearsal-12345678"
+    release = root / "opt/pdi/releases" / candidate
+    (release / ".venv/bin").mkdir(parents=True)
+    (release / ".venv/lib/python3.13/site-packages/a.dist-info").mkdir(
+        parents=True
+    )
+    (release / ".venv/pyvenv.cfg").write_text(
+        f"home = {root}/runtime\n", encoding="utf-8",
+    )
+    (release / ".venv/bin/tool").write_text(
+        f"#!{root}/runtime/bin/python\n", encoding="utf-8",
+    )
+    (release / ".venv/lib/python3.13/site-packages/authority.pth").write_text(
+        f"/opt/pdi/releases/{candidate}/src\n", encoding="utf-8",
+    )
+    (release / ".venv/lib/python3.13/site-packages/a.dist-info/RECORD").write_text(
+        "/opt/pdi/current/src/pdi/__init__.py,,\n", encoding="utf-8",
+    )
+    assert _runtime_reference_counts(release, root, candidate) == (2, 2)
+
+
+def test_interpreter_diagnostic_safe_output_never_contains_raw_paths_or_loader_text(
+) -> None:
+    runtime_path = "/run/pdi-p3d-wp7-runtime.RANDOM"
+    diagnostic = _InterpreterFailureDiagnostic(
+        127,
+        0,
+        -1,
+        _ELF_OK,
+        _ELF_OK,
+        _PyVenvAuthorityDiagnostic(
+            "APPROVED_RUNTIME", "APPROVED_RUNTIME", False, True, False,
+        ),
+        0,
+        0,
+        "CANDIDATE_VENV_NOT_EXECUTABLE_IN_CONTAINER",
+    )
+    output = "\n".join(f"{key}={value}" for key, value in diagnostic.safe_values())
+    assert "CONTAINER_CANDIDATE_PYTHON_PROBE_RC=127" in output
+    assert "INTERPRETER_FAILURE_CLASS=CANDIDATE_VENV_NOT_EXECUTABLE_IN_CONTAINER" in output
+    assert runtime_path not in output
+    assert "not found" not in output
+    assert "DATABASE__URL" not in output
+
+
+def test_interpreter_probes_require_exact_exit_127_without_fresh_ledger() -> None:
+    state = {
+        "LoadState": "loaded", "ActiveState": "failed",
+        "SubState": "failed", "Result": "exit-code",
+        "ExecMainStatus": "127", "ExecMainCode": "1", "StatusErrno": "2",
+    }
+    journal = _RehearsalFailureJournalDiagnostic(
+        "SERVICES_VERIFIED", (), CANONICAL_PIPELINES[0],
+        SERVICE_UNITS[CANONICAL_PIPELINES[0]], 1, state,
+    )
+    counts = _provider_call_counts(())
+    absent = _PipelineRunFailureDiagnostic(0, 0, 0, False, None, None, None)
+    present = _PipelineRunFailureDiagnostic(
+        1, 0, 1, True, "failed", True, "execution_failed",
+    )
+    assert _interpreter_probe_required(
+        _ServiceFailureDiagnostic(
+            journal, state, absent, counts, "SERVICE_START_COMMAND_FAILED",
+        )
+    )
+    assert not _interpreter_probe_required(
+        _ServiceFailureDiagnostic(
+            journal, state, present, counts, "SERVICE_START_COMMAND_FAILED",
+        )
+    )
+    non_127 = dict(state, ExecMainStatus="1")
+    assert not _interpreter_probe_required(
+        _ServiceFailureDiagnostic(
+            journal, non_127, absent, counts, "SERVICE_START_COMMAND_FAILED",
+        )
+    )
 
 
 def _terminate_machine(machine: str, process: subprocess.Popen) -> bool:
@@ -2135,6 +3023,22 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                     boundary=rehearsal_boundary,
                     provider_calls=tuple(fixture.calls),
                 )
+                if _interpreter_probe_required(diagnostic):
+                    try:
+                        interpreter = _collect_interpreter_failure_diagnostic(
+                            leader=leader,
+                            machine=machine,
+                            operation_id=rehearsal_operation,
+                            runtime_uid=account.pw_uid,
+                            runtime_gid=group.gr_gid,
+                            system_python=system_python,
+                            release=release,
+                            rehearsal_root=root,
+                            candidate=candidate,
+                        )
+                    except (AssertionError, OSError, UnicodeError):
+                        interpreter = _InterpreterFailureDiagnostic.unavailable()
+                    diagnostic = replace(diagnostic, interpreter=interpreter)
                 raise AssertionError(
                     "P3D_DISPOSABLE_REHEARSAL=FAIL\n"
                     "FAILURE_CODE=P3D_REHEARSAL_SERVICE_FAILED\n"
