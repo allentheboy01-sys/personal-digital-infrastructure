@@ -572,11 +572,11 @@ jobs:
           test "$(id -u pdi)" -gt 0
           test "$(id -g pdi)" -gt 0
           runtime_source="${pythonLocation:?}"
-          qualification_runtime="$(sudo mktemp -d /tmp/pdi-p3d-wp7-runtime.XXXXXX)"
+          qualification_runtime="$(sudo mktemp -d /run/pdi-p3d-wp7-runtime.XXXXXX)"
           rehearsal_root="$(sudo mktemp -d /tmp/pdi-p3d-rehearsal-XXXXXXXX)"
           sudo rmdir "$rehearsal_root"
           case "$qualification_runtime" in
-            /tmp/pdi-p3d-wp7-runtime.*) ;;
+            /run/pdi-p3d-wp7-runtime.*) ;;
             *) exit 1 ;;
           esac
           case "$rehearsal_root" in
@@ -585,14 +585,17 @@ jobs:
           esac
           cleanup() {
             case "$qualification_runtime" in
-              /tmp/pdi-p3d-wp7-runtime.*) ;;
+              /run/pdi-p3d-wp7-runtime.*) ;;
               *) return 1 ;;
             esac
             case "$rehearsal_root" in
               /tmp/pdi-p3d-rehearsal-*) ;;
               *) return 1 ;;
             esac
+            sudo test ! -L "$qualification_runtime"
             sudo rm -rf -- "$qualification_runtime" "$rehearsal_root"
+            sudo test ! -e "$qualification_runtime"
+            echo 'QUALIFICATION_RUNTIME_CLEANED=PASS'
           }
           trap cleanup EXIT
           sudo cp -aL "$runtime_source/." "$qualification_runtime/"
@@ -601,8 +604,17 @@ jobs:
           sudo find "$qualification_runtime" -type f -perm /111 -exec chmod 0755 {} +
           sudo find "$qualification_runtime" -type f ! -perm /111 -exec chmod 0644 {} +
           test -z "$(sudo find "$qualification_runtime" -mindepth 1 ! -type d ! -type f -print -quit)"
+          test "$(sudo readlink -f "$qualification_runtime")" = "$qualification_runtime"
+          test "$(sudo stat -Lc '%u:%g:%a:%F' /run)" = '0:0:755:directory'
+          test "$(sudo stat -Lc '%u:%g:%a:%F' "$qualification_runtime")" = '0:0:755:directory'
           system_python="$qualification_runtime/bin/python"
           sudo test -x "$system_python"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONNOUSERSITE=1 \
+            "$system_python" -c 'import sys; assert sys.executable'
           rehearsal_log="$RUNNER_TEMP/pdi-p3d-wp7-rehearsal.log"
           rehearsal_report="$RUNNER_TEMP/pdi-p3d-wp7-rehearsal.xml"
           sudo /usr/bin/env -i \

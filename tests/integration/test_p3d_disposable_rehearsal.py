@@ -244,6 +244,122 @@ def _environment() -> tuple[Path, Path, Path, Path, str]:
     )
 
 
+def _validate_qualification_runtime_root(
+    runtime_root: Path,
+    *,
+    resolved: Path,
+    runtime_info: os.stat_result,
+    run_info: os.stat_result,
+) -> Path:
+    prefix = "pdi-p3d-wp7-runtime."
+    suffix = runtime_root.name.removeprefix(prefix)
+    if (
+        not runtime_root.is_absolute()
+        or runtime_root.parent != Path("/run")
+        or not runtime_root.name.startswith(prefix)
+        or not suffix
+        or not suffix.isalnum()
+        or resolved != runtime_root
+        or not stat.S_ISDIR(runtime_info.st_mode)
+        or stat.S_ISLNK(runtime_info.st_mode)
+        or runtime_info.st_uid != 0
+        or runtime_info.st_gid != 0
+        or runtime_info.st_mode & 0o022
+        or not stat.S_ISDIR(run_info.st_mode)
+        or stat.S_ISLNK(run_info.st_mode)
+        or run_info.st_uid != 0
+        or run_info.st_gid != 0
+        or run_info.st_mode & 0o022
+    ):
+        raise AssertionError("QUALIFICATION_RUNTIME_INVALID")
+    return resolved
+
+
+def _verify_qualification_runtime_root(system_python: Path) -> Path:
+    runtime_root = system_python.parent.parent
+    if system_python != runtime_root / "bin/python":
+        raise AssertionError("QUALIFICATION_RUNTIME_INVALID")
+    try:
+        resolved = runtime_root.resolve(strict=True)
+        runtime_info = runtime_root.lstat()
+        run_info = Path("/run").lstat()
+        python_info = system_python.lstat()
+    except OSError as exc:
+        raise AssertionError("QUALIFICATION_RUNTIME_INVALID") from exc
+    _validate_qualification_runtime_root(
+        runtime_root,
+        resolved=resolved,
+        runtime_info=runtime_info,
+        run_info=run_info,
+    )
+    if (
+        not stat.S_ISREG(python_info.st_mode)
+        or stat.S_ISLNK(python_info.st_mode)
+        or python_info.st_uid != 0
+        or python_info.st_gid != 0
+        or python_info.st_mode & 0o022
+        or not python_info.st_mode & stat.S_IXUSR
+    ):
+        raise AssertionError("QUALIFICATION_RUNTIME_INVALID")
+    return runtime_root
+
+
+def _assert_candidate_venv_runtime_authority(
+    release: Path,
+    *,
+    system_python: Path,
+    runtime_root: Path,
+) -> None:
+    candidate_python = release / ".venv/bin/python"
+    config = release / ".venv/pyvenv.cfg"
+    try:
+        candidate_resolved = candidate_python.resolve(strict=True)
+        candidate_info = candidate_python.lstat()
+        values = {
+            key.strip(): value.strip()
+            for line in config.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+            for key, value in (line.split("=", 1),)
+        }
+        home = Path(values["home"])
+        executable = Path(values["executable"])
+        command_python = Path(values["command"].split(" -m venv", 1)[0])
+        resolved_refs = tuple(
+            reference.resolve(strict=True)
+            for reference in (home, executable, command_python)
+        )
+    except (KeyError, OSError, ValueError) as exc:
+        raise AssertionError("CANDIDATE_RUNTIME_AUTHORITY_INVALID") from exc
+    release_resolved = release.resolve(strict=True)
+    runtime_resolved = runtime_root.resolve(strict=True)
+    if (
+        candidate_resolved.parent.parent.parent != release_resolved
+        or not stat.S_ISREG(candidate_info.st_mode)
+        or stat.S_ISLNK(candidate_info.st_mode)
+        or candidate_info.st_uid != 0
+        or candidate_info.st_gid != 0
+        or candidate_info.st_mode & 0o022
+        or not candidate_info.st_mode & stat.S_IXUSR
+        or sha256(candidate_python.read_bytes()).digest()
+        != sha256(system_python.read_bytes()).digest()
+        or any(not reference.is_absolute() for reference in (
+            home, executable, command_python,
+        ))
+        or any(
+            reference != runtime_resolved
+            and runtime_resolved not in reference.parents
+            for reference in resolved_refs
+        )
+        or command_python.resolve(strict=True) != system_python.resolve(strict=True)
+        or any(
+            forbidden == reference or forbidden in reference.parents
+            for forbidden in (Path("/tmp"), Path("/var/tmp"))
+            for reference in resolved_refs
+        )
+    ):
+        raise AssertionError("CANDIDATE_RUNTIME_AUTHORITY_INVALID")
+
+
 def _docx(content: str) -> bytes:
     output = BytesIO()
     document = (
@@ -873,7 +989,7 @@ def _build_nspawn_command(
 def test_nspawn_command_uses_only_approved_options() -> None:
     machine = "pdi-p3d-1234567812344234"
     root = Path("/tmp/pdi-p3d-rehearsal-synthetic")
-    system_python = Path("/opt/synthetic-runtime/bin/python3.13")
+    system_python = Path("/run/pdi-p3d-wp7-runtime.SYNTHETIC/bin/python")
     assert _build_nspawn_command(machine, root, system_python) == (
         str(SYSTEMD_NSPAWN),
         "--quiet",
@@ -882,7 +998,8 @@ def test_nspawn_command_uses_only_approved_options() -> None:
         f"--machine={machine}",
         f"--directory={root}",
         "--bind-ro=/usr:/usr",
-        "--bind-ro=/opt/synthetic-runtime:/opt/synthetic-runtime",
+        "--bind-ro=/run/pdi-p3d-wp7-runtime.SYNTHETIC:"
+        "/run/pdi-p3d-wp7-runtime.SYNTHETIC",
         "--console=pipe",
         "--link-journal=no",
         "--settings=no",
@@ -894,6 +1011,83 @@ def test_nspawn_command_uses_only_approved_options() -> None:
         root,
         system_python,
     )
+
+
+def _directory_stat(mode: int = 0o755, uid: int = 0, gid: int = 0) -> os.stat_result:
+    return os.stat_result((stat.S_IFDIR | mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
+
+
+def _symlink_stat() -> os.stat_result:
+    return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+
+def test_qualification_runtime_accepts_trusted_run_path() -> None:
+    runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
+    assert _validate_qualification_runtime_root(
+        runtime,
+        resolved=runtime,
+        runtime_info=_directory_stat(),
+        run_info=_directory_stat(),
+    ) == runtime
+
+
+@pytest.mark.parametrize("runtime", (
+    Path("/tmp/pdi-p3d-wp7-runtime.A1b2C3"),
+    Path("/var/tmp/pdi-p3d-wp7-runtime.A1b2C3"),
+))
+def test_qualification_runtime_rejects_private_tmp_paths(runtime: Path) -> None:
+    with pytest.raises(AssertionError, match="QUALIFICATION_RUNTIME_INVALID"):
+        _validate_qualification_runtime_root(
+            runtime,
+            resolved=runtime,
+            runtime_info=_directory_stat(),
+            run_info=_directory_stat(),
+        )
+
+
+@pytest.mark.parametrize("runtime_info,run_info,resolved", (
+    (
+        _directory_stat(uid=1000), _directory_stat(),
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3"),
+    ),
+    (
+        _directory_stat(gid=1000), _directory_stat(),
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3"),
+    ),
+    (
+        _directory_stat(mode=0o775), _directory_stat(),
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3"),
+    ),
+    (
+        _symlink_stat(), _directory_stat(),
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3"),
+    ),
+    (
+        _directory_stat(), _directory_stat(mode=0o777),
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3"),
+    ),
+    (
+        _directory_stat(), _symlink_stat(),
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3"),
+    ),
+    (
+        _directory_stat(), _directory_stat(),
+        Path("/run/other-runtime.A1b2C3"),
+    ),
+))
+def test_qualification_runtime_rejects_untrusted_path_facts(
+    runtime_info: os.stat_result,
+    run_info: os.stat_result,
+    resolved: Path,
+) -> None:
+    runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
+    with pytest.raises(AssertionError, match="QUALIFICATION_RUNTIME_INVALID"):
+        _validate_qualification_runtime_root(
+            runtime,
+            resolved=resolved,
+            runtime_info=runtime_info,
+            run_info=run_info,
+        )
 
 
 def test_rootfs_default_target_remains_basic_target(
@@ -1693,6 +1887,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     assert root != Path("/") and str(root).startswith("/tmp/pdi-p3d-rehearsal-")
     assert SYSTEMD_NSPAWN.is_file() and MACHINECTL.is_file()
     assert bundle.is_file() and digest_path.is_file() and system_python.is_file()
+    runtime_root = _verify_qualification_runtime_root(system_python)
     assert not root.exists()
     root.mkdir(mode=0o755)
     os.chown(root, 0, 0)
@@ -1744,6 +1939,11 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
             ).run()
             assert bootstrap.final_state.phase == "COMPLETE"
             release = releases_root / candidate
+            _assert_candidate_venv_runtime_authority(
+                release,
+                system_python=system_python,
+                runtime_root=runtime_root,
+            )
 
             gate_a_operation = str(uuid4())
             rollback_metadata, _ = _create_complete_gate_a(

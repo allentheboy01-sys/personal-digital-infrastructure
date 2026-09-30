@@ -898,3 +898,25 @@ def test_dedicated_ci_requires_real_unskipped_systemd_rehearsal() -> None:
     assert "P3D_SERVICE_START_COUNT=6" in workflow
     assert "P3D_TIMER_ENABLE_COUNT=0" in workflow
     assert "RUNTIME_PIPELINE_COVERAGE=6/6" in workflow
+
+
+def test_dedicated_ci_keeps_runtime_visible_with_private_tmp() -> None:
+    root = Path(__file__).parents[1]
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    service = (
+        root / "deployment/systemd/pdi-scoped-pipeline@.service"
+    ).read_text()
+    assert "PrivateTmp=true" in service
+    assert "PrivateTmp=false" not in service
+    assert "mktemp -d /run/pdi-p3d-wp7-runtime.XXXXXX" in workflow
+    assert "/tmp/pdi-p3d-wp7-runtime." not in workflow
+    assert 'readlink -f "$qualification_runtime"' in workflow
+    assert "stat -Lc '%u:%g:%a:%F' /run" in workflow
+    assert "stat -Lc '%u:%g:%a:%F' \"$qualification_runtime\"" in workflow
+    assert '"$system_python" -c \'import sys; assert sys.executable\'' in workflow
+    assert "QUALIFICATION_RUNTIME_CLEANED=PASS" in workflow
+    integration = (
+        root / "tests/integration/test_p3d_disposable_rehearsal.py"
+    ).read_text()
+    assert "runtime_root = _verify_qualification_runtime_root(system_python)" in integration
+    assert "_assert_candidate_venv_runtime_authority(" in integration
