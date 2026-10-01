@@ -948,3 +948,28 @@ def test_wp7_loader_cache_fix_is_disposable_and_preserves_service_contract() -> 
     assert "PrivateTmp=false" not in service
     assert "LD_LIBRARY_PATH" not in service
     assert "LD_PRELOAD" not in service
+
+
+def test_wp7_python_preflight_failure_emits_only_structured_safe_evidence() -> None:
+    integration = (
+        Path(__file__).parents[1]
+        / "tests/integration/test_p3d_disposable_rehearsal.py"
+    ).read_text(encoding="utf-8")
+    assert (
+        "class _QualificationPythonPreflightError(AssertionError):"
+        in integration
+    )
+    assert "diagnostic = _QualificationPythonPreflight(" in integration
+    assert "except _QualificationPythonPreflightError as exc:" in integration
+    assert "print(exc.safe_message())" in integration
+    assert '"QUALIFICATION_PYTHON_PREFLIGHT", "FAIL"' in integration
+    assert '"QUALIFICATION_PYTHON_PREFLIGHT_CLASS"' in integration
+    assert (
+        'raise AssertionError(\n'
+        '                    "QUALIFICATION_PYTHON_PREFLIGHT_INVALID"'
+        in integration
+    )
+    assert (
+        "_materialize_disposable_loader_cache(root, runtime_root)"
+        in integration
+    )

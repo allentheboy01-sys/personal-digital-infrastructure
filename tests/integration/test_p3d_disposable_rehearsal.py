@@ -100,6 +100,18 @@ _INTERPRETER_FAILURE_CLASSES = {
     "PHYSICAL_LOGICAL_RUNTIME_PATH_MISMATCH",
     "INTERPRETER_FAILURE_UNCLASSIFIED",
 }
+_QUALIFICATION_PYTHON_PREFLIGHT_CLASSES = {
+    "BASE_PYTHON_PROBE_FAILED",
+    "CANDIDATE_PYTHON_PROBE_FAILED",
+    "BOTH_PYTHON_PROBES_FAILED",
+    "BASE_PYTHON_MISSING_LIBRARY",
+    "CANDIDATE_PYTHON_MISSING_LIBRARY",
+    "BOTH_PYTHONS_MISSING_LIBRARY",
+    "BASE_ELF_INVALID",
+    "CANDIDATE_ELF_INVALID",
+    "BOTH_ELF_INVALID",
+    "QUALIFICATION_PYTHON_PREFLIGHT_UNCLASSIFIED",
+}
 
 
 @dataclass(frozen=True)
@@ -195,6 +207,83 @@ class _QualificationPythonPreflight:
     base_probe_rc: int
     candidate_elf: _ElfDependencyDiagnostic
     base_elf: _ElfDependencyDiagnostic
+
+    def safe_values(
+        self,
+        classification: str,
+    ) -> tuple[tuple[str, str], ...]:
+        _validate_qualification_python_preflight(self)
+        if classification not in _QUALIFICATION_PYTHON_PREFLIGHT_CLASSES:
+            raise AssertionError(
+                "QUALIFICATION_PYTHON_PREFLIGHT_DIAGNOSTIC_REJECTED"
+            )
+        base_missing = self.base_elf.missing_libraries
+        candidate_missing = self.candidate_elf.missing_libraries
+        return (
+            ("QUALIFICATION_PYTHON_PREFLIGHT", "FAIL"),
+            ("CONTAINER_BASE_PYTHON_PROBE_RC", str(self.base_probe_rc)),
+            (
+                "CONTAINER_CANDIDATE_PYTHON_PROBE_RC",
+                str(self.candidate_probe_rc),
+            ),
+            (
+                "BASE_PYTHON_ELF_DYNAMIC",
+                "YES" if self.base_elf.dynamic else "NO",
+            ),
+            (
+                "BASE_PYTHON_INTERPRETER_PRESENT",
+                "YES" if self.base_elf.interpreter_present else "NO",
+            ),
+            ("BASE_PYTHON_MISSING_LIBRARY_COUNT", str(len(base_missing))),
+            (
+                "BASE_PYTHON_MISSING_LIBRARIES",
+                ",".join(base_missing) or "NONE",
+            ),
+            (
+                "CANDIDATE_PYTHON_ELF_DYNAMIC",
+                "YES" if self.candidate_elf.dynamic else "NO",
+            ),
+            (
+                "CANDIDATE_PYTHON_INTERPRETER_PRESENT",
+                "YES" if self.candidate_elf.interpreter_present else "NO",
+            ),
+            (
+                "CANDIDATE_PYTHON_MISSING_LIBRARY_COUNT",
+                str(len(candidate_missing)),
+            ),
+            (
+                "CANDIDATE_PYTHON_MISSING_LIBRARIES",
+                ",".join(candidate_missing) or "NONE",
+            ),
+            ("QUALIFICATION_PYTHON_PREFLIGHT_CLASS", classification),
+        )
+
+
+class _QualificationPythonPreflightError(AssertionError):
+    def __init__(
+        self,
+        diagnostic: _QualificationPythonPreflight,
+        classification: str,
+    ) -> None:
+        values = diagnostic.safe_values(classification)
+        self.candidate_probe_rc = diagnostic.candidate_probe_rc
+        self.base_probe_rc = diagnostic.base_probe_rc
+        self.candidate_elf = diagnostic.candidate_elf
+        self.base_elf = diagnostic.base_elf
+        self.classification = classification
+        super().__init__("\n".join(f"{name}={value}" for name, value in values))
+
+    def safe_message(self) -> str:
+        diagnostic = _QualificationPythonPreflight(
+            self.candidate_probe_rc,
+            self.base_probe_rc,
+            self.candidate_elf,
+            self.base_elf,
+        )
+        return "\n".join(
+            f"{name}={value}"
+            for name, value in diagnostic.safe_values(self.classification)
+        )
 
 
 @dataclass(frozen=True)
@@ -1306,23 +1395,112 @@ def _verify_container_python_preflight(
         leader, runtime_uid, runtime_gid, candidate_python,
     )
     base_elf = elf_probe(leader, runtime_uid, runtime_gid, system_python)
-    if (
-        candidate_rc != 0
-        or base_rc != 0
-        or not candidate_elf.dynamic
-        or not candidate_elf.interpreter_present
-        or candidate_elf.missing_libraries
-        or not base_elf.dynamic
-        or not base_elf.interpreter_present
-        or base_elf.missing_libraries
-    ):
-        raise AssertionError("QUALIFICATION_PYTHON_PREFLIGHT_INVALID")
-    return _QualificationPythonPreflight(
+    diagnostic = _QualificationPythonPreflight(
         candidate_rc,
         base_rc,
         candidate_elf,
         base_elf,
     )
+    _validate_qualification_python_preflight(diagnostic)
+    if not _qualification_python_preflight_passed(diagnostic):
+        raise _QualificationPythonPreflightError(
+            diagnostic,
+            _qualification_python_preflight_failure_class(diagnostic),
+        )
+    return diagnostic
+
+
+def _validate_qualification_python_preflight(
+    diagnostic: _QualificationPythonPreflight,
+) -> None:
+    elf_values = (diagnostic.candidate_elf, diagnostic.base_elf)
+    if (
+        any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or not -255 <= value <= 255
+            for value in (
+                diagnostic.candidate_probe_rc,
+                diagnostic.base_probe_rc,
+            )
+        )
+        or any(
+            not isinstance(value, _ElfDependencyDiagnostic)
+            for value in elf_values
+        )
+        or any(
+            not isinstance(value.dynamic, bool)
+            or not isinstance(value.interpreter_present, bool)
+            or not isinstance(value.missing_libraries, tuple)
+            for value in elf_values
+        )
+        or any(
+            not isinstance(name, str)
+            or _LIBRARY_BASENAME.fullmatch(name) is None
+            for value in elf_values
+            for name in value.missing_libraries
+        )
+        or any(
+            value.missing_libraries
+            != tuple(sorted(set(value.missing_libraries)))
+            for value in elf_values
+        )
+    ):
+        raise AssertionError(
+            "QUALIFICATION_PYTHON_PREFLIGHT_DIAGNOSTIC_REJECTED"
+        )
+
+
+def _qualification_python_preflight_passed(
+    diagnostic: _QualificationPythonPreflight,
+) -> bool:
+    return (
+        diagnostic.candidate_probe_rc == 0
+        and diagnostic.base_probe_rc == 0
+        and diagnostic.candidate_elf.dynamic
+        and diagnostic.candidate_elf.interpreter_present
+        and not diagnostic.candidate_elf.missing_libraries
+        and diagnostic.base_elf.dynamic
+        and diagnostic.base_elf.interpreter_present
+        and not diagnostic.base_elf.missing_libraries
+    )
+
+
+def _qualification_python_preflight_failure_class(
+    diagnostic: _QualificationPythonPreflight,
+) -> str:
+    _validate_qualification_python_preflight(diagnostic)
+    candidate_probe_failed = diagnostic.candidate_probe_rc != 0
+    base_probe_failed = diagnostic.base_probe_rc != 0
+    candidate_missing = bool(diagnostic.candidate_elf.missing_libraries)
+    base_missing = bool(diagnostic.base_elf.missing_libraries)
+    candidate_elf_invalid = (
+        not diagnostic.candidate_elf.dynamic
+        or not diagnostic.candidate_elf.interpreter_present
+    )
+    base_elf_invalid = (
+        not diagnostic.base_elf.dynamic
+        or not diagnostic.base_elf.interpreter_present
+    )
+    if candidate_probe_failed and base_probe_failed:
+        return "BOTH_PYTHON_PROBES_FAILED"
+    if candidate_probe_failed:
+        return "CANDIDATE_PYTHON_PROBE_FAILED"
+    if base_probe_failed:
+        return "BASE_PYTHON_PROBE_FAILED"
+    if candidate_missing and base_missing:
+        return "BOTH_PYTHONS_MISSING_LIBRARY"
+    if candidate_missing:
+        return "CANDIDATE_PYTHON_MISSING_LIBRARY"
+    if base_missing:
+        return "BASE_PYTHON_MISSING_LIBRARY"
+    if candidate_elf_invalid and base_elf_invalid:
+        return "BOTH_ELF_INVALID"
+    if candidate_elf_invalid:
+        return "CANDIDATE_ELF_INVALID"
+    if base_elf_invalid:
+        return "BASE_ELF_INVALID"
+    return "QUALIFICATION_PYTHON_PREFLIGHT_UNCLASSIFIED"
 
 
 def _lexically_inside(path: Path, root: Path) -> bool:
@@ -2251,10 +2429,18 @@ def test_container_python_preflight_requires_both_runtimes_and_clean_elf() -> No
 
 
 @pytest.mark.parametrize(
-    "candidate_rc,base_rc,candidate_elf,base_elf",
+    "candidate_rc,base_rc,candidate_elf,base_elf,classification",
     (
-        (127, 0, _ELF_OK, _ELF_OK),
-        (0, 127, _ELF_OK, _ELF_OK),
+        (127, 127, _ELF_OK, _ELF_OK, "BOTH_PYTHON_PROBES_FAILED"),
+        (127, 0, _ELF_OK, _ELF_OK, "CANDIDATE_PYTHON_PROBE_FAILED"),
+        (0, 127, _ELF_OK, _ELF_OK, "BASE_PYTHON_PROBE_FAILED"),
+        (
+            0,
+            0,
+            _ElfDependencyDiagnostic(True, True, (_LIBPYTHON_SONAME,)),
+            _ElfDependencyDiagnostic(True, True, (_LIBPYTHON_SONAME,)),
+            "BOTH_PYTHONS_MISSING_LIBRARY",
+        ),
         (
             0,
             0,
@@ -2262,6 +2448,7 @@ def test_container_python_preflight_requires_both_runtimes_and_clean_elf() -> No
                 True, True, (_LIBPYTHON_SONAME,),
             ),
             _ELF_OK,
+            "CANDIDATE_PYTHON_MISSING_LIBRARY",
         ),
         (
             0,
@@ -2270,6 +2457,28 @@ def test_container_python_preflight_requires_both_runtimes_and_clean_elf() -> No
             _ElfDependencyDiagnostic(
                 True, True, (_LIBPYTHON_SONAME,),
             ),
+            "BASE_PYTHON_MISSING_LIBRARY",
+        ),
+        (
+            0,
+            0,
+            _ElfDependencyDiagnostic(False, False, ()),
+            _ElfDependencyDiagnostic(False, False, ()),
+            "BOTH_ELF_INVALID",
+        ),
+        (
+            0,
+            0,
+            _ElfDependencyDiagnostic(False, False, ()),
+            _ELF_OK,
+            "CANDIDATE_ELF_INVALID",
+        ),
+        (
+            0,
+            0,
+            _ELF_OK,
+            _ElfDependencyDiagnostic(False, False, ()),
+            "BASE_ELF_INVALID",
         ),
     ),
 )
@@ -2278,13 +2487,22 @@ def test_container_python_preflight_fails_closed_before_workload(
     base_rc: int,
     candidate_elf: _ElfDependencyDiagnostic,
     base_elf: _ElfDependencyDiagnostic,
+    classification: str,
 ) -> None:
-    probe_results = iter((candidate_rc, base_rc))
-    elf_results = iter((candidate_elf, base_elf))
-    with pytest.raises(
-        AssertionError,
-        match="QUALIFICATION_PYTHON_PREFLIGHT_INVALID",
-    ):
+    probe_results = [candidate_rc, base_rc]
+    elf_results = [candidate_elf, base_elf]
+    probe_calls = []
+    elf_calls = []
+
+    def python_probe(*args):
+        probe_calls.append(args)
+        return probe_results[len(probe_calls) - 1]
+
+    def elf_probe(*args):
+        elf_calls.append(args)
+        return elf_results[len(elf_calls) - 1]
+
+    with pytest.raises(_QualificationPythonPreflightError) as raised:
         _verify_container_python_preflight(
             leader=4321,
             runtime_uid=998,
@@ -2293,9 +2511,118 @@ def test_container_python_preflight_fails_closed_before_workload(
                 "/run/pdi-p3d-wp7-runtime.A1b2C3/bin/python"
             ),
             candidate="a" * 40,
-            python_probe=lambda *args: next(probe_results),
-            elf_probe=lambda *args: next(elf_results),
+            python_probe=python_probe,
+            elf_probe=elf_probe,
         )
+    error = raised.value
+    assert error.classification == classification
+    assert set(error.__dict__) == {
+        "candidate_probe_rc",
+        "base_probe_rc",
+        "candidate_elf",
+        "base_elf",
+        "classification",
+    }
+    assert len(probe_calls) == 2
+    assert len(elf_calls) == 2
+    output = error.safe_message()
+    values = dict(line.split("=", 1) for line in output.splitlines())
+    assert values == {
+        "QUALIFICATION_PYTHON_PREFLIGHT": "FAIL",
+        "CONTAINER_BASE_PYTHON_PROBE_RC": str(base_rc),
+        "CONTAINER_CANDIDATE_PYTHON_PROBE_RC": str(candidate_rc),
+        "BASE_PYTHON_ELF_DYNAMIC": "YES" if base_elf.dynamic else "NO",
+        "BASE_PYTHON_INTERPRETER_PRESENT": (
+            "YES" if base_elf.interpreter_present else "NO"
+        ),
+        "BASE_PYTHON_MISSING_LIBRARY_COUNT": str(
+            len(base_elf.missing_libraries)
+        ),
+        "BASE_PYTHON_MISSING_LIBRARIES": (
+            ",".join(base_elf.missing_libraries) or "NONE"
+        ),
+        "CANDIDATE_PYTHON_ELF_DYNAMIC": (
+            "YES" if candidate_elf.dynamic else "NO"
+        ),
+        "CANDIDATE_PYTHON_INTERPRETER_PRESENT": (
+            "YES" if candidate_elf.interpreter_present else "NO"
+        ),
+        "CANDIDATE_PYTHON_MISSING_LIBRARY_COUNT": str(
+            len(candidate_elf.missing_libraries)
+        ),
+        "CANDIDATE_PYTHON_MISSING_LIBRARIES": (
+            ",".join(candidate_elf.missing_libraries) or "NONE"
+        ),
+        "QUALIFICATION_PYTHON_PREFLIGHT_CLASS": classification,
+    }
+    assert "/" not in output
+    assert "not found" not in output
+    assert not any(marker in output for marker in _PROTECTED_SECRET_MARKERS)
+
+
+@pytest.mark.parametrize(
+    "diagnostic,classification",
+    (
+        (
+            _QualificationPythonPreflight(
+                "0", 0, _ELF_OK, _ELF_OK,  # type: ignore[arg-type]
+            ),
+            "QUALIFICATION_PYTHON_PREFLIGHT_UNCLASSIFIED",
+        ),
+        (
+            _QualificationPythonPreflight(
+                0,
+                0,
+                _ElfDependencyDiagnostic(True, True, ("/tmp/libpython.so",)),
+                _ELF_OK,
+            ),
+            "CANDIDATE_PYTHON_MISSING_LIBRARY",
+        ),
+        (
+            _QualificationPythonPreflight(
+                0,
+                0,
+                _ElfDependencyDiagnostic(
+                    True, True, ("libpython.so => not found",),
+                ),
+                _ELF_OK,
+            ),
+            "CANDIDATE_PYTHON_MISSING_LIBRARY",
+        ),
+        (
+            _QualificationPythonPreflight(0, 0, _ELF_OK, _ELF_OK),
+            "FREE_FORM_CLASSIFICATION",
+        ),
+    ),
+)
+def test_python_preflight_safe_serialization_rejects_non_allowlisted_values(
+    diagnostic: _QualificationPythonPreflight,
+    classification: str,
+) -> None:
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_PYTHON_PREFLIGHT_DIAGNOSTIC_REJECTED",
+    ):
+        diagnostic.safe_values(classification)
+
+
+def test_python_preflight_classification_priority_is_deterministic() -> None:
+    diagnostic = _QualificationPythonPreflight(
+        127,
+        127,
+        _ElfDependencyDiagnostic(False, False, (_LIBPYTHON_SONAME,)),
+        _ElfDependencyDiagnostic(False, False, (_LIBPYTHON_SONAME,)),
+    )
+    assert (
+        _qualification_python_preflight_failure_class(diagnostic)
+        == "BOTH_PYTHON_PROBES_FAILED"
+    )
+    assert (
+        _qualification_python_preflight_failure_class(
+            _QualificationPythonPreflight(0, 0, _ELF_OK, _ELF_OK)
+        )
+        == "QUALIFICATION_PYTHON_PREFLIGHT_UNCLASSIFIED"
+    )
 
 
 def test_rootfs_default_target_remains_basic_target(
@@ -3556,13 +3883,19 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                     "synthetic-immich-api-key",
                 ),
             )
-            python_preflight = _verify_container_python_preflight(
-                leader=leader,
-                runtime_uid=account.pw_uid,
-                runtime_gid=group.gr_gid,
-                system_python=system_python,
-                candidate=candidate,
-            )
+            try:
+                python_preflight = _verify_container_python_preflight(
+                    leader=leader,
+                    runtime_uid=account.pw_uid,
+                    runtime_gid=group.gr_gid,
+                    system_python=system_python,
+                    candidate=candidate,
+                )
+            except _QualificationPythonPreflightError as exc:
+                print(exc.safe_message())
+                raise AssertionError(
+                    "QUALIFICATION_PYTHON_PREFLIGHT_INVALID"
+                ) from None
             assert trusted_libpython.path.name == _LIBPYTHON_SONAME
             print("LOADER_CACHE_LIBPYTHON_ENTRY_COUNT=1")
             print("LOADER_CACHE_LIBPYTHON_TARGET_TRUSTED=PASS")
