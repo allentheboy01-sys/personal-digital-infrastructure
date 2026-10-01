@@ -73,7 +73,10 @@ SYSTEMD_RUN = Path("/usr/bin/systemd-run")
 SYSTEMCTL = Path("/usr/bin/systemctl")
 READELF = Path("/usr/bin/readelf")
 LDD = Path("/usr/bin/ldd")
+LDCONFIG = Path("/sbin/ldconfig")
+_LIBPYTHON_SONAME = "libpython3.13.so.1.0"
 _DIAGNOSTIC_LIMIT = 64 * 1024
+_LOADER_CACHE_OUTPUT_LIMIT = 4 * 1024 * 1024
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(DATABASE__URL|PASSWORD|API[_-]?KEY|ACCESS[_-]?TOKEN|"
     r"REFRESH[_-]?TOKEN|OAUTH|SECRET)\b\s*[:=]\s*"
@@ -174,6 +177,24 @@ class _ElfDependencyDiagnostic:
     dynamic: bool
     interpreter_present: bool
     missing_libraries: tuple[str, ...]
+
+
+_ELF_OK = _ElfDependencyDiagnostic(True, True, ())
+
+
+@dataclass(frozen=True)
+class _TrustedLibpython:
+    path: Path
+    directory: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _QualificationPythonPreflight:
+    candidate_probe_rc: int
+    base_probe_rc: int
+    candidate_elf: _ElfDependencyDiagnostic
+    base_elf: _ElfDependencyDiagnostic
 
 
 @dataclass(frozen=True)
@@ -470,6 +491,234 @@ def _verify_qualification_runtime_root(system_python: Path) -> Path:
     ):
         raise AssertionError("QUALIFICATION_RUNTIME_INVALID")
     return runtime_root
+
+
+def _validate_trusted_libpython_candidate(
+    runtime_root: Path,
+    candidate: Path,
+) -> _TrustedLibpython:
+    try:
+        runtime_resolved = runtime_root.resolve(strict=True)
+        candidate_resolved = candidate.resolve(strict=True)
+        candidate_info = candidate.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise AssertionError("QUALIFICATION_LIBPYTHON_INVALID") from exc
+    if (
+        runtime_resolved != runtime_root
+        or candidate_resolved != candidate
+        or candidate.name != _LIBPYTHON_SONAME
+        or runtime_root not in candidate.parents
+        or not stat.S_ISREG(candidate_info.st_mode)
+        or stat.S_ISLNK(candidate_info.st_mode)
+        or candidate_info.st_uid != 0
+        or candidate_info.st_gid != 0
+        or candidate_info.st_mode & 0o022
+        or candidate_info.st_size <= 0
+    ):
+        raise AssertionError("QUALIFICATION_LIBPYTHON_INVALID")
+    parent = candidate.parent
+    while True:
+        try:
+            parent_info = parent.lstat()
+            parent_resolved = parent.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise AssertionError("QUALIFICATION_LIBPYTHON_INVALID") from exc
+        if (
+            parent_resolved != parent
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_ISLNK(parent_info.st_mode)
+            or parent_info.st_uid != 0
+            or parent_info.st_gid != 0
+            or parent_info.st_mode & 0o022
+        ):
+            raise AssertionError("QUALIFICATION_LIBPYTHON_INVALID")
+        if parent == runtime_root:
+            break
+        if runtime_root not in parent.parents:
+            raise AssertionError("QUALIFICATION_LIBPYTHON_INVALID")
+        parent = parent.parent
+    try:
+        digest = sha256(candidate.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise AssertionError("QUALIFICATION_LIBPYTHON_INVALID") from exc
+    return _TrustedLibpython(candidate, candidate.parent, digest)
+
+
+def _discover_trusted_libpython(runtime_root: Path) -> _TrustedLibpython:
+    try:
+        candidates = tuple(sorted(runtime_root.rglob(_LIBPYTHON_SONAME)))
+    except OSError as exc:
+        raise AssertionError("QUALIFICATION_LIBPYTHON_INVALID") from exc
+    if len(candidates) != 1:
+        raise AssertionError("QUALIFICATION_LIBPYTHON_CARDINALITY_INVALID")
+    return _validate_trusted_libpython_candidate(runtime_root, candidates[0])
+
+
+def _validate_trusted_executable(path: Path) -> Path:
+    if not path.is_absolute():
+        raise AssertionError("QUALIFICATION_LDCONFIG_INVALID")
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except (OSError, RuntimeError) as exc:
+        raise AssertionError("QUALIFICATION_LDCONFIG_INVALID") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_mode & 0o022
+        or not info.st_mode & stat.S_IXUSR
+    ):
+        raise AssertionError("QUALIFICATION_LDCONFIG_INVALID")
+    parent = resolved.parent
+    while True:
+        try:
+            parent_info = parent.lstat()
+        except OSError as exc:
+            raise AssertionError("QUALIFICATION_LDCONFIG_INVALID") from exc
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or stat.S_ISLNK(parent_info.st_mode)
+            or parent_info.st_uid != 0
+            or parent_info.st_gid != 0
+            or parent_info.st_mode & 0o022
+        ):
+            raise AssertionError("QUALIFICATION_LDCONFIG_INVALID")
+        if parent == Path("/"):
+            break
+        parent = parent.parent
+    return resolved
+
+
+def _loader_cache_build_command(
+    root: Path,
+    configuration: Path,
+) -> tuple[str, ...]:
+    return (
+        str(LDCONFIG),
+        "-C", str(root / "etc/ld.so.cache"),
+        "-f", str(configuration),
+        "-X",
+        "--ignore-aux-cache",
+    )
+
+
+def _loader_cache_inspect_command(root: Path) -> tuple[str, ...]:
+    return (str(LDCONFIG), "-p", "-C", str(root / "etc/ld.so.cache"))
+
+
+def _validate_loader_cache_listing(
+    payload: str,
+    trusted: _TrustedLibpython,
+) -> None:
+    if (
+        len(payload.encode("utf-8")) > _LOADER_CACHE_OUTPUT_LIMIT
+        or "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+    ):
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    matches: list[Path] = []
+    expression = re.compile(
+        rf"\s*{re.escape(_LIBPYTHON_SONAME)}\s+"
+        r"\([^()\r\n]+\)\s+=>\s+(/[A-Za-z0-9_./+-]+)\s*"
+    )
+    for line in payload.splitlines():
+        if _LIBPYTHON_SONAME not in line:
+            continue
+        matched = expression.fullmatch(line)
+        if matched is None:
+            raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+        matches.append(Path(matched.group(1)))
+    if len(matches) != 1 or matches[0] != trusted.path:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+
+
+def _assert_loader_cache_file(cache: Path) -> None:
+    try:
+        info = cache.lstat()
+        resolved = cache.resolve(strict=True)
+        parent_info = cache.parent.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID") from exc
+    if (
+        resolved != cache
+        or not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o644
+        or info.st_size <= 0
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or parent_info.st_mode & 0o022
+    ):
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+
+
+def _materialize_disposable_loader_cache(
+    root: Path,
+    runtime_root: Path,
+    *,
+    runner=subprocess.run,
+) -> _TrustedLibpython:
+    trusted = _discover_trusted_libpython(runtime_root)
+    _validate_trusted_executable(LDCONFIG)
+    cache = root / "etc/ld.so.cache"
+    configuration = root / "var/lib/pdi-p3d/ld.so.conf.wp7"
+    if (
+        cache.exists()
+        or cache.is_symlink()
+        or configuration.exists()
+        or configuration.is_symlink()
+    ):
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    descriptor = os.open(
+        configuration,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.fchown(descriptor, 0, 0)
+        os.fchmod(descriptor, 0o600)
+        payload = f"{trusted.directory}\n".encode("utf-8")
+        written = os.write(descriptor, payload)
+        if written != len(payload):
+            raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        generated = runner(
+            _loader_cache_build_command(root, configuration),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            shell=False,
+        )
+    finally:
+        configuration.unlink(missing_ok=True)
+    if generated.returncode != 0 or generated.stdout or generated.stderr:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    _assert_loader_cache_file(cache)
+    inspected = runner(
+        _loader_cache_inspect_command(root),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        shell=False,
+    )
+    if inspected.returncode != 0 or inspected.stderr:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    _validate_loader_cache_listing(inspected.stdout, trusted)
+    if _discover_trusted_libpython(runtime_root) != trusted:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    return trusted
 
 
 def _assert_candidate_venv_runtime_authority(
@@ -1032,6 +1281,48 @@ def _elf_dependency_diagnostic(
             dependencies.stdout + "\n" + dependencies.stderr
         )
     return _ElfDependencyDiagnostic(dynamic, interpreter_present, missing)
+
+
+def _verify_container_python_preflight(
+    *,
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    system_python: Path,
+    candidate: str,
+    python_probe=_container_python_probe,
+    elf_probe=_elf_dependency_diagnostic,
+) -> _QualificationPythonPreflight:
+    if re.fullmatch(r"[0-9a-f]{40}", candidate) is None:
+        raise AssertionError("QUALIFICATION_PYTHON_PREFLIGHT_INVALID")
+    candidate_python = (
+        Path("/opt/pdi/releases") / candidate / ".venv/bin/python"
+    )
+    candidate_rc = python_probe(
+        leader, runtime_uid, runtime_gid, candidate_python,
+    )
+    base_rc = python_probe(leader, runtime_uid, runtime_gid, system_python)
+    candidate_elf = elf_probe(
+        leader, runtime_uid, runtime_gid, candidate_python,
+    )
+    base_elf = elf_probe(leader, runtime_uid, runtime_gid, system_python)
+    if (
+        candidate_rc != 0
+        or base_rc != 0
+        or not candidate_elf.dynamic
+        or not candidate_elf.interpreter_present
+        or candidate_elf.missing_libraries
+        or not base_elf.dynamic
+        or not base_elf.interpreter_present
+        or base_elf.missing_libraries
+    ):
+        raise AssertionError("QUALIFICATION_PYTHON_PREFLIGHT_INVALID")
+    return _QualificationPythonPreflight(
+        candidate_rc,
+        base_rc,
+        candidate_elf,
+        base_elf,
+    )
 
 
 def _lexically_inside(path: Path, root: Path) -> bool:
@@ -1644,6 +1935,17 @@ def _directory_stat(mode: int = 0o755, uid: int = 0, gid: int = 0) -> os.stat_re
     return os.stat_result((stat.S_IFDIR | mode, 0, 0, 1, uid, gid, 0, 0, 0, 0))
 
 
+def _regular_stat(
+    mode: int = 0o644,
+    uid: int = 0,
+    gid: int = 0,
+    size: int = 1,
+) -> os.stat_result:
+    return os.stat_result(
+        (stat.S_IFREG | mode, 0, 0, 1, uid, gid, size, 0, 0, 0)
+    )
+
+
 def _symlink_stat() -> os.stat_result:
     return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
 
@@ -1714,6 +2016,285 @@ def test_qualification_runtime_rejects_untrusted_path_facts(
             resolved=resolved,
             runtime_info=runtime_info,
             run_info=run_info,
+        )
+
+
+def _runtime_libpython_fixture(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    file_mode: int = 0o644,
+    file_size: int = 7,
+) -> tuple[Path, Path]:
+    runtime = tmp_path / "pdi-p3d-wp7-runtime.A1b2C3"
+    directory = runtime / "lib"
+    directory.mkdir(parents=True)
+    library = directory / _LIBPYTHON_SONAME
+    library.write_bytes(b"runtime" if file_size else b"")
+    original_lstat = Path.lstat
+    facts = {
+        runtime: _directory_stat(),
+        directory: _directory_stat(),
+        library: _regular_stat(mode=file_mode, size=file_size),
+    }
+
+    def trusted_lstat(path: Path):
+        return facts.get(path, original_lstat(path))
+
+    monkeypatch.setattr(Path, "lstat", trusted_lstat)
+    return runtime, library
+
+
+def test_trusted_runtime_libpython_exactly_one_is_accepted(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime, library = _runtime_libpython_fixture(tmp_path, monkeypatch)
+    trusted = _discover_trusted_libpython(runtime)
+    assert trusted.path == library
+    assert trusted.directory == library.parent
+    assert trusted.sha256 == sha256(b"runtime").hexdigest()
+
+
+def test_trusted_runtime_libpython_missing_or_multiple_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    missing = tmp_path / "missing-runtime"
+    missing.mkdir()
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_LIBPYTHON_CARDINALITY_INVALID",
+    ):
+        _discover_trusted_libpython(missing)
+
+    runtime, _ = _runtime_libpython_fixture(tmp_path, monkeypatch)
+    duplicate = runtime / "alt" / _LIBPYTHON_SONAME
+    duplicate.parent.mkdir()
+    duplicate.write_bytes(b"duplicate")
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_LIBPYTHON_CARDINALITY_INVALID",
+    ):
+        _discover_trusted_libpython(runtime)
+
+
+def test_trusted_runtime_libpython_outside_runtime_is_rejected(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    outside = tmp_path / _LIBPYTHON_SONAME
+    outside.write_bytes(b"outside")
+    with pytest.raises(AssertionError, match="QUALIFICATION_LIBPYTHON_INVALID"):
+        _validate_trusted_libpython_candidate(runtime, outside)
+
+
+@pytest.mark.parametrize("file_mode,file_size", ((0o664, 7), (0o644, 0)))
+def test_trusted_runtime_libpython_writable_or_empty_is_rejected(
+    tmp_path: Path,
+    monkeypatch,
+    file_mode: int,
+    file_size: int,
+) -> None:
+    runtime, _ = _runtime_libpython_fixture(
+        tmp_path,
+        monkeypatch,
+        file_mode=file_mode,
+        file_size=file_size,
+    )
+    with pytest.raises(AssertionError, match="QUALIFICATION_LIBPYTHON_INVALID"):
+        _discover_trusted_libpython(runtime)
+
+
+def test_loader_cache_requires_exact_soname_and_trusted_target() -> None:
+    trusted_path = Path(
+        "/run/pdi-p3d-wp7-runtime.A1b2C3/lib/libpython3.13.so.1.0"
+    )
+    trusted = _TrustedLibpython(
+        trusted_path,
+        trusted_path.parent,
+        "1" * 64,
+    )
+    payload = (
+        "1 libs found in cache `/root/etc/ld.so.cache'\n"
+        "\tlibpython3.13.so.1.0 (libc6,x86-64) => "
+        f"{trusted_path}\n"
+    )
+    _validate_loader_cache_listing(payload, trusted)
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_LOADER_CACHE_INVALID",
+    ):
+        _validate_loader_cache_listing("0 libs found in cache\n", trusted)
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_LOADER_CACHE_INVALID",
+    ):
+        _validate_loader_cache_listing(
+            payload.replace(str(trusted_path), "/usr/lib/libpython3.13.so.1.0"),
+            trusted,
+        )
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_LOADER_CACHE_INVALID",
+    ):
+        _validate_loader_cache_listing(payload + payload.splitlines()[-1], trusted)
+
+
+def test_loader_cache_commands_are_fixed_nonmutating_host_invocations() -> None:
+    root = Path("/tmp/pdi-p3d-rehearsal-synthetic")
+    configuration = root / "var/lib/pdi-p3d/ld.so.conf.wp7"
+    assert _loader_cache_build_command(root, configuration) == (
+        "/sbin/ldconfig",
+        "-C", "/tmp/pdi-p3d-rehearsal-synthetic/etc/ld.so.cache",
+        "-f", str(configuration),
+        "-X",
+        "--ignore-aux-cache",
+    )
+    assert _loader_cache_inspect_command(root) == (
+        "/sbin/ldconfig",
+        "-p",
+        "-C", "/tmp/pdi-p3d-rehearsal-synthetic/etc/ld.so.cache",
+    )
+    combined = " ".join(_loader_cache_build_command(root, configuration))
+    assert "LD_LIBRARY_PATH" not in combined
+    assert "LD_PRELOAD" not in combined
+    assert "patchelf" not in combined
+
+
+def test_loader_cache_materialization_uses_fixed_env_and_shell_false(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "rehearsal"
+    (root / "etc").mkdir(parents=True)
+    (root / "var/lib/pdi-p3d").mkdir(parents=True)
+    runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
+    library = runtime / "lib" / _LIBPYTHON_SONAME
+    trusted = _TrustedLibpython(library, library.parent, "1" * 64)
+    discoveries = []
+    commands = []
+    listings = []
+
+    def discover(selected: Path) -> _TrustedLibpython:
+        discoveries.append(selected)
+        return trusted
+
+    def runner(argv, **kwargs):
+        commands.append((tuple(argv), kwargs))
+        if "-p" in argv:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                f"\t{_LIBPYTHON_SONAME} (libc6,x86-64) => {library}\n",
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setitem(globals(), "_discover_trusted_libpython", discover)
+    monkeypatch.setitem(
+        globals(), "_validate_trusted_executable", lambda path: path,
+    )
+    monkeypatch.setitem(globals(), "_assert_loader_cache_file", lambda path: None)
+    monkeypatch.setitem(
+        globals(),
+        "_validate_loader_cache_listing",
+        lambda payload, selected: listings.append((payload, selected)),
+    )
+    monkeypatch.setattr(os, "fchown", lambda *args: None)
+    monkeypatch.setattr(os, "fchmod", lambda *args: None)
+
+    assert _materialize_disposable_loader_cache(
+        root,
+        runtime,
+        runner=runner,
+    ) == trusted
+    assert discoveries == [runtime, runtime]
+    assert listings and listings[0][1] == trusted
+    assert len(commands) == 2
+    assert all(command[1]["shell"] is False for command in commands)
+    assert all(command[1]["env"] == {
+        "PATH": "/usr/bin:/bin", "LC_ALL": "C",
+    } for command in commands)
+    assert not (root / "var/lib/pdi-p3d/ld.so.conf.wp7").exists()
+
+
+def test_container_python_preflight_requires_both_runtimes_and_clean_elf() -> None:
+    probed = []
+    inspected = []
+
+    def python_probe(leader, uid, gid, python):
+        probed.append((leader, uid, gid, python))
+        return 0
+
+    def elf_probe(leader, uid, gid, python):
+        inspected.append((leader, uid, gid, python))
+        return _ELF_OK
+
+    candidate = "a" * 40
+    result = _verify_container_python_preflight(
+        leader=4321,
+        runtime_uid=998,
+        runtime_gid=997,
+        system_python=Path("/run/pdi-p3d-wp7-runtime.A1b2C3/bin/python"),
+        candidate=candidate,
+        python_probe=python_probe,
+        elf_probe=elf_probe,
+    )
+    assert result.candidate_probe_rc == 0 and result.base_probe_rc == 0
+    assert [item[-1] for item in probed] == [
+        Path(f"/opt/pdi/releases/{candidate}/.venv/bin/python"),
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3/bin/python"),
+    ]
+    assert inspected == probed
+
+
+@pytest.mark.parametrize(
+    "candidate_rc,base_rc,candidate_elf,base_elf",
+    (
+        (127, 0, _ELF_OK, _ELF_OK),
+        (0, 127, _ELF_OK, _ELF_OK),
+        (
+            0,
+            0,
+            _ElfDependencyDiagnostic(
+                True, True, (_LIBPYTHON_SONAME,),
+            ),
+            _ELF_OK,
+        ),
+        (
+            0,
+            0,
+            _ELF_OK,
+            _ElfDependencyDiagnostic(
+                True, True, (_LIBPYTHON_SONAME,),
+            ),
+        ),
+    ),
+)
+def test_container_python_preflight_fails_closed_before_workload(
+    candidate_rc: int,
+    base_rc: int,
+    candidate_elf: _ElfDependencyDiagnostic,
+    base_elf: _ElfDependencyDiagnostic,
+) -> None:
+    probe_results = iter((candidate_rc, base_rc))
+    elf_results = iter((candidate_elf, base_elf))
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_PYTHON_PREFLIGHT_INVALID",
+    ):
+        _verify_container_python_preflight(
+            leader=4321,
+            runtime_uid=998,
+            runtime_gid=997,
+            system_python=Path(
+                "/run/pdi-p3d-wp7-runtime.A1b2C3/bin/python"
+            ),
+            candidate="a" * 40,
+            python_probe=lambda *args: next(probe_results),
+            elf_probe=lambda *args: next(elf_results),
         )
 
 
@@ -2505,9 +3086,6 @@ def test_provider_and_combined_failure_diagnostic_emit_counts_and_allowlists_onl
         _provider_call_counts(("Authorization: secret",))
 
 
-_ELF_OK = _ElfDependencyDiagnostic(True, True, ())
-
-
 @pytest.mark.parametrize(
     "candidate_rc,base_rc,sandbox_rc,candidate_elf,base_elf,physical,logical,expected",
     (
@@ -2784,6 +3362,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     group = grp.getgrnam("pdi")
     assert account.pw_uid > 0 and group.gr_gid > 0 and account.pw_gid == group.gr_gid
     trusted_os_release = _prepare_rootfs(root, account.pw_uid, group.gr_gid)
+    trusted_libpython = _materialize_disposable_loader_cache(root, runtime_root)
     digests = json.loads(digest_path.read_text(encoding="utf-8"))
     assert digests["CANDIDATE_SHA"] == candidate
     assert len(candidate) == 40
@@ -2976,6 +3555,32 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                     "synthetic-nextcloud-password",
                     "synthetic-immich-api-key",
                 ),
+            )
+            python_preflight = _verify_container_python_preflight(
+                leader=leader,
+                runtime_uid=account.pw_uid,
+                runtime_gid=group.gr_gid,
+                system_python=system_python,
+                candidate=candidate,
+            )
+            assert trusted_libpython.path.name == _LIBPYTHON_SONAME
+            print("LOADER_CACHE_LIBPYTHON_ENTRY_COUNT=1")
+            print("LOADER_CACHE_LIBPYTHON_TARGET_TRUSTED=PASS")
+            print(
+                "CONTAINER_BASE_PYTHON_PROBE_RC="
+                f"{python_preflight.base_probe_rc}"
+            )
+            print(
+                "CONTAINER_CANDIDATE_PYTHON_PROBE_RC="
+                f"{python_preflight.candidate_probe_rc}"
+            )
+            print(
+                "BASE_PYTHON_MISSING_LIBRARY_COUNT="
+                f"{len(python_preflight.base_elf.missing_libraries)}"
+            )
+            print(
+                "CANDIDATE_PYTHON_MISSING_LIBRARY_COUNT="
+                f"{len(python_preflight.candidate_elf.missing_libraries)}"
             )
             lock = Path(f"/proc/{leader}/root/run/lock/pdi-sync.lock")
             lock.parent.mkdir(parents=True, exist_ok=True)

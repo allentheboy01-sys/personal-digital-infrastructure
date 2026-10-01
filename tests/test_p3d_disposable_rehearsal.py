@@ -924,3 +924,27 @@ def test_dedicated_ci_keeps_runtime_visible_with_private_tmp() -> None:
     ).read_text()
     assert "runtime_root = _verify_qualification_runtime_root(system_python)" in integration
     assert "_assert_candidate_venv_runtime_authority(" in integration
+
+
+def test_wp7_loader_cache_fix_is_disposable_and_preserves_service_contract() -> None:
+    root = Path(__file__).parents[1]
+    integration = (
+        root / "tests/integration/test_p3d_disposable_rehearsal.py"
+    ).read_text(encoding="utf-8")
+    service = (
+        root / "deployment/systemd/pdi-scoped-pipeline@.service"
+    ).read_text(encoding="utf-8")
+    assert "_materialize_disposable_loader_cache(root, runtime_root)" in integration
+    assert "_verify_container_python_preflight(" in integration
+    assert 'LDCONFIG = Path("/sbin/ldconfig")' in integration
+    assert '"-X"' in integration
+    assert '"--ignore-aux-cache"' in integration
+    assert "LOADER_CACHE_LIBPYTHON_ENTRY_COUNT=1" in integration
+    assert "LOADER_CACHE_LIBPYTHON_TARGET_TRUSTED=PASS" in integration
+    assert "LD_LIBRARY_PATH=" not in integration
+    assert "LD_PRELOAD=" not in integration
+    assert 'Path("/usr/bin/patchelf")' not in integration
+    assert "PrivateTmp=true" in service
+    assert "PrivateTmp=false" not in service
+    assert "LD_LIBRARY_PATH" not in service
+    assert "LD_PRELOAD" not in service
