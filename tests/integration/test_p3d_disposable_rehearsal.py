@@ -74,6 +74,8 @@ SYSTEMCTL = Path("/usr/bin/systemctl")
 READELF = Path("/usr/bin/readelf")
 LDD = Path("/usr/bin/ldd")
 LDCONFIG = Path("/sbin/ldconfig")
+SHA256SUM = Path("/usr/bin/sha256sum")
+TEST = Path("/usr/bin/test")
 _LIBPYTHON_SONAME = "libpython3.13.so.1.0"
 _DIAGNOSTIC_LIMIT = 64 * 1024
 _LOADER_CACHE_OUTPUT_LIMIT = 4 * 1024 * 1024
@@ -111,6 +113,19 @@ _QUALIFICATION_PYTHON_PREFLIGHT_CLASSES = {
     "CANDIDATE_ELF_INVALID",
     "BOTH_ELF_INVALID",
     "QUALIFICATION_PYTHON_PREFLIGHT_UNCLASSIFIED",
+}
+_LOADER_RESULTS = {"RESOLVED", "NOT_FOUND", "INVALID"}
+_CONTAINER_LOADER_CACHE_CLASSES = {
+    "CONTAINER_CACHE_FILE_MISSING",
+    "CONTAINER_CACHE_BYTES_MISMATCH",
+    "CONTAINER_CACHE_LIBPYTHON_ENTRY_MISSING",
+    "CONTAINER_CACHE_LIBPYTHON_ENTRY_AMBIGUOUS",
+    "CONTAINER_CACHE_TARGET_NOT_VISIBLE",
+    "CONTAINER_CACHE_TARGET_IDENTITY_MISMATCH",
+    "QUALIFICATION_RUNTIME_BIND_NOT_VISIBLE",
+    "LOADER_NOT_RESOLVING_VALID_CACHE_ENTRY",
+    "LOADER_CACHE_EFFECTIVE",
+    "LOADER_CACHE_VISIBILITY_UNCLASSIFIED",
 }
 
 
@@ -284,6 +299,182 @@ class _QualificationPythonPreflightError(AssertionError):
             f"{name}={value}"
             for name, value in diagnostic.safe_values(self.classification)
         )
+
+
+@dataclass(frozen=True)
+class _ContainerLoaderCacheDiagnostic:
+    host_cache_present: bool
+    host_cache_sha256_valid: bool
+    container_cache_present: bool
+    container_cache_regular: bool
+    container_cache_bytes_match_host: bool
+    libpython_entry_count: int
+    cache_target_visible: bool
+    cache_target_identity_match: bool
+    base_python_visible: bool
+    libpython_visible: bool
+    base_loader_direct: str
+    candidate_loader_direct: str
+    base_loader_default_cache: str
+    base_loader_inhibit_cache: str
+
+    @property
+    def classification(self) -> str:
+        return _container_loader_cache_classification(self)
+
+    def safe_values(self) -> tuple[tuple[str, str], ...]:
+        _validate_container_loader_cache_diagnostic(self)
+        return (
+            (
+                "HOST_LOADER_CACHE_PRESENT",
+                "YES" if self.host_cache_present else "NO",
+            ),
+            (
+                "HOST_LOADER_CACHE_SHA256_VALID",
+                "PASS" if self.host_cache_sha256_valid else "FAIL",
+            ),
+            (
+                "CONTAINER_LOADER_CACHE_PRESENT",
+                "YES" if self.container_cache_present else "NO",
+            ),
+            (
+                "CONTAINER_LOADER_CACHE_REGULAR",
+                "YES" if self.container_cache_regular else "NO",
+            ),
+            (
+                "CONTAINER_LOADER_CACHE_BYTES_MATCH_HOST",
+                (
+                    "PASS"
+                    if self.container_cache_bytes_match_host
+                    else "FAIL"
+                ),
+            ),
+            (
+                "CONTAINER_CACHE_LIBPYTHON_ENTRY_COUNT",
+                str(self.libpython_entry_count),
+            ),
+            (
+                "CONTAINER_CACHE_LIBPYTHON_ENTRY_PRESENT",
+                "YES" if self.libpython_entry_count > 0 else "NO",
+            ),
+            (
+                "CONTAINER_CACHE_TARGET_VISIBLE",
+                "YES" if self.cache_target_visible else "NO",
+            ),
+            (
+                "CONTAINER_CACHE_TARGET_IDENTITY_MATCH",
+                "PASS" if self.cache_target_identity_match else "FAIL",
+            ),
+            (
+                "CONTAINER_BASE_PYTHON_FILE_VISIBLE",
+                "YES" if self.base_python_visible else "NO",
+            ),
+            (
+                "CONTAINER_LIBPYTHON_FILE_VISIBLE",
+                "YES" if self.libpython_visible else "NO",
+            ),
+            ("BASE_LOADER_DIRECT_LIBPYTHON", self.base_loader_direct),
+            (
+                "CANDIDATE_LOADER_DIRECT_LIBPYTHON",
+                self.candidate_loader_direct,
+            ),
+            (
+                "BASE_LOADER_DEFAULT_CACHE_RESULT",
+                self.base_loader_default_cache,
+            ),
+            (
+                "BASE_LOADER_INHIBIT_CACHE_RESULT",
+                self.base_loader_inhibit_cache,
+            ),
+            (
+                "CONTAINER_LOADER_CACHE_DIAGNOSTIC_CLASS",
+                self.classification,
+            ),
+        )
+
+    def safe_message(self) -> str:
+        return "\n".join(
+            f"{name}={value}" for name, value in self.safe_values()
+        )
+
+
+class _ContainerLoaderCacheDiagnosticError(AssertionError):
+    def __init__(self, diagnostic: _ContainerLoaderCacheDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.safe_message())
+
+
+def _validate_container_loader_cache_diagnostic(
+    diagnostic: _ContainerLoaderCacheDiagnostic,
+) -> None:
+    boolean_values = (
+        diagnostic.host_cache_present,
+        diagnostic.host_cache_sha256_valid,
+        diagnostic.container_cache_present,
+        diagnostic.container_cache_regular,
+        diagnostic.container_cache_bytes_match_host,
+        diagnostic.cache_target_visible,
+        diagnostic.cache_target_identity_match,
+        diagnostic.base_python_visible,
+        diagnostic.libpython_visible,
+    )
+    if (
+        any(not isinstance(value, bool) for value in boolean_values)
+        or not isinstance(diagnostic.libpython_entry_count, int)
+        or isinstance(diagnostic.libpython_entry_count, bool)
+        or not 0 <= diagnostic.libpython_entry_count <= 1024
+        or any(
+            value not in _LOADER_RESULTS
+            for value in (
+                diagnostic.base_loader_direct,
+                diagnostic.candidate_loader_direct,
+                diagnostic.base_loader_default_cache,
+                diagnostic.base_loader_inhibit_cache,
+            )
+        )
+        or diagnostic.classification not in _CONTAINER_LOADER_CACHE_CLASSES
+    ):
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+
+
+def _container_loader_cache_classification(
+    diagnostic: _ContainerLoaderCacheDiagnostic,
+) -> str:
+    if (
+        not diagnostic.host_cache_present
+        or not diagnostic.host_cache_sha256_valid
+    ):
+        return "LOADER_CACHE_VISIBILITY_UNCLASSIFIED"
+    if (
+        not diagnostic.container_cache_present
+        or not diagnostic.container_cache_regular
+    ):
+        return "CONTAINER_CACHE_FILE_MISSING"
+    if not diagnostic.container_cache_bytes_match_host:
+        return "CONTAINER_CACHE_BYTES_MISMATCH"
+    if diagnostic.libpython_entry_count == 0:
+        return "CONTAINER_CACHE_LIBPYTHON_ENTRY_MISSING"
+    if diagnostic.libpython_entry_count != 1:
+        return "CONTAINER_CACHE_LIBPYTHON_ENTRY_AMBIGUOUS"
+    if not diagnostic.cache_target_visible:
+        return "CONTAINER_CACHE_TARGET_NOT_VISIBLE"
+    if not diagnostic.cache_target_identity_match:
+        return "CONTAINER_CACHE_TARGET_IDENTITY_MISMATCH"
+    if not diagnostic.base_python_visible or not diagnostic.libpython_visible:
+        return "QUALIFICATION_RUNTIME_BIND_NOT_VISIBLE"
+    if (
+        diagnostic.base_loader_default_cache == "NOT_FOUND"
+        or diagnostic.candidate_loader_direct == "NOT_FOUND"
+    ):
+        return "LOADER_NOT_RESOLVING_VALID_CACHE_ENTRY"
+    if (
+        diagnostic.base_loader_direct == "RESOLVED"
+        and diagnostic.candidate_loader_direct == "RESOLVED"
+        and diagnostic.base_loader_default_cache == "RESOLVED"
+        and diagnostic.base_loader_inhibit_cache == "NOT_FOUND"
+    ):
+        return "LOADER_CACHE_EFFECTIVE"
+    return "LOADER_CACHE_VISIBILITY_UNCLASSIFIED"
 
 
 @dataclass(frozen=True)
@@ -810,6 +1001,18 @@ def _materialize_disposable_loader_cache(
     return trusted
 
 
+def _host_loader_cache_sha256(root: Path) -> str:
+    cache = root / "etc/ld.so.cache"
+    _assert_loader_cache_file(cache)
+    try:
+        digest = sha256(cache.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID") from exc
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    return digest
+
+
 def _assert_candidate_venv_runtime_authority(
     release: Path,
     *,
@@ -1297,6 +1500,438 @@ def _namespace_capture(
         raise AssertionError("INTERPRETER_DIAGNOSTIC_REJECTED")
     _safe_return_code(result.returncode)
     return result
+
+
+def _validate_diagnostic_namespace_path(path: Path) -> Path:
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or str(path).startswith("//")
+        or ".." in path.parts
+        or str(path) != path.as_posix()
+        or any(ord(char) < 33 or ord(char) > 126 for char in str(path))
+    ):
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    return path
+
+
+def _namespace_test_path(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    flag: str,
+    path: Path,
+    *,
+    capture=_namespace_capture,
+) -> bool:
+    if flag not in {"-e", "-f", "-L", "-s"}:
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    selected = _validate_diagnostic_namespace_path(path)
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(TEST), flag, str(selected)),
+    )
+    if result.returncode not in {0, 1} or result.stdout or result.stderr:
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    return result.returncode == 0
+
+
+def _namespace_regular_nonempty_file(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    path: Path,
+    *,
+    capture=_namespace_capture,
+) -> tuple[bool, bool]:
+    present = _namespace_test_path(
+        leader, runtime_uid, runtime_gid, "-e", path, capture=capture,
+    )
+    regular = _namespace_test_path(
+        leader, runtime_uid, runtime_gid, "-f", path, capture=capture,
+    )
+    symlink = _namespace_test_path(
+        leader, runtime_uid, runtime_gid, "-L", path, capture=capture,
+    )
+    nonempty = _namespace_test_path(
+        leader, runtime_uid, runtime_gid, "-s", path, capture=capture,
+    )
+    return present, present and regular and not symlink and nonempty
+
+
+def _namespace_file_sha256(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    path: Path,
+    *,
+    capture=_namespace_capture,
+) -> str:
+    selected = _validate_diagnostic_namespace_path(path)
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(SHA256SUM), str(selected)),
+    )
+    matched = re.fullmatch(
+        rf"([0-9a-f]{{64}})  {re.escape(str(selected))}\n?",
+        result.stdout,
+    )
+    if result.returncode != 0 or result.stderr or matched is None:
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    return matched.group(1)
+
+
+def _container_cache_libpython_targets(payload: str) -> tuple[Path, ...]:
+    if (
+        len(payload.encode("utf-8")) > _LOADER_CACHE_OUTPUT_LIMIT
+        or "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+        or _SECRET_ASSIGNMENT.search(payload)
+        or any(marker in payload for marker in _PROTECTED_SECRET_MARKERS)
+    ):
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    expression = re.compile(
+        rf"\s*{re.escape(_LIBPYTHON_SONAME)}\s+"
+        r"\([^()\r\n]+\)\s+=>\s+(/[A-Za-z0-9_./+-]+)\s*"
+    )
+    targets: list[Path] = []
+    for line in payload.splitlines():
+        if _LIBPYTHON_SONAME not in line:
+            continue
+        matched = expression.fullmatch(line)
+        if matched is None:
+            raise AssertionError(
+                "CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED"
+            )
+        raw_target = matched.group(1)
+        target = _validate_diagnostic_namespace_path(Path(raw_target))
+        if target.name != _LIBPYTHON_SONAME or target.as_posix() != raw_target:
+            raise AssertionError(
+                "CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED"
+            )
+        targets.append(target)
+    return tuple(targets)
+
+
+def _container_cache_targets_from_namespace(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    *,
+    capture=_namespace_capture,
+) -> tuple[Path, ...]:
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(LDCONFIG), "-p", "-C", "/etc/ld.so.cache"),
+    )
+    if result.returncode != 0 or result.stderr:
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    return _container_cache_libpython_targets(result.stdout)
+
+
+def _container_elf_interpreter(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    binary: Path,
+    *,
+    capture=_namespace_capture,
+) -> Path | None:
+    selected = _validate_diagnostic_namespace_path(binary)
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(READELF), "--program-headers", "--wide", str(selected)),
+    )
+    payload = result.stdout + "\n" + result.stderr
+    if (
+        len(payload.encode("utf-8")) > _DIAGNOSTIC_LIMIT
+        or "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+        or _SECRET_ASSIGNMENT.search(payload)
+        or any(marker in payload for marker in _PROTECTED_SECRET_MARKERS)
+    ):
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    interpreters = _ELF_INTERPRETER.findall(result.stdout)
+    if result.returncode != 0 or result.stderr or len(interpreters) != 1:
+        return None
+    interpreter = _validate_diagnostic_namespace_path(Path(interpreters[0]))
+    if not _namespace_test_path(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        "-e",
+        interpreter,
+        capture=capture,
+    ):
+        return None
+    return interpreter
+
+
+def _loader_libpython_result(
+    result: subprocess.CompletedProcess[str],
+    trusted: _TrustedLibpython,
+) -> str:
+    payload = result.stdout + "\n" + result.stderr
+    if (
+        len(payload.encode("utf-8")) > _DIAGNOSTIC_LIMIT
+        or "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+        or _SECRET_ASSIGNMENT.search(payload)
+        or any(marker in payload for marker in _PROTECTED_SECRET_MARKERS)
+    ):
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    _safe_return_code(result.returncode)
+    missing_line = re.compile(
+        rf"\s*{re.escape(_LIBPYTHON_SONAME)}\s+=>\s+not found\s*"
+    )
+    resolved_line = re.compile(
+        rf"\s*{re.escape(_LIBPYTHON_SONAME)}\s+=>\s+"
+        r"(/[A-Za-z0-9_./+-]+)\s+\(0x[0-9A-Fa-f]+\)\s*"
+    )
+    matching_lines = [
+        line for line in payload.splitlines() if _LIBPYTHON_SONAME in line
+    ]
+    if len(matching_lines) == 1:
+        if missing_line.fullmatch(matching_lines[0]):
+            return "NOT_FOUND"
+        resolved = resolved_line.fullmatch(matching_lines[0])
+        if resolved is not None:
+            raw_target = resolved.group(1)
+            target = _validate_diagnostic_namespace_path(Path(raw_target))
+            if target.as_posix() == raw_target and target == trusted.path:
+                return "RESOLVED"
+    if (
+        result.returncode != 0
+        and _LIBPYTHON_SONAME in payload
+        and "cannot open shared object file" in payload
+        and "No such file or directory" in payload
+    ):
+        return "NOT_FOUND"
+    return "INVALID"
+
+
+def _direct_loader_probe(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    interpreter: Path | None,
+    binary: Path,
+    trusted: _TrustedLibpython,
+    *,
+    inhibit_cache: bool = False,
+    capture=_namespace_capture,
+) -> str:
+    if interpreter is None:
+        return "INVALID"
+    selected_binary = _validate_diagnostic_namespace_path(binary)
+    command = [str(interpreter)]
+    if inhibit_cache:
+        command.append("--inhibit-cache")
+    command.extend(("--list", str(selected_binary)))
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        tuple(command),
+    )
+    return _loader_libpython_result(result, trusted)
+
+
+def _collect_container_loader_cache_diagnostic(
+    *,
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    system_python: Path,
+    candidate: str,
+    runtime_root: Path,
+    trusted: _TrustedLibpython,
+    host_cache_sha256: str,
+    capture=_namespace_capture,
+) -> _ContainerLoaderCacheDiagnostic:
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", candidate) is None
+        or re.fullmatch(r"[0-9a-f]{64}", host_cache_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", trusted.sha256) is None
+        or trusted.path.name != _LIBPYTHON_SONAME
+        or runtime_root not in trusted.path.parents
+    ):
+        raise AssertionError("CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED")
+    cache = Path("/etc/ld.so.cache")
+    candidate_python = (
+        Path("/opt/pdi/releases") / candidate / ".venv/bin/python"
+    )
+    container_cache_present, container_cache_regular = (
+        _namespace_regular_nonempty_file(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            cache,
+            capture=capture,
+        )
+    )
+    cache_bytes_match = False
+    targets: tuple[Path, ...] = ()
+    if container_cache_regular:
+        cache_bytes_match = (
+            _namespace_file_sha256(
+                leader,
+                runtime_uid,
+                runtime_gid,
+                cache,
+                capture=capture,
+            )
+            == host_cache_sha256
+        )
+        targets = _container_cache_targets_from_namespace(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            capture=capture,
+        )
+
+    target_visible = False
+    target_identity_match = False
+    if len(targets) == 1:
+        target = targets[0]
+        target_present, target_regular = _namespace_regular_nonempty_file(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            target,
+            capture=capture,
+        )
+        target_visible = target_present and target_regular
+        if target_visible:
+            target_identity_match = (
+                runtime_root in target.parents
+                and target == trusted.path
+                and _namespace_file_sha256(
+                    leader,
+                    runtime_uid,
+                    runtime_gid,
+                    target,
+                    capture=capture,
+                )
+                == trusted.sha256
+            )
+
+    base_present, base_regular = _namespace_regular_nonempty_file(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        system_python,
+        capture=capture,
+    )
+    libpython_present, libpython_regular = _namespace_regular_nonempty_file(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        trusted.path,
+        capture=capture,
+    )
+    candidate_present, candidate_regular = _namespace_regular_nonempty_file(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        candidate_python,
+        capture=capture,
+    )
+    base_visible = base_present and base_regular
+    libpython_visible = libpython_present and libpython_regular
+    candidate_visible = candidate_present and candidate_regular
+
+    base_direct = "INVALID"
+    candidate_direct = "INVALID"
+    base_inhibit = "INVALID"
+    if (
+        container_cache_regular
+        and cache_bytes_match
+        and len(targets) == 1
+        and target_visible
+        and target_identity_match
+        and base_visible
+        and libpython_visible
+        and candidate_visible
+    ):
+        base_interpreter = _container_elf_interpreter(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            system_python,
+            capture=capture,
+        )
+        candidate_interpreter = _container_elf_interpreter(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            candidate_python,
+            capture=capture,
+        )
+        base_direct = _direct_loader_probe(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            base_interpreter,
+            system_python,
+            trusted,
+            capture=capture,
+        )
+        candidate_direct = _direct_loader_probe(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            candidate_interpreter,
+            candidate_python,
+            trusted,
+            capture=capture,
+        )
+        base_inhibit = _direct_loader_probe(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            base_interpreter,
+            system_python,
+            trusted,
+            inhibit_cache=True,
+            capture=capture,
+        )
+
+    diagnostic = _ContainerLoaderCacheDiagnostic(
+        True,
+        True,
+        container_cache_present,
+        container_cache_regular,
+        cache_bytes_match,
+        len(targets),
+        target_visible,
+        target_identity_match,
+        base_visible,
+        libpython_visible,
+        base_direct,
+        candidate_direct,
+        base_direct,
+        base_inhibit,
+    )
+    _validate_container_loader_cache_diagnostic(diagnostic)
+    return diagnostic
+
+
+def _verify_container_loader_cache_visibility(
+    **kwargs,
+) -> _ContainerLoaderCacheDiagnostic:
+    diagnostic = _collect_container_loader_cache_diagnostic(**kwargs)
+    if diagnostic.classification != "LOADER_CACHE_EFFECTIVE":
+        raise _ContainerLoaderCacheDiagnosticError(diagnostic)
+    return diagnostic
 
 
 def _parse_missing_libraries(payload: str) -> tuple[str, ...]:
@@ -2396,6 +3031,276 @@ def test_loader_cache_materialization_uses_fixed_env_and_shell_false(
         "PATH": "/usr/bin:/bin", "LC_ALL": "C",
     } for command in commands)
     assert not (root / "var/lib/pdi-p3d/ld.so.conf.wp7").exists()
+
+
+def _effective_container_loader_cache_diagnostic(
+    **changes,
+) -> _ContainerLoaderCacheDiagnostic:
+    return replace(
+        _ContainerLoaderCacheDiagnostic(
+            True,
+            True,
+            True,
+            True,
+            True,
+            1,
+            True,
+            True,
+            True,
+            True,
+            "RESOLVED",
+            "RESOLVED",
+            "RESOLVED",
+            "NOT_FOUND",
+        ),
+        **changes,
+    )
+
+
+def test_container_loader_cache_diagnostic_proves_effective_exact_cache() -> None:
+    runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
+    system_python = runtime / "bin/python"
+    trusted = _TrustedLibpython(
+        runtime / "lib" / _LIBPYTHON_SONAME,
+        runtime / "lib",
+        "2" * 64,
+    )
+    host_cache_digest = "1" * 64
+    interpreter = Path("/lib64/ld-linux-x86-64.so.2")
+    commands: list[tuple[str, ...]] = []
+
+    def capture(leader, uid, gid, command):
+        assert (leader, uid, gid) == (4321, 998, 997)
+        commands.append(command)
+        if command[0] == str(TEST):
+            return subprocess.CompletedProcess(
+                command, 1 if command[1] == "-L" else 0, "", "",
+            )
+        if command[0] == str(SHA256SUM):
+            digest = (
+                host_cache_digest
+                if command[1] == "/etc/ld.so.cache"
+                else trusted.sha256
+            )
+            return subprocess.CompletedProcess(
+                command, 0, f"{digest}  {command[1]}\n", "",
+            )
+        if command[0] == str(LDCONFIG):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                "1 libs found in cache `/etc/ld.so.cache'\n"
+                f"\t{_LIBPYTHON_SONAME} (libc6,x86-64) => "
+                f"{trusted.path}\n",
+                "",
+            )
+        if command[0] == str(READELF):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"      [Requesting program interpreter: {interpreter}]\n",
+                "",
+            )
+        if command[0] == str(interpreter):
+            if "--inhibit-cache" in command:
+                return subprocess.CompletedProcess(
+                    command,
+                    127,
+                    "",
+                    f"{command[-1]}: error while loading shared libraries: "
+                    f"{_LIBPYTHON_SONAME}: cannot open shared object file: "
+                    "No such file or directory\n",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                f"\t{_LIBPYTHON_SONAME} => {trusted.path} (0x1234)\n",
+                "",
+            )
+        raise AssertionError("UNEXPECTED_DIAGNOSTIC_COMMAND")
+
+    diagnostic = _verify_container_loader_cache_visibility(
+        leader=4321,
+        runtime_uid=998,
+        runtime_gid=997,
+        system_python=system_python,
+        candidate="a" * 40,
+        runtime_root=runtime,
+        trusted=trusted,
+        host_cache_sha256=host_cache_digest,
+        capture=capture,
+    )
+    assert diagnostic.classification == "LOADER_CACHE_EFFECTIVE"
+    values = dict(diagnostic.safe_values())
+    assert values["HOST_LOADER_CACHE_PRESENT"] == "YES"
+    assert values["HOST_LOADER_CACHE_SHA256_VALID"] == "PASS"
+    assert values["CONTAINER_LOADER_CACHE_BYTES_MATCH_HOST"] == "PASS"
+    assert values["CONTAINER_CACHE_LIBPYTHON_ENTRY_COUNT"] == "1"
+    assert values["CONTAINER_CACHE_TARGET_IDENTITY_MATCH"] == "PASS"
+    assert values["BASE_LOADER_DEFAULT_CACHE_RESULT"] == "RESOLVED"
+    assert values["BASE_LOADER_INHIBIT_CACHE_RESULT"] == "NOT_FOUND"
+    assert (
+        str(LDCONFIG), "-p", "-C", "/etc/ld.so.cache"
+    ) in commands
+    assert any("--inhibit-cache" in command for command in commands)
+    assert not any(
+        "LD_LIBRARY_PATH" in item
+        for command in commands
+        for item in command
+    )
+    assert not any(
+        "LD_PRELOAD" in item for command in commands for item in command
+    )
+
+
+@pytest.mark.parametrize(
+    "changes,classification",
+    (
+        (
+            {"container_cache_present": False, "container_cache_regular": False},
+            "CONTAINER_CACHE_FILE_MISSING",
+        ),
+        (
+            {"container_cache_bytes_match_host": False},
+            "CONTAINER_CACHE_BYTES_MISMATCH",
+        ),
+        (
+            {
+                "libpython_entry_count": 0,
+                "cache_target_visible": False,
+                "cache_target_identity_match": False,
+            },
+            "CONTAINER_CACHE_LIBPYTHON_ENTRY_MISSING",
+        ),
+        (
+            {"libpython_entry_count": 2},
+            "CONTAINER_CACHE_LIBPYTHON_ENTRY_AMBIGUOUS",
+        ),
+        (
+            {"cache_target_visible": False},
+            "CONTAINER_CACHE_TARGET_NOT_VISIBLE",
+        ),
+        (
+            {"cache_target_identity_match": False},
+            "CONTAINER_CACHE_TARGET_IDENTITY_MISMATCH",
+        ),
+        (
+            {"base_python_visible": False},
+            "QUALIFICATION_RUNTIME_BIND_NOT_VISIBLE",
+        ),
+        (
+            {
+                "base_loader_direct": "NOT_FOUND",
+                "base_loader_default_cache": "NOT_FOUND",
+            },
+            "LOADER_NOT_RESOLVING_VALID_CACHE_ENTRY",
+        ),
+        (
+            {"base_loader_inhibit_cache": "RESOLVED"},
+            "LOADER_CACHE_VISIBILITY_UNCLASSIFIED",
+        ),
+        ({}, "LOADER_CACHE_EFFECTIVE"),
+    ),
+)
+def test_container_loader_cache_classification_is_fixed_and_prioritized(
+    changes: dict[str, object],
+    classification: str,
+) -> None:
+    diagnostic = _effective_container_loader_cache_diagnostic(**changes)
+    assert diagnostic.classification == classification
+    _validate_container_loader_cache_diagnostic(diagnostic)
+
+
+def test_container_loader_cache_safe_output_contains_no_raw_evidence() -> None:
+    diagnostic = _effective_container_loader_cache_diagnostic()
+    output = diagnostic.safe_message()
+    assert set(line.split("=", 1)[0] for line in output.splitlines()) == {
+        "HOST_LOADER_CACHE_PRESENT",
+        "HOST_LOADER_CACHE_SHA256_VALID",
+        "CONTAINER_LOADER_CACHE_PRESENT",
+        "CONTAINER_LOADER_CACHE_REGULAR",
+        "CONTAINER_LOADER_CACHE_BYTES_MATCH_HOST",
+        "CONTAINER_CACHE_LIBPYTHON_ENTRY_COUNT",
+        "CONTAINER_CACHE_LIBPYTHON_ENTRY_PRESENT",
+        "CONTAINER_CACHE_TARGET_VISIBLE",
+        "CONTAINER_CACHE_TARGET_IDENTITY_MATCH",
+        "CONTAINER_BASE_PYTHON_FILE_VISIBLE",
+        "CONTAINER_LIBPYTHON_FILE_VISIBLE",
+        "BASE_LOADER_DIRECT_LIBPYTHON",
+        "CANDIDATE_LOADER_DIRECT_LIBPYTHON",
+        "BASE_LOADER_DEFAULT_CACHE_RESULT",
+        "BASE_LOADER_INHIBIT_CACHE_RESULT",
+        "CONTAINER_LOADER_CACHE_DIAGNOSTIC_CLASS",
+    }
+    assert "/" not in output
+    assert re.search(r"\b[0-9a-f]{64}\b", output) is None
+    assert _LIBPYTHON_SONAME not in output
+    assert "not found" not in output.lower()
+    assert not any(marker in output for marker in _PROTECTED_SECRET_MARKERS)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"libpython_entry_count": -1},
+        {"libpython_entry_count": True},
+        {"base_loader_direct": "/run/raw/path"},
+        {"candidate_loader_direct": "libpython => not found"},
+    ),
+)
+def test_container_loader_cache_safe_output_rejects_untrusted_values(
+    changes: dict[str, object],
+) -> None:
+    diagnostic = _effective_container_loader_cache_diagnostic(**changes)
+    with pytest.raises(
+        AssertionError,
+        match="CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED",
+    ):
+        diagnostic.safe_values()
+
+
+def test_container_loader_cache_raw_parsers_reject_secret_material() -> None:
+    with pytest.raises(
+        AssertionError,
+        match="CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED",
+    ):
+        _container_cache_libpython_targets(
+            "PASSWORD=synthetic\n"
+            f"{_LIBPYTHON_SONAME} (libc6) => /run/lib/{_LIBPYTHON_SONAME}\n"
+        )
+    trusted = _TrustedLibpython(
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3/lib") / _LIBPYTHON_SONAME,
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3/lib"),
+        "1" * 64,
+    )
+    with pytest.raises(
+        AssertionError,
+        match="CONTAINER_LOADER_CACHE_DIAGNOSTIC_REJECTED",
+    ):
+        _loader_libpython_result(
+            subprocess.CompletedProcess(
+                ("loader",), 1, "", "IMMICH__API_KEY=synthetic\n",
+            ),
+            trusted,
+        )
+
+
+def test_host_loader_cache_identity_revalidates_exact_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path / "root"
+    cache = root / "etc/ld.so.cache"
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"synthetic-cache")
+    checked = []
+    monkeypatch.setitem(
+        globals(), "_assert_loader_cache_file", lambda path: checked.append(path),
+    )
+    assert _host_loader_cache_sha256(root) == sha256(
+        b"synthetic-cache"
+    ).hexdigest()
+    assert checked == [cache]
 
 
 def test_container_python_preflight_requires_both_runtimes_and_clean_elf() -> None:
@@ -3690,6 +4595,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     assert account.pw_uid > 0 and group.gr_gid > 0 and account.pw_gid == group.gr_gid
     trusted_os_release = _prepare_rootfs(root, account.pw_uid, group.gr_gid)
     trusted_libpython = _materialize_disposable_loader_cache(root, runtime_root)
+    host_loader_cache_sha256 = _host_loader_cache_sha256(root)
     digests = json.loads(digest_path.read_text(encoding="utf-8"))
     assert digests["CANDIDATE_SHA"] == candidate
     assert len(candidate) == 40
@@ -3883,6 +4789,25 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                     "synthetic-immich-api-key",
                 ),
             )
+            try:
+                loader_cache_diagnostic = (
+                    _verify_container_loader_cache_visibility(
+                        leader=leader,
+                        runtime_uid=account.pw_uid,
+                        runtime_gid=group.gr_gid,
+                        system_python=system_python,
+                        candidate=candidate,
+                        runtime_root=runtime_root,
+                        trusted=trusted_libpython,
+                        host_cache_sha256=host_loader_cache_sha256,
+                    )
+                )
+            except _ContainerLoaderCacheDiagnosticError as exc:
+                print(exc.diagnostic.safe_message())
+                raise AssertionError(
+                    "CONTAINER_LOADER_CACHE_DIAGNOSTIC_INVALID"
+                ) from None
+            print(loader_cache_diagnostic.safe_message())
             try:
                 python_preflight = _verify_container_python_preflight(
                     leader=leader,

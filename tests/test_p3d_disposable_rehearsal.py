@@ -973,3 +973,33 @@ def test_wp7_python_preflight_failure_emits_only_structured_safe_evidence() -> N
         "_materialize_disposable_loader_cache(root, runtime_root)"
         in integration
     )
+
+
+def test_wp7_container_loader_cache_diagnostic_is_pre_workload_only() -> None:
+    integration = (
+        Path(__file__).parents[1]
+        / "tests/integration/test_p3d_disposable_rehearsal.py"
+    ).read_text(encoding="utf-8")
+    rehearsal = integration.index(
+        "def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal()"
+    )
+    diagnostic = integration.index(
+        "_verify_container_loader_cache_visibility(", rehearsal
+    )
+    python_preflight = integration.index(
+        "_verify_container_python_preflight(", diagnostic
+    )
+    formal_lock = integration.index(
+        'Path(f"/proc/{leader}/root/run/lock/pdi-sync.lock")',
+        python_preflight,
+    )
+    wp7_cli = integration.index(
+        'str(release / "scripts/pdi_p3d_disposable_rehearsal.py")',
+        formal_lock,
+    )
+    assert diagnostic < python_preflight < formal_lock < wp7_cli
+    assert 'LDCONFIG), "-p", "-C", "/etc/ld.so.cache"' in integration
+    assert 'command.append("--inhibit-cache")' in integration
+    assert 'CONTAINER_LOADER_CACHE_DIAGNOSTIC_CLASS' in integration
+    assert "LD_LIBRARY_PATH=" not in integration
+    assert "LD_PRELOAD=" not in integration
