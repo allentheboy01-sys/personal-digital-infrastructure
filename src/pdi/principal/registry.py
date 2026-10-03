@@ -100,6 +100,11 @@ class DatabaseBindingRegistry:
                 f"database binding {database_ref} is malformed"
             ) from error
 
+    def url_env(self, database_ref: str) -> str | None:
+        """Return the protected environment-key name, never its value."""
+        record = self._records.get(database_ref)
+        return None if record is None else record.url_env
+
     @classmethod
     def from_mapping(
         cls,
