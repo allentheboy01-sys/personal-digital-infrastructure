@@ -984,7 +984,7 @@ def test_wp7_container_loader_cache_diagnostic_is_pre_workload_only() -> None:
         "def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal()"
     )
     diagnostic = integration.index(
-        "_verify_container_loader_cache_visibility(", rehearsal
+        "_collect_container_loader_cache_diagnostic(", rehearsal
     )
     python_preflight = integration.index(
         "_verify_container_python_preflight(", diagnostic
@@ -1014,19 +1014,28 @@ def test_wp7_boot_cache_attribution_is_read_only_and_pre_workload() -> None:
         "def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal()"
     )
     loader_diagnostic = integration.index(
-        "_verify_container_loader_cache_visibility(", rehearsal
+        "_collect_container_loader_cache_diagnostic(", rehearsal
     )
     attribution = integration.index(
         "_collect_boot_cache_attribution(", loader_diagnostic
     )
+    authority = integration.index(
+        "_verify_boot_loader_authority(", attribution
+    )
     python_preflight = integration.index(
-        "_verify_container_python_preflight(", attribution
+        "_verify_container_python_preflight(", authority
     )
     formal_lock = integration.index(
         'Path(f"/proc/{leader}/root/run/lock/pdi-sync.lock")',
         python_preflight,
     )
-    assert loader_diagnostic < attribution < python_preflight < formal_lock
+    assert (
+        loader_diagnostic
+        < attribution
+        < authority
+        < python_preflight
+        < formal_lock
+    )
     writer_query_start = integration.index(
         "def _cache_writer_service_state("
     )

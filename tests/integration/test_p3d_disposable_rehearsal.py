@@ -128,6 +128,7 @@ _CONTAINER_LOADER_CACHE_CLASSES = {
     "QUALIFICATION_RUNTIME_BIND_NOT_VISIBLE",
     "LOADER_NOT_RESOLVING_VALID_CACHE_ENTRY",
     "LOADER_CACHE_EFFECTIVE",
+    "BOOT_REBUILT_CACHE_TRUSTED",
     "LOADER_CACHE_VISIBILITY_UNCLASSIFIED",
 }
 _CACHE_WRITER_UNITS = (
@@ -598,7 +599,9 @@ class _BootCacheAttributionDiagnostic:
             if (
                 self.writer_before_post_observation(ldconfig) == "YES"
                 and self.mutation_during_boot == "YES"
-                and self.post_libpython_entry_count == 0
+                and ldconfig.load_state == "loaded"
+                and ldconfig.result == "success"
+                and ldconfig.exec_main_status == 0
             ):
                 return "LDCONFIG_SERVICE_CONFIRMED"
             return "LDCONFIG_SERVICE_EXECUTED_BUT_CAUSALITY_UNPROVEN"
@@ -847,8 +850,6 @@ def _container_loader_cache_classification(
         or not diagnostic.container_cache_regular
     ):
         return "CONTAINER_CACHE_FILE_MISSING"
-    if not diagnostic.container_cache_bytes_match_host:
-        return "CONTAINER_CACHE_BYTES_MISMATCH"
     if diagnostic.libpython_entry_count == 0:
         return "CONTAINER_CACHE_LIBPYTHON_ENTRY_MISSING"
     if diagnostic.libpython_entry_count != 1:
@@ -868,9 +869,10 @@ def _container_loader_cache_classification(
         diagnostic.base_loader_direct == "RESOLVED"
         and diagnostic.candidate_loader_direct == "RESOLVED"
         and diagnostic.base_loader_default_cache == "RESOLVED"
-        and diagnostic.base_loader_inhibit_cache == "NOT_FOUND"
     ):
-        return "LOADER_CACHE_EFFECTIVE"
+        if diagnostic.container_cache_bytes_match_host:
+            return "LOADER_CACHE_EFFECTIVE"
+        return "BOOT_REBUILT_CACHE_TRUSTED"
     return "LOADER_CACHE_VISIBILITY_UNCLASSIFIED"
 
 
@@ -1280,6 +1282,94 @@ def _loader_cache_build_command(
     )
 
 
+def _qualification_loader_configuration_payload(
+    runtime_root: Path,
+    trusted: _TrustedLibpython,
+) -> bytes:
+    prefix = "pdi-p3d-wp7-runtime."
+    suffix = runtime_root.name.removeprefix(prefix)
+    directory = trusted.directory.as_posix()
+    if (
+        not runtime_root.is_absolute()
+        or runtime_root.parent != Path("/run")
+        or not runtime_root.name.startswith(prefix)
+        or not suffix
+        or not suffix.isalnum()
+        or trusted.path.name != _LIBPYTHON_SONAME
+        or trusted.path.parent != trusted.directory
+        or runtime_root not in trusted.directory.parents
+        or not trusted.directory.is_absolute()
+        or directory.startswith("//")
+        or ".." in trusted.directory.parts
+        or re.fullmatch(r"/[A-Za-z0-9_./+-]+", directory) is None
+    ):
+        raise AssertionError("QUALIFICATION_LOADER_CONFIG_INVALID")
+    return f"{directory}\n".encode("utf-8")
+
+
+def _validate_disposable_loader_configuration_facts(
+    *,
+    root: Path,
+    configuration: Path,
+    resolved: Path,
+    configuration_info: os.stat_result,
+    etc_info: os.stat_result,
+    root_info: os.stat_result,
+    payload: bytes,
+    expected_payload: bytes,
+) -> None:
+    if (
+        configuration != root / "etc/ld.so.conf"
+        or resolved != configuration
+        or not stat.S_ISREG(configuration_info.st_mode)
+        or stat.S_ISLNK(configuration_info.st_mode)
+        or configuration_info.st_uid != 0
+        or configuration_info.st_gid != 0
+        or stat.S_IMODE(configuration_info.st_mode) != 0o644
+        or configuration_info.st_size != len(expected_payload)
+        or not stat.S_ISDIR(etc_info.st_mode)
+        or stat.S_ISLNK(etc_info.st_mode)
+        or etc_info.st_uid != 0
+        or etc_info.st_gid != 0
+        or etc_info.st_mode & 0o022
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != 0
+        or root_info.st_gid != 0
+        or root_info.st_mode & 0o022
+        or not expected_payload
+        or payload != expected_payload
+        or payload.count(b"\n") != 1
+        or not payload.endswith(b"\n")
+    ):
+        raise AssertionError("QUALIFICATION_LOADER_CONFIG_INVALID")
+
+
+def _assert_disposable_loader_configuration(
+    root: Path,
+    configuration: Path,
+    expected_payload: bytes,
+) -> None:
+    try:
+        configuration_info = configuration.lstat()
+        resolved = configuration.resolve(strict=True)
+        etc_info = configuration.parent.lstat()
+        root_info = root.lstat()
+        payload = configuration.read_bytes()
+    except (OSError, RuntimeError) as exc:
+        raise AssertionError("QUALIFICATION_LOADER_CONFIG_INVALID") from exc
+    _validate_disposable_loader_configuration_facts(
+        root=root,
+        configuration=configuration,
+        resolved=resolved,
+        configuration_info=configuration_info,
+        etc_info=etc_info,
+        root_info=root_info,
+        payload=payload,
+        expected_payload=expected_payload,
+    )
+
+
 def _loader_cache_inspect_command(root: Path) -> tuple[str, ...]:
     return (str(LDCONFIG), "-p", "-C", str(root / "etc/ld.so.cache"))
 
@@ -1343,7 +1433,11 @@ def _materialize_disposable_loader_cache(
     trusted = _discover_trusted_libpython(runtime_root)
     _validate_trusted_executable(LDCONFIG)
     cache = root / "etc/ld.so.cache"
-    configuration = root / "var/lib/pdi-p3d/ld.so.conf.wp7"
+    configuration = root / "etc/ld.so.conf"
+    payload = _qualification_loader_configuration_payload(
+        runtime_root,
+        trusted,
+    )
     if (
         cache.exists()
         or cache.is_symlink()
@@ -1354,30 +1448,27 @@ def _materialize_disposable_loader_cache(
     descriptor = os.open(
         configuration,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o600,
+        0o644,
     )
     try:
         os.fchown(descriptor, 0, 0)
-        os.fchmod(descriptor, 0o600)
-        payload = f"{trusted.directory}\n".encode("utf-8")
+        os.fchmod(descriptor, 0o644)
         written = os.write(descriptor, payload)
         if written != len(payload):
             raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    try:
-        generated = runner(
-            _loader_cache_build_command(root, configuration),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-            shell=False,
-        )
-    finally:
-        configuration.unlink(missing_ok=True)
+    _assert_disposable_loader_configuration(root, configuration, payload)
+    generated = runner(
+        _loader_cache_build_command(root, configuration),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        shell=False,
+    )
     if generated.returncode != 0 or generated.stdout or generated.stderr:
         raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
     _assert_loader_cache_file(cache)
@@ -1393,8 +1484,15 @@ def _materialize_disposable_loader_cache(
     if inspected.returncode != 0 or inspected.stderr:
         raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
     _validate_loader_cache_listing(inspected.stdout, trusted)
-    if _discover_trusted_libpython(runtime_root) != trusted:
+    if (
+        _discover_trusted_libpython(runtime_root) != trusted
+        or _qualification_loader_configuration_payload(
+            runtime_root,
+            trusted,
+        ) != payload
+    ):
         raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    _assert_disposable_loader_configuration(root, configuration, payload)
     return trusted
 
 
@@ -1982,6 +2080,54 @@ def _namespace_regular_nonempty_file(
     return present, present and regular and not symlink and nonempty
 
 
+def _namespace_trusted_loader_configuration(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    path: Path,
+    *,
+    capture=_namespace_capture,
+) -> bool:
+    present, regular_nonempty = _namespace_regular_nonempty_file(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        path,
+        capture=capture,
+    )
+    if not present or not regular_nonempty:
+        return False
+    if _namespace_test_path(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        "-L",
+        path.parent,
+        capture=capture,
+    ):
+        return False
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(STAT), "--format=%u:%g:%a:%F", "--", str(path)),
+    )
+    parent = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(STAT), "--format=%u:%g:%a:%F", "--", str(path.parent)),
+    )
+    return (
+        result.returncode == 0
+        and not result.stderr
+        and result.stdout in {"0:0:644:regular file\n", "0:0:644:regular file"}
+        and parent.returncode == 0
+        and not parent.stderr
+        and parent.stdout in {"0:0:755:directory\n", "0:0:755:directory"}
+    )
+
+
 def _namespace_file_sha256(
     leader: int,
     runtime_uid: int,
@@ -2186,11 +2332,13 @@ def _validate_ld_so_conf_payload(payload: str) -> tuple[str, ...]:
         raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
     entries: list[str] = []
     for raw_line in payload.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line or line.startswith("include "):
-            continue
+        line = raw_line.strip()
         if (
-            not line.startswith("/")
+            not line
+            or line != raw_line
+            or "#" in line
+            or line.startswith("include ")
+            or not line.startswith("/")
             or re.fullmatch(r"/[A-Za-z0-9_./+-]+", line) is None
             or ".." in Path(line).parts
         ):
@@ -2297,25 +2445,27 @@ def _ldconfig_input_authority(
         capture=capture,
     )
     main_entries: tuple[str, ...] = ()
+    main_trusted = False
     if main_present:
-        present, regular = _namespace_regular_nonempty_file(
+        main_trusted = _namespace_trusted_loader_configuration(
             leader,
             runtime_uid,
             runtime_gid,
             main,
             capture=capture,
         )
-        if not present or not regular:
+        if not main_trusted:
             raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
-        main_entries = _validate_ld_so_conf_payload(
-            _namespace_text_file(
-                leader,
-                runtime_uid,
-                runtime_gid,
-                main,
-                capture=capture,
-            )
+        main_payload = _namespace_text_file(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            main,
+            capture=capture,
         )
+        main_entries = _validate_ld_so_conf_payload(main_payload)
+        if main_payload != f"{expected}\n":
+            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
     conf_d_files = _namespace_ld_so_conf_files(
         leader,
         runtime_uid,
@@ -2335,11 +2485,14 @@ def _ldconfig_input_authority(
                 )
             )
         )
+    exact_main = main_trusted and main_entries == (expected,)
+    exact_authority = exact_main and not conf_d_files and not conf_d_entries
     return _LdConfigInputAuthority(
         main_present,
-        expected in main_entries,
+        exact_main,
         len(conf_d_files),
-        expected in conf_d_entries,
+        False,
+        valid=exact_authority,
     )
 
 
@@ -2612,7 +2765,6 @@ def _collect_container_loader_cache_diagnostic(
     base_inhibit = "INVALID"
     if (
         container_cache_regular
-        and cache_bytes_match
         and len(targets) == 1
         and target_visible
         and target_identity_match
@@ -2687,9 +2839,39 @@ def _verify_container_loader_cache_visibility(
     **kwargs,
 ) -> _ContainerLoaderCacheDiagnostic:
     diagnostic = _collect_container_loader_cache_diagnostic(**kwargs)
-    if diagnostic.classification != "LOADER_CACHE_EFFECTIVE":
+    if diagnostic.classification not in {
+        "LOADER_CACHE_EFFECTIVE",
+        "BOOT_REBUILT_CACHE_TRUSTED",
+    }:
         raise _ContainerLoaderCacheDiagnosticError(diagnostic)
     return diagnostic
+
+
+def _verify_boot_loader_authority(
+    loader: _ContainerLoaderCacheDiagnostic,
+    attribution: _BootCacheAttributionDiagnostic,
+) -> None:
+    _validate_container_loader_cache_diagnostic(loader)
+    _validate_boot_cache_attribution(attribution)
+    ldconfig = attribution.ldconfig_state
+    if (
+        loader.classification
+        not in {"LOADER_CACHE_EFFECTIVE", "BOOT_REBUILT_CACHE_TRUSTED"}
+        or attribution.writer_classification != "LDCONFIG_SERVICE_CONFIRMED"
+        or attribution.writer_input_classification
+        != "QUALIFICATION_RUNTIME_INCLUDED"
+        or not attribution.ldconfig_input.main_present
+        or not attribution.ldconfig_input.main_includes_runtime
+        or attribution.ldconfig_input.conf_d_file_count != 0
+        or attribution.ldconfig_input.conf_d_includes_runtime
+        or not attribution.ldconfig_input.valid
+        or attribution.post_libpython_entry_count != 1
+        or loader.libpython_entry_count != 1
+        or ldconfig.load_state != "loaded"
+        or ldconfig.result != "success"
+        or ldconfig.exec_main_status != 0
+    ):
+        raise AssertionError("BOOT_LOADER_AUTHORITY_INVALID")
 
 
 def _collect_boot_cache_attribution(
@@ -3771,7 +3953,7 @@ def test_loader_cache_requires_exact_soname_and_trusted_target() -> None:
 
 def test_loader_cache_commands_are_fixed_nonmutating_host_invocations() -> None:
     root = Path("/tmp/pdi-p3d-rehearsal-synthetic")
-    configuration = root / "var/lib/pdi-p3d/ld.so.conf.wp7"
+    configuration = root / "etc/ld.so.conf"
     assert _loader_cache_build_command(root, configuration) == (
         "/sbin/ldconfig",
         "-C", "/tmp/pdi-p3d-rehearsal-synthetic/etc/ld.so.cache",
@@ -3824,6 +4006,14 @@ def test_loader_cache_materialization_uses_fixed_env_and_shell_false(
         globals(), "_validate_trusted_executable", lambda path: path,
     )
     monkeypatch.setitem(globals(), "_assert_loader_cache_file", lambda path: None)
+    checked_configurations = []
+    monkeypatch.setitem(
+        globals(),
+        "_assert_disposable_loader_configuration",
+        lambda selected_root, path, payload: checked_configurations.append(
+            (selected_root, path, payload)
+        ),
+    )
     monkeypatch.setitem(
         globals(),
         "_validate_loader_cache_listing",
@@ -3844,7 +4034,108 @@ def test_loader_cache_materialization_uses_fixed_env_and_shell_false(
     assert all(command[1]["env"] == {
         "PATH": "/usr/bin:/bin", "LC_ALL": "C",
     } for command in commands)
-    assert not (root / "var/lib/pdi-p3d/ld.so.conf.wp7").exists()
+    configuration = root / "etc/ld.so.conf"
+    assert configuration.read_bytes() == f"{trusted.directory}\n".encode()
+    assert checked_configurations == [
+        (root, configuration, configuration.read_bytes()),
+        (root, configuration, configuration.read_bytes()),
+    ]
+
+
+def test_qualification_loader_configuration_uses_exact_trusted_parent() -> None:
+    runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
+    trusted = _TrustedLibpython(
+        runtime / "lib" / _LIBPYTHON_SONAME,
+        runtime / "lib",
+        "1" * 64,
+    )
+    assert _qualification_loader_configuration_payload(
+        runtime,
+        trusted,
+    ) == b"/run/pdi-p3d-wp7-runtime.A1b2C3/lib\n"
+
+
+@pytest.mark.parametrize(
+    "runtime,trusted_directory",
+    (
+        (
+            Path("/run/pdi-p3d-wp7-runtime.A1b2C3"),
+            Path("/run/pdi-p3d-wp7-runtime.Other/lib"),
+        ),
+        (Path("relative/runtime"), Path("relative/runtime/lib")),
+        (
+            Path("/tmp/pdi-p3d-wp7-runtime.A1b2C3"),
+            Path("/tmp/pdi-p3d-wp7-runtime.A1b2C3/lib"),
+        ),
+    ),
+)
+def test_qualification_loader_configuration_rejects_untrusted_directory(
+    runtime: Path,
+    trusted_directory: Path,
+) -> None:
+    trusted = _TrustedLibpython(
+        trusted_directory / _LIBPYTHON_SONAME,
+        trusted_directory,
+        "1" * 64,
+    )
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_LOADER_CONFIG_INVALID",
+    ):
+        _qualification_loader_configuration_payload(runtime, trusted)
+
+
+def _loader_configuration_facts(
+    *,
+    configuration_info: os.stat_result | None = None,
+    etc_info: os.stat_result | None = None,
+    root_info: os.stat_result | None = None,
+    payload: bytes | None = None,
+    resolved: Path | None = None,
+) -> dict[str, object]:
+    root = Path("/tmp/pdi-p3d-rehearsal-synthetic")
+    configuration = root / "etc/ld.so.conf"
+    expected = b"/run/pdi-p3d-wp7-runtime.A1b2C3/lib\n"
+    return {
+        "root": root,
+        "configuration": configuration,
+        "resolved": resolved or configuration,
+        "configuration_info": configuration_info
+        or _regular_stat(mode=0o644, size=len(expected)),
+        "etc_info": etc_info or _directory_stat(),
+        "root_info": root_info or _directory_stat(),
+        "payload": expected if payload is None else payload,
+        "expected_payload": expected,
+    }
+
+
+def test_disposable_loader_configuration_facts_accept_exact_authority() -> None:
+    _validate_disposable_loader_configuration_facts(
+        **_loader_configuration_facts()
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"payload": b"/run/pdi-p3d-wp7-runtime.A1b2C3/lib\n/usr/lib\n"},
+        {"payload": b"include /etc/ld.so.conf.d/*.conf\n"},
+        {"configuration_info": _regular_stat(uid=1000, size=36)},
+        {"configuration_info": _regular_stat(gid=1000, size=36)},
+        {"configuration_info": _regular_stat(mode=0o640, size=36)},
+        {"configuration_info": _symlink_stat()},
+        {"etc_info": _directory_stat(mode=0o775)},
+    ),
+)
+def test_disposable_loader_configuration_facts_reject_unsafe_authority(
+    changes: dict[str, object],
+) -> None:
+    facts = _loader_configuration_facts(**changes)
+    with pytest.raises(
+        AssertionError,
+        match="QUALIFICATION_LOADER_CONFIG_INVALID",
+    ):
+        _validate_disposable_loader_configuration_facts(**facts)
 
 
 def _effective_container_loader_cache_diagnostic(
@@ -3976,7 +4267,7 @@ def test_container_loader_cache_diagnostic_proves_effective_exact_cache() -> Non
         ),
         (
             {"container_cache_bytes_match_host": False},
-            "CONTAINER_CACHE_BYTES_MISMATCH",
+            "BOOT_REBUILT_CACHE_TRUSTED",
         ),
         (
             {
@@ -4011,7 +4302,7 @@ def test_container_loader_cache_diagnostic_proves_effective_exact_cache() -> Non
         ),
         (
             {"base_loader_inhibit_cache": "RESOLVED"},
-            "LOADER_CACHE_VISIBILITY_UNCLASSIFIED",
+            "LOADER_CACHE_EFFECTIVE",
         ),
         ({}, "LOADER_CACHE_EFFECTIVE"),
     ),
@@ -4166,7 +4457,12 @@ def _boot_cache_diagnostic(
         _cache_snapshot("1" * 64),
         _cache_snapshot("2" * 64 if changed else "1" * 64),
         states,
-        _LdConfigInputAuthority(False, False, 0, input_included),
+        _LdConfigInputAuthority(
+            input_included,
+            input_included,
+            0,
+            False,
+        ),
         100,
         150,
         200,
@@ -4251,6 +4547,52 @@ def test_boot_cache_change_is_not_hidden_by_missing_or_untrusted_post_cache() ->
     )
     assert weak_mode.cache_changed
     assert weak_mode.writer_classification == "ATTRIBUTION_INSUFFICIENT"
+
+
+def test_boot_rebuilt_cache_with_trusted_writer_and_input_is_accepted() -> None:
+    loader = _effective_container_loader_cache_diagnostic(
+        container_cache_bytes_match_host=False,
+        base_loader_inhibit_cache="RESOLVED",
+    )
+    attribution = _boot_cache_diagnostic(
+        input_included=True,
+        post_libpython_entry_count=1,
+    )
+    assert loader.classification == "BOOT_REBUILT_CACHE_TRUSTED"
+    assert attribution.writer_classification == "LDCONFIG_SERVICE_CONFIRMED"
+    assert (
+        attribution.writer_input_classification
+        == "QUALIFICATION_RUNTIME_INCLUDED"
+    )
+    _verify_boot_loader_authority(loader, attribution)
+
+
+def test_boot_rebuilt_cache_without_runtime_input_is_rejected() -> None:
+    loader = _effective_container_loader_cache_diagnostic(
+        container_cache_bytes_match_host=False,
+    )
+    with pytest.raises(AssertionError, match="BOOT_LOADER_AUTHORITY_INVALID"):
+        _verify_boot_loader_authority(
+            loader,
+            _boot_cache_diagnostic(post_libpython_entry_count=1),
+        )
+
+
+def test_boot_rebuilt_cache_without_post_writer_libpython_is_rejected() -> None:
+    loader = _effective_container_loader_cache_diagnostic(
+        container_cache_bytes_match_host=False,
+        libpython_entry_count=0,
+        cache_target_visible=False,
+        cache_target_identity_match=False,
+    )
+    with pytest.raises(AssertionError, match="BOOT_LOADER_AUTHORITY_INVALID"):
+        _verify_boot_loader_authority(
+            loader,
+            _boot_cache_diagnostic(
+                input_included=True,
+                post_libpython_entry_count=0,
+            ),
+        )
 
 
 def test_boot_cache_writer_safe_output_is_allowlisted_and_path_free() -> None:
@@ -4345,14 +4687,26 @@ def test_boot_cache_attribution_collects_post_boot_authority_read_only() -> None
         assert (leader, uid, gid) == (4321, 998, 997)
         if command[0] == str(TEST):
             path = command[-1]
-            if path in {"/etc/ld.so.conf", "/etc/ld.so.conf.d"}:
+            if path == "/etc/ld.so.conf.d":
                 return subprocess.CompletedProcess(command, 1, "", "")
             return subprocess.CompletedProcess(
                 command, 1 if command[1] == "-L" else 0, "", "",
             )
         if command[0] == str(STAT):
+            if command[-1] == "/etc":
+                return subprocess.CompletedProcess(
+                    command, 0, "0:0:755:directory\n", "",
+                )
+            if command[-1] == "/etc/ld.so.conf":
+                return subprocess.CompletedProcess(
+                    command, 0, "0:0:644:regular file\n", "",
+                )
             return subprocess.CompletedProcess(
                 command, 0, "128:0:0:644:regular file\n", "",
+            )
+        if command[0] == str(CAT):
+            return subprocess.CompletedProcess(
+                command, 0, f"{trusted.directory}\n", "",
             )
         if command[0] == str(SHA256SUM):
             return subprocess.CompletedProcess(
@@ -4391,7 +4745,7 @@ def test_boot_cache_attribution_collects_post_boot_authority_read_only() -> None
         pre_boot=_cache_snapshot("1" * 64),
         nspawn_start_monotonic_us=100,
         manager_registration_monotonic_us=150,
-        post_libpython_entry_count=0,
+        post_libpython_entry_count=1,
         capture=capture,
         systemd_runner=systemd_runner,
         monotonic_ns=lambda: 200_000,
@@ -4399,7 +4753,7 @@ def test_boot_cache_attribution_collects_post_boot_authority_read_only() -> None
     assert diagnostic.writer_classification == "LDCONFIG_SERVICE_CONFIRMED"
     assert (
         diagnostic.writer_input_classification
-        == "QUALIFICATION_RUNTIME_NOT_INCLUDED"
+        == "QUALIFICATION_RUNTIME_INCLUDED"
     )
     assert diagnostic.mutation_during_boot == "YES"
 
@@ -4407,12 +4761,13 @@ def test_boot_cache_attribution_collects_post_boot_authority_read_only() -> None
 def test_ldconfig_input_parser_rejects_raw_secret_and_unsafe_path() -> None:
     assert _validate_ld_so_conf_payload(
         "/run/pdi-p3d-wp7-runtime.A1b2C3/lib\n"
-        "include /etc/ld.so.conf.d/*.conf\n"
     ) == ("/run/pdi-p3d-wp7-runtime.A1b2C3/lib",)
     for payload in (
         "DATABASE__URL=postgresql://secret\n",
         "/run/../tmp/escape\n",
         "relative/path\n",
+        "include /etc/ld.so.conf.d/*.conf\n",
+        "/run/pdi-p3d-wp7-runtime.A1b2C3/lib # comment\n",
     ):
         with pytest.raises(
             AssertionError,
@@ -4421,34 +4776,34 @@ def test_ldconfig_input_parser_rejects_raw_secret_and_unsafe_path() -> None:
             _validate_ld_so_conf_payload(payload)
 
 
-def test_ldconfig_input_authority_finds_runtime_only_in_conf_d() -> None:
+def test_ldconfig_input_authority_requires_exact_root_owned_main_file() -> None:
     runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
     trusted = _TrustedLibpython(
         runtime / "lib" / _LIBPYTHON_SONAME,
         runtime / "lib",
         "1" * 64,
     )
-    main = Path("/etc/ld.so.conf")
-    conf_a = Path("/etc/ld.so.conf.d/a.conf")
-    conf_b = Path("/etc/ld.so.conf.d/b.conf")
 
     def capture(leader, uid, gid, command):
         assert (leader, uid, gid) == (4321, 998, 997)
         if command[0] == str(TEST):
+            if command[-1] == "/etc/ld.so.conf.d":
+                return subprocess.CompletedProcess(command, 1, "", "")
             return subprocess.CompletedProcess(
                 command, 1 if command[1] == "-L" else 0, "", "",
             )
-        if command[0] == str(FIND):
+        if command[0] == str(STAT):
+            if command[-1] == "/etc":
+                return subprocess.CompletedProcess(
+                    command, 0, "0:0:755:directory\n", "",
+                )
             return subprocess.CompletedProcess(
-                command, 0, f"{conf_b}\n{conf_a}\n", "",
+                command, 0, "0:0:644:regular file\n", "",
             )
         if command[0] == str(CAT):
-            payload = {
-                str(main): "include /etc/ld.so.conf.d/*.conf\n",
-                str(conf_a): f"{trusted.directory}\n",
-                str(conf_b): "/usr/local/lib\n",
-            }[command[-1]]
-            return subprocess.CompletedProcess(command, 0, payload, "")
+            return subprocess.CompletedProcess(
+                command, 0, f"{trusted.directory}\n", "",
+            )
         raise AssertionError("UNEXPECTED_LDCONFIG_INPUT_COMMAND")
 
     authority = _ldconfig_input_authority(
@@ -4459,10 +4814,11 @@ def test_ldconfig_input_authority_finds_runtime_only_in_conf_d() -> None:
         capture=capture,
     )
     assert authority.main_present
-    assert not authority.main_includes_runtime
-    assert authority.conf_d_file_count == 2
-    assert authority.conf_d_includes_runtime
+    assert authority.main_includes_runtime
+    assert authority.conf_d_file_count == 0
+    assert not authority.conf_d_includes_runtime
     assert authority.includes_runtime
+    assert authority.valid
 
 
 def test_boot_cache_safe_output_rejects_raw_journal_or_runtime_path() -> None:
@@ -5785,6 +6141,10 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     assert account.pw_uid > 0 and group.gr_gid > 0 and account.pw_gid == group.gr_gid
     trusted_os_release = _prepare_rootfs(root, account.pw_uid, group.gr_gid)
     trusted_libpython = _materialize_disposable_loader_cache(root, runtime_root)
+    print("PRE_BOOT_LD_SO_CONF_PRESENT=PASS")
+    print("PRE_BOOT_LD_SO_CONF_TRUSTED=PASS")
+    print("PRE_BOOT_LD_SO_CONF_EXACT_AUTHORITY=PASS")
+    print("PRE_BOOT_CACHE_CONFIG_AUTHORITY_MATCH=PASS")
     host_loader_cache_sha256 = _host_loader_cache_sha256(root)
     digests = json.loads(digest_path.read_text(encoding="utf-8"))
     assert digests["CANDIDATE_SHA"] == candidate
@@ -5983,46 +6343,49 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                 ),
             )
             manager_registration_monotonic_us = time.monotonic_ns() // 1000
-            try:
-                loader_cache_diagnostic = (
-                    _verify_container_loader_cache_visibility(
-                        leader=leader,
-                        runtime_uid=account.pw_uid,
-                        runtime_gid=group.gr_gid,
-                        system_python=system_python,
-                        candidate=candidate,
-                        runtime_root=runtime_root,
-                        trusted=trusted_libpython,
-                        host_cache_sha256=host_loader_cache_sha256,
-                    )
+            loader_cache_diagnostic = (
+                _collect_container_loader_cache_diagnostic(
+                    leader=leader,
+                    runtime_uid=account.pw_uid,
+                    runtime_gid=group.gr_gid,
+                    system_python=system_python,
+                    candidate=candidate,
+                    runtime_root=runtime_root,
+                    trusted=trusted_libpython,
+                    host_cache_sha256=host_loader_cache_sha256,
                 )
-            except _ContainerLoaderCacheDiagnosticError as exc:
-                print(exc.diagnostic.safe_message())
-                try:
-                    cache_attribution = _collect_boot_cache_attribution(
-                        machine=machine,
-                        leader=leader,
-                        runtime_uid=account.pw_uid,
-                        runtime_gid=group.gr_gid,
-                        trusted=trusted_libpython,
-                        pre_boot=pre_boot_cache,
-                        nspawn_start_monotonic_us=nspawn_start_monotonic_us,
-                        manager_registration_monotonic_us=(
-                            manager_registration_monotonic_us
-                        ),
-                        post_libpython_entry_count=(
-                            exc.diagnostic.libpython_entry_count
-                        ),
-                    )
-                except AssertionError:
-                    raise AssertionError(
-                        "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_INVALID"
-                    ) from None
-                print(cache_attribution.safe_message())
+            )
+            print(loader_cache_diagnostic.safe_message())
+            try:
+                cache_attribution = _collect_boot_cache_attribution(
+                    machine=machine,
+                    leader=leader,
+                    runtime_uid=account.pw_uid,
+                    runtime_gid=group.gr_gid,
+                    trusted=trusted_libpython,
+                    pre_boot=pre_boot_cache,
+                    nspawn_start_monotonic_us=nspawn_start_monotonic_us,
+                    manager_registration_monotonic_us=(
+                        manager_registration_monotonic_us
+                    ),
+                    post_libpython_entry_count=(
+                        loader_cache_diagnostic.libpython_entry_count
+                    ),
+                )
+            except AssertionError:
+                raise AssertionError(
+                    "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_INVALID"
+                ) from None
+            print(cache_attribution.safe_message())
+            try:
+                _verify_boot_loader_authority(
+                    loader_cache_diagnostic,
+                    cache_attribution,
+                )
+            except AssertionError:
                 raise AssertionError(
                     "CONTAINER_LOADER_CACHE_DIAGNOSTIC_INVALID"
                 ) from None
-            print(loader_cache_diagnostic.safe_message())
             try:
                 python_preflight = _verify_container_python_preflight(
                     leader=leader,
