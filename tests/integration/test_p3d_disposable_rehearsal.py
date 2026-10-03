@@ -76,6 +76,9 @@ LDD = Path("/usr/bin/ldd")
 LDCONFIG = Path("/sbin/ldconfig")
 SHA256SUM = Path("/usr/bin/sha256sum")
 TEST = Path("/usr/bin/test")
+STAT = Path("/usr/bin/stat")
+CAT = Path("/usr/bin/cat")
+FIND = Path("/usr/bin/find")
 _LIBPYTHON_SONAME = "libpython3.13.so.1.0"
 _DIAGNOSTIC_LIMIT = 64 * 1024
 _LOADER_CACHE_OUTPUT_LIMIT = 4 * 1024 * 1024
@@ -126,6 +129,62 @@ _CONTAINER_LOADER_CACHE_CLASSES = {
     "LOADER_NOT_RESOLVING_VALID_CACHE_ENTRY",
     "LOADER_CACHE_EFFECTIVE",
     "LOADER_CACHE_VISIBILITY_UNCLASSIFIED",
+}
+_CACHE_WRITER_UNITS = (
+    "ldconfig.service",
+    "systemd-update-done.service",
+    "systemd-tmpfiles-setup.service",
+    "systemd-tmpfiles-setup-dev.service",
+)
+_CACHE_WRITER_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+    "InactiveExitTimestampMonotonic",
+    "ActiveEnterTimestampMonotonic",
+    "ExecMainStartTimestampMonotonic",
+    "ExecMainExitTimestampMonotonic",
+)
+_SYSTEMD_LOAD_STATES = {
+    "loaded", "not-found", "masked", "error", "bad-setting",
+}
+_SYSTEMD_ACTIVE_STATES = {
+    "active", "reloading", "inactive", "failed", "activating",
+    "deactivating", "maintenance",
+}
+_SYSTEMD_SUB_STATES = {
+    "dead", "exited", "running", "failed", "start", "start-pre",
+    "start-post", "stop", "stop-sigterm", "stop-sigkill", "auto-restart",
+    "condition", "plugged", "mounted", "waiting",
+}
+_SYSTEMD_RESULTS = {
+    "success", "exit-code", "signal", "core-dump", "watchdog",
+    "start-limit-hit", "resources", "timeout", "protocol", "dependency",
+    "skipped", "oom-kill", "none",
+}
+_CACHE_WRITER_CLASSES = {
+    "LDCONFIG_SERVICE_CONFIRMED",
+    "LDCONFIG_SERVICE_EXECUTED_BUT_CAUSALITY_UNPROVEN",
+    "OTHER_ALLOWLISTED_SYSTEMD_WRITER_CONFIRMED",
+    "CACHE_CHANGED_WITH_NO_ALLOWLISTED_WRITER",
+    "CACHE_NOT_CHANGED",
+    "ATTRIBUTION_INSUFFICIENT",
+}
+_CACHE_WRITER_INPUT_CLASSES = {
+    "QUALIFICATION_RUNTIME_INCLUDED",
+    "QUALIFICATION_RUNTIME_NOT_INCLUDED",
+    "WRITER_NOT_CONFIRMED",
+    "INPUT_AUTHORITY_UNKNOWN",
+}
+_LDCONFIG_JOURNAL_CLASSES = {
+    "EXECUTED_SUCCESS",
+    "EXECUTED_FAILED",
+    "SKIPPED_CONDITION",
+    "NOT_OBSERVED",
+    "AMBIGUOUS",
 }
 
 
@@ -402,6 +461,344 @@ class _ContainerLoaderCacheDiagnosticError(AssertionError):
     def __init__(self, diagnostic: _ContainerLoaderCacheDiagnostic) -> None:
         self.diagnostic = diagnostic
         super().__init__(diagnostic.safe_message())
+
+
+@dataclass(frozen=True)
+class _LoaderCacheSnapshot:
+    present: bool
+    regular: bool
+    nonempty: bool
+    owner_uid: int
+    owner_gid: int
+    mode: int
+    size: int
+    sha256: str
+
+    @property
+    def identity_valid(self) -> bool:
+        return (
+            self.present
+            and self.regular
+            and self.nonempty
+            and self.owner_uid == 0
+            and self.owner_gid == 0
+            and self.mode == 0o644
+            and self.size > 0
+            and re.fullmatch(r"[0-9a-f]{64}", self.sha256) is not None
+        )
+
+
+@dataclass(frozen=True)
+class _CacheWriterServiceState:
+    unit: str
+    load_state: str
+    active_state: str
+    sub_state: str
+    result: str
+    exec_main_code: int
+    exec_main_status: int
+    inactive_exit_monotonic_us: int
+    active_enter_monotonic_us: int
+    exec_start_monotonic_us: int
+    exec_exit_monotonic_us: int
+
+    @property
+    def executed(self) -> bool:
+        return self.exec_start_monotonic_us > 0
+
+
+@dataclass(frozen=True)
+class _LdConfigInputAuthority:
+    main_present: bool
+    main_includes_runtime: bool
+    conf_d_file_count: int
+    conf_d_includes_runtime: bool
+    valid: bool = True
+
+    @property
+    def includes_runtime(self) -> bool:
+        return self.main_includes_runtime or self.conf_d_includes_runtime
+
+
+@dataclass(frozen=True)
+class _BootCacheAttributionDiagnostic:
+    pre_boot: _LoaderCacheSnapshot
+    post_boot: _LoaderCacheSnapshot
+    writer_states: tuple[_CacheWriterServiceState, ...]
+    ldconfig_input: _LdConfigInputAuthority
+    nspawn_start_monotonic_us: int
+    manager_registration_monotonic_us: int
+    post_observation_monotonic_us: int
+    post_libpython_entry_count: int
+    ldconfig_journal_class: str = "NOT_OBSERVED"
+
+    @property
+    def cache_changed(self) -> bool:
+        if not self.pre_boot.identity_valid:
+            return False
+        if not self.post_boot.present:
+            return True
+        return (
+            re.fullmatch(r"[0-9a-f]{64}", self.post_boot.sha256) is not None
+            and self.pre_boot.sha256 != self.post_boot.sha256
+        )
+
+    @property
+    def ldconfig_state(self) -> _CacheWriterServiceState:
+        return self.writer_states[0]
+
+    @property
+    def mutation_during_boot(self) -> str:
+        if not self.pre_boot.identity_valid:
+            return "UNKNOWN"
+        if not self.cache_changed:
+            return "NO"
+        if (
+            0 < self.nspawn_start_monotonic_us
+            <= self.manager_registration_monotonic_us
+            <= self.post_observation_monotonic_us
+        ):
+            return "YES"
+        return "UNKNOWN"
+
+    def writer_before_post_observation(
+        self,
+        state: _CacheWriterServiceState,
+    ) -> str:
+        if not state.executed:
+            return "NO"
+        if (
+            state.exec_start_monotonic_us <= 0
+            or state.exec_exit_monotonic_us <= 0
+            or self.nspawn_start_monotonic_us <= 0
+            or self.post_observation_monotonic_us <= 0
+        ):
+            return "UNKNOWN"
+        if (
+            self.nspawn_start_monotonic_us
+            <= state.exec_start_monotonic_us
+            <= state.exec_exit_monotonic_us
+            <= self.post_observation_monotonic_us
+        ):
+            return "YES"
+        if state.exec_start_monotonic_us > self.post_observation_monotonic_us:
+            return "NO"
+        return "UNKNOWN"
+
+    @property
+    def writer_classification(self) -> str:
+        if not self.pre_boot.identity_valid:
+            return "ATTRIBUTION_INSUFFICIENT"
+        if not self.cache_changed:
+            return "CACHE_NOT_CHANGED"
+        if not self.post_boot.identity_valid:
+            return "ATTRIBUTION_INSUFFICIENT"
+        ldconfig = self.ldconfig_state
+        if ldconfig.executed:
+            if (
+                self.writer_before_post_observation(ldconfig) == "YES"
+                and self.mutation_during_boot == "YES"
+                and self.post_libpython_entry_count == 0
+            ):
+                return "LDCONFIG_SERVICE_CONFIRMED"
+            return "LDCONFIG_SERVICE_EXECUTED_BUT_CAUSALITY_UNPROVEN"
+        if all(not state.executed for state in self.writer_states):
+            return "CACHE_CHANGED_WITH_NO_ALLOWLISTED_WRITER"
+        return "ATTRIBUTION_INSUFFICIENT"
+
+    @property
+    def writer_input_classification(self) -> str:
+        if self.writer_classification != "LDCONFIG_SERVICE_CONFIRMED":
+            return "WRITER_NOT_CONFIRMED"
+        if not self.ldconfig_input.valid:
+            return "INPUT_AUTHORITY_UNKNOWN"
+        if self.ldconfig_input.includes_runtime:
+            return "QUALIFICATION_RUNTIME_INCLUDED"
+        return "QUALIFICATION_RUNTIME_NOT_INCLUDED"
+
+    def safe_values(self) -> tuple[tuple[str, str], ...]:
+        _validate_boot_cache_attribution(self)
+        ldconfig = self.ldconfig_state
+        executed_units = tuple(
+            state.unit for state in self.writer_states if state.executed
+        )
+        return (
+            (
+                "PRE_BOOT_LOADER_CACHE_PRESENT",
+                "YES" if self.pre_boot.present else "NO",
+            ),
+            (
+                "PRE_BOOT_LOADER_CACHE_IDENTITY_VALID",
+                "PASS" if self.pre_boot.identity_valid else "FAIL",
+            ),
+            (
+                "POST_BOOT_LOADER_CACHE_PRESENT",
+                "YES" if self.post_boot.present else "NO",
+            ),
+            (
+                "POST_BOOT_LOADER_CACHE_CHANGED",
+                "YES" if self.cache_changed else "NO",
+            ),
+            ("LDCONFIG_SERVICE_LOAD_STATE", ldconfig.load_state),
+            ("LDCONFIG_SERVICE_ACTIVE_STATE", ldconfig.active_state),
+            ("LDCONFIG_SERVICE_SUB_STATE", ldconfig.sub_state),
+            ("LDCONFIG_SERVICE_RESULT", ldconfig.result),
+            (
+                "LDCONFIG_SERVICE_EXEC_MAIN_STATUS",
+                str(ldconfig.exec_main_status),
+            ),
+            (
+                "LDCONFIG_SERVICE_EXECUTED",
+                "YES" if ldconfig.executed else "NO",
+            ),
+            ("CACHE_WRITER_CANDIDATE_COUNT", str(len(self.writer_states))),
+            (
+                "CACHE_WRITER_EXECUTED_COUNT",
+                str(len(executed_units)),
+            ),
+            (
+                "CACHE_WRITER_EXECUTED_UNITS",
+                ",".join(executed_units) or "NONE",
+            ),
+            (
+                "CACHE_MUTATION_OCCURRED_DURING_BOOT",
+                self.mutation_during_boot,
+            ),
+            (
+                "LDCONFIG_EXECUTED_BEFORE_POST_BOOT_OBSERVATION",
+                self.writer_before_post_observation(ldconfig),
+            ),
+            ("LDCONFIG_JOURNAL_CLASS", self.ldconfig_journal_class),
+            (
+                "CONTAINER_LD_SO_CONF_PRESENT",
+                "YES" if self.ldconfig_input.main_present else "NO",
+            ),
+            (
+                "CONTAINER_LD_SO_CONF_INCLUDES_QUALIFICATION_RUNTIME",
+                "YES" if self.ldconfig_input.main_includes_runtime else "NO",
+            ),
+            (
+                "CONTAINER_LD_SO_CONF_D_FILE_COUNT",
+                str(self.ldconfig_input.conf_d_file_count),
+            ),
+            (
+                "CONTAINER_LD_SO_CONF_D_INCLUDES_QUALIFICATION_RUNTIME",
+                "YES" if self.ldconfig_input.conf_d_includes_runtime else "NO",
+            ),
+            (
+                "POST_WRITER_CACHE_DIFFERS_FROM_PRE_BOOT",
+                "YES" if self.cache_changed else "NO",
+            ),
+            (
+                "POST_WRITER_LIBPYTHON_ENTRY_COUNT",
+                str(self.post_libpython_entry_count),
+            ),
+            ("BOOT_CACHE_WRITER_CLASS", self.writer_classification),
+            (
+                "BOOT_CACHE_WRITER_INPUT_CLASS",
+                self.writer_input_classification,
+            ),
+        )
+
+    def safe_message(self) -> str:
+        return "\n".join(
+            f"{name}={value}" for name, value in self.safe_values()
+        )
+
+
+def _validate_cache_writer_state(state: _CacheWriterServiceState) -> None:
+    integer_values = (
+        state.exec_main_code,
+        state.exec_main_status,
+        state.inactive_exit_monotonic_us,
+        state.active_enter_monotonic_us,
+        state.exec_start_monotonic_us,
+        state.exec_exit_monotonic_us,
+    )
+    if (
+        state.unit not in _CACHE_WRITER_UNITS
+        or state.load_state not in _SYSTEMD_LOAD_STATES
+        or state.active_state not in _SYSTEMD_ACTIVE_STATES
+        or state.sub_state not in _SYSTEMD_SUB_STATES
+        or state.result not in _SYSTEMD_RESULTS
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in integer_values
+        )
+        or state.exec_main_code > 255
+        or state.exec_main_status > 255
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+
+
+def _validate_loader_cache_snapshot(snapshot: _LoaderCacheSnapshot) -> None:
+    if (
+        any(
+            not isinstance(value, bool)
+            for value in (snapshot.present, snapshot.regular, snapshot.nonempty)
+        )
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in (
+                snapshot.owner_uid,
+                snapshot.owner_gid,
+                snapshot.mode,
+                snapshot.size,
+            )
+        )
+        or snapshot.mode > 0o7777
+        or (
+            snapshot.sha256
+            and re.fullmatch(r"[0-9a-f]{64}", snapshot.sha256) is None
+        )
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+
+
+def _validate_boot_cache_attribution(
+    diagnostic: _BootCacheAttributionDiagnostic,
+) -> None:
+    _validate_loader_cache_snapshot(diagnostic.pre_boot)
+    _validate_loader_cache_snapshot(diagnostic.post_boot)
+    if (
+        tuple(state.unit for state in diagnostic.writer_states)
+        != _CACHE_WRITER_UNITS
+        or not isinstance(diagnostic.ldconfig_input, _LdConfigInputAuthority)
+        or any(
+            not isinstance(value, bool)
+            for value in (
+                diagnostic.ldconfig_input.main_present,
+                diagnostic.ldconfig_input.main_includes_runtime,
+                diagnostic.ldconfig_input.conf_d_includes_runtime,
+                diagnostic.ldconfig_input.valid,
+            )
+        )
+        or not isinstance(diagnostic.ldconfig_input.conf_d_file_count, int)
+        or isinstance(diagnostic.ldconfig_input.conf_d_file_count, bool)
+        or not 0 <= diagnostic.ldconfig_input.conf_d_file_count <= 1024
+        or diagnostic.ldconfig_journal_class not in _LDCONFIG_JOURNAL_CLASSES
+        or diagnostic.writer_classification not in _CACHE_WRITER_CLASSES
+        or diagnostic.writer_input_classification
+        not in _CACHE_WRITER_INPUT_CLASSES
+        or diagnostic.mutation_during_boot not in {"YES", "NO", "UNKNOWN"}
+        or diagnostic.writer_before_post_observation(
+            diagnostic.ldconfig_state
+        ) not in {"YES", "NO", "UNKNOWN"}
+        or not isinstance(diagnostic.post_libpython_entry_count, int)
+        or isinstance(diagnostic.post_libpython_entry_count, bool)
+        or not 0 <= diagnostic.post_libpython_entry_count <= 1024
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+            for value in (
+                diagnostic.nspawn_start_monotonic_us,
+                diagnostic.manager_registration_monotonic_us,
+                diagnostic.post_observation_monotonic_us,
+            )
+        )
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    for state in diagnostic.writer_states:
+        _validate_cache_writer_state(state)
 
 
 def _validate_container_loader_cache_diagnostic(
@@ -1013,6 +1410,30 @@ def _host_loader_cache_sha256(root: Path) -> str:
     return digest
 
 
+def _host_loader_cache_snapshot(root: Path) -> _LoaderCacheSnapshot:
+    cache = root / "etc/ld.so.cache"
+    _assert_loader_cache_file(cache)
+    try:
+        info = cache.lstat()
+        digest = sha256(cache.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID") from exc
+    snapshot = _LoaderCacheSnapshot(
+        True,
+        stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode),
+        info.st_size > 0,
+        info.st_uid,
+        info.st_gid,
+        stat.S_IMODE(info.st_mode),
+        info.st_size,
+        digest,
+    )
+    _validate_loader_cache_snapshot(snapshot)
+    if not snapshot.identity_valid:
+        raise AssertionError("QUALIFICATION_LOADER_CACHE_INVALID")
+    return snapshot
+
+
 def _assert_candidate_venv_runtime_authority(
     release: Path,
     *,
@@ -1585,6 +2006,343 @@ def _namespace_file_sha256(
     return matched.group(1)
 
 
+def _namespace_loader_cache_snapshot(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    *,
+    capture=_namespace_capture,
+) -> _LoaderCacheSnapshot:
+    cache = Path("/etc/ld.so.cache")
+    present, regular_nonempty = _namespace_regular_nonempty_file(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        cache,
+        capture=capture,
+    )
+    if not present:
+        snapshot = _LoaderCacheSnapshot(False, False, False, 0, 0, 0, 0, "")
+        _validate_loader_cache_snapshot(snapshot)
+        return snapshot
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(STAT), "--format=%s:%u:%g:%a:%F", "--", str(cache)),
+    )
+    matched = re.fullmatch(
+        r"([0-9]+):([0-9]+):([0-9]+):([0-7]{3,4}):regular file\n?",
+        result.stdout,
+    )
+    if result.returncode != 0 or result.stderr or matched is None:
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    size, owner_uid, owner_gid = (int(matched.group(i)) for i in range(1, 4))
+    mode = int(matched.group(4), 8)
+    digest = _namespace_file_sha256(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        cache,
+        capture=capture,
+    )
+    snapshot = _LoaderCacheSnapshot(
+        True,
+        regular_nonempty,
+        size > 0,
+        owner_uid,
+        owner_gid,
+        mode,
+        size,
+        digest,
+    )
+    _validate_loader_cache_snapshot(snapshot)
+    return snapshot
+
+
+def _parse_systemd_monotonic(value: str) -> int:
+    if value == "":
+        return 0
+    if re.fullmatch(r"[0-9]{1,20}", value) is None:
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    return int(value)
+
+
+def _parse_systemd_status(value: str) -> int:
+    if value == "":
+        return 0
+    if re.fullmatch(r"[0-9]{1,3}", value) is None:
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    result = int(value)
+    if result > 255:
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    return result
+
+
+def _cache_writer_service_state(
+    machine: str,
+    unit: str,
+    *,
+    runner=subprocess.run,
+) -> _CacheWriterServiceState:
+    if (
+        re.fullmatch(r"pdi-p3d-[0-9a-f]{16}", machine) is None
+        or unit not in _CACHE_WRITER_UNITS
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    command = (
+        str(SYSTEMCTL),
+        f"--machine={machine}",
+        "--no-pager",
+        "show",
+        unit,
+        *(f"--property={name}" for name in _CACHE_WRITER_PROPERTIES),
+    )
+    try:
+        result = runner(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AssertionError(
+            "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED"
+        ) from exc
+    payload = result.stdout + "\n" + result.stderr
+    if (
+        len(payload.encode("utf-8")) > _DIAGNOSTIC_LIMIT
+        or "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+        or _SECRET_ASSIGNMENT.search(payload)
+        or any(marker in payload for marker in _PROTECTED_SECRET_MARKERS)
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if (
+            separator != "="
+            or name not in _CACHE_WRITER_PROPERTIES
+            or name in values
+        ):
+            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+        values[name] = value
+    if values.get("LoadState") == "not-found":
+        allowed_stderr = {"", f"Unit {unit} could not be found.\n"}
+        if result.returncode not in {0, 4} or result.stderr not in allowed_stderr:
+            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+        state = _CacheWriterServiceState(
+            unit, "not-found", "inactive", "dead", "success",
+            0, 0, 0, 0, 0, 0,
+        )
+        _validate_cache_writer_state(state)
+        return state
+    if (
+        result.returncode != 0
+        or result.stderr
+        or set(values) != set(_CACHE_WRITER_PROPERTIES)
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    state = _CacheWriterServiceState(
+        unit,
+        values["LoadState"],
+        values["ActiveState"],
+        values["SubState"],
+        values["Result"],
+        _parse_systemd_status(values["ExecMainCode"]),
+        _parse_systemd_status(values["ExecMainStatus"]),
+        _parse_systemd_monotonic(values["InactiveExitTimestampMonotonic"]),
+        _parse_systemd_monotonic(values["ActiveEnterTimestampMonotonic"]),
+        _parse_systemd_monotonic(values["ExecMainStartTimestampMonotonic"]),
+        _parse_systemd_monotonic(values["ExecMainExitTimestampMonotonic"]),
+    )
+    _validate_cache_writer_state(state)
+    return state
+
+
+def _allowlisted_cache_writer_states(
+    machine: str,
+    *,
+    runner=subprocess.run,
+) -> tuple[_CacheWriterServiceState, ...]:
+    return tuple(
+        _cache_writer_service_state(machine, unit, runner=runner)
+        for unit in _CACHE_WRITER_UNITS
+    )
+
+
+def _validate_ld_so_conf_payload(payload: str) -> tuple[str, ...]:
+    if (
+        len(payload.encode("utf-8")) > _DIAGNOSTIC_LIMIT
+        or "\x00" in payload
+        or any(ord(char) < 32 and char not in "\n\r\t" for char in payload)
+        or _SECRET_ASSIGNMENT.search(payload)
+        or any(marker in payload for marker in _PROTECTED_SECRET_MARKERS)
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    entries: list[str] = []
+    for raw_line in payload.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("include "):
+            continue
+        if (
+            not line.startswith("/")
+            or re.fullmatch(r"/[A-Za-z0-9_./+-]+", line) is None
+            or ".." in Path(line).parts
+        ):
+            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+        entries.append(line.rstrip("/") or "/")
+    return tuple(entries)
+
+
+def _namespace_text_file(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    path: Path,
+    *,
+    capture=_namespace_capture,
+) -> str:
+    selected = _validate_diagnostic_namespace_path(path)
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (str(CAT), "--", str(selected)),
+    )
+    if result.returncode != 0 or result.stderr:
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    _validate_ld_so_conf_payload(result.stdout)
+    return result.stdout
+
+
+def _namespace_ld_so_conf_files(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    *,
+    capture=_namespace_capture,
+) -> tuple[Path, ...]:
+    directory = Path("/etc/ld.so.conf.d")
+    if not _namespace_test_path(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        "-e",
+        directory,
+        capture=capture,
+    ):
+        return ()
+    result = capture(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        (
+            str(FIND),
+            str(directory),
+            "-mindepth", "1",
+            "-maxdepth", "1",
+            "-type", "f",
+            "-name", "*.conf",
+            "-print",
+        ),
+    )
+    if result.returncode != 0 or result.stderr:
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    files: list[Path] = []
+    for raw_path in result.stdout.splitlines():
+        path = _validate_diagnostic_namespace_path(Path(raw_path))
+        if path.parent != directory or path.suffix != ".conf":
+            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+        present, regular = _namespace_regular_nonempty_file(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            path,
+            capture=capture,
+        )
+        if not present or not regular:
+            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+        files.append(path)
+    if len(files) > 1024 or len(set(files)) != len(files):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    return tuple(sorted(files))
+
+
+def _ldconfig_input_authority(
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    trusted: _TrustedLibpython,
+    *,
+    capture=_namespace_capture,
+) -> _LdConfigInputAuthority:
+    expected = trusted.directory.as_posix().rstrip("/")
+    if (
+        not expected.startswith("/run/pdi-p3d-wp7-runtime.")
+        or trusted.path.parent != trusted.directory
+    ):
+        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    main = Path("/etc/ld.so.conf")
+    main_present = _namespace_test_path(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        "-e",
+        main,
+        capture=capture,
+    )
+    main_entries: tuple[str, ...] = ()
+    if main_present:
+        present, regular = _namespace_regular_nonempty_file(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            main,
+            capture=capture,
+        )
+        if not present or not regular:
+            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+        main_entries = _validate_ld_so_conf_payload(
+            _namespace_text_file(
+                leader,
+                runtime_uid,
+                runtime_gid,
+                main,
+                capture=capture,
+            )
+        )
+    conf_d_files = _namespace_ld_so_conf_files(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        capture=capture,
+    )
+    conf_d_entries: list[str] = []
+    for path in conf_d_files:
+        conf_d_entries.extend(
+            _validate_ld_so_conf_payload(
+                _namespace_text_file(
+                    leader,
+                    runtime_uid,
+                    runtime_gid,
+                    path,
+                    capture=capture,
+                )
+            )
+        )
+    return _LdConfigInputAuthority(
+        main_present,
+        expected in main_entries,
+        len(conf_d_files),
+        expected in conf_d_entries,
+    )
+
+
 def _container_cache_libpython_targets(payload: str) -> tuple[Path, ...]:
     if (
         len(payload.encode("utf-8")) > _LOADER_CACHE_OUTPUT_LIMIT
@@ -1931,6 +2689,62 @@ def _verify_container_loader_cache_visibility(
     diagnostic = _collect_container_loader_cache_diagnostic(**kwargs)
     if diagnostic.classification != "LOADER_CACHE_EFFECTIVE":
         raise _ContainerLoaderCacheDiagnosticError(diagnostic)
+    return diagnostic
+
+
+def _collect_boot_cache_attribution(
+    *,
+    machine: str,
+    leader: int,
+    runtime_uid: int,
+    runtime_gid: int,
+    trusted: _TrustedLibpython,
+    pre_boot: _LoaderCacheSnapshot,
+    nspawn_start_monotonic_us: int,
+    manager_registration_monotonic_us: int,
+    post_libpython_entry_count: int,
+    capture=_namespace_capture,
+    systemd_runner=subprocess.run,
+    monotonic_ns=time.monotonic_ns,
+) -> _BootCacheAttributionDiagnostic:
+    _validate_loader_cache_snapshot(pre_boot)
+    post_boot = _namespace_loader_cache_snapshot(
+        leader,
+        runtime_uid,
+        runtime_gid,
+        capture=capture,
+    )
+    post_observation_monotonic_us = monotonic_ns() // 1000
+    writer_states = _allowlisted_cache_writer_states(
+        machine,
+        runner=systemd_runner,
+    )
+    if writer_states[0].executed:
+        try:
+            ldconfig_input = _ldconfig_input_authority(
+                leader,
+                runtime_uid,
+                runtime_gid,
+                trusted,
+                capture=capture,
+            )
+        except AssertionError:
+            ldconfig_input = _LdConfigInputAuthority(
+                False, False, 0, False, valid=False,
+            )
+    else:
+        ldconfig_input = _LdConfigInputAuthority(False, False, 0, False)
+    diagnostic = _BootCacheAttributionDiagnostic(
+        pre_boot,
+        post_boot,
+        writer_states,
+        ldconfig_input,
+        nspawn_start_monotonic_us,
+        manager_registration_monotonic_us,
+        post_observation_monotonic_us,
+        post_libpython_entry_count,
+    )
+    _validate_boot_cache_attribution(diagnostic)
     return diagnostic
 
 
@@ -3301,6 +4115,382 @@ def test_host_loader_cache_identity_revalidates_exact_cache(
         b"synthetic-cache"
     ).hexdigest()
     assert checked == [cache]
+
+
+def _cache_snapshot(digest: str = "1" * 64) -> _LoaderCacheSnapshot:
+    return _LoaderCacheSnapshot(True, True, True, 0, 0, 0o644, 128, digest)
+
+
+def _cache_writer_state(
+    unit: str,
+    *,
+    executed: bool = False,
+    start: int = 0,
+    exit: int = 0,
+) -> _CacheWriterServiceState:
+    return _CacheWriterServiceState(
+        unit,
+        "loaded",
+        "inactive",
+        "dead",
+        "success",
+        1 if executed else 0,
+        0,
+        exit if executed else 0,
+        exit if executed else 0,
+        start if executed else 0,
+        exit if executed else 0,
+    )
+
+
+def _boot_cache_diagnostic(
+    *,
+    changed: bool = True,
+    ldconfig_executed: bool = True,
+    ldconfig_start: int = 120,
+    ldconfig_exit: int = 140,
+    other_executed: bool = False,
+    input_included: bool = False,
+    post_libpython_entry_count: int = 0,
+) -> _BootCacheAttributionDiagnostic:
+    states = tuple(
+        _cache_writer_state(
+            unit,
+            executed=(ldconfig_executed if index == 0 else other_executed),
+            start=(ldconfig_start if index == 0 else 125),
+            exit=(ldconfig_exit if index == 0 else 135),
+        )
+        for index, unit in enumerate(_CACHE_WRITER_UNITS)
+    )
+    return _BootCacheAttributionDiagnostic(
+        _cache_snapshot("1" * 64),
+        _cache_snapshot("2" * 64 if changed else "1" * 64),
+        states,
+        _LdConfigInputAuthority(False, False, 0, input_included),
+        100,
+        150,
+        200,
+        post_libpython_entry_count,
+    )
+
+
+@pytest.mark.parametrize(
+    "diagnostic,writer_class,input_class",
+    (
+        (
+            _boot_cache_diagnostic(),
+            "LDCONFIG_SERVICE_CONFIRMED",
+            "QUALIFICATION_RUNTIME_NOT_INCLUDED",
+        ),
+        (
+            _boot_cache_diagnostic(ldconfig_exit=0),
+            "LDCONFIG_SERVICE_EXECUTED_BUT_CAUSALITY_UNPROVEN",
+            "WRITER_NOT_CONFIRMED",
+        ),
+        (
+            _boot_cache_diagnostic(
+                ldconfig_executed=False,
+                other_executed=False,
+            ),
+            "CACHE_CHANGED_WITH_NO_ALLOWLISTED_WRITER",
+            "WRITER_NOT_CONFIRMED",
+        ),
+        (
+            _boot_cache_diagnostic(changed=False),
+            "CACHE_NOT_CHANGED",
+            "WRITER_NOT_CONFIRMED",
+        ),
+        (
+            _boot_cache_diagnostic(input_included=True),
+            "LDCONFIG_SERVICE_CONFIRMED",
+            "QUALIFICATION_RUNTIME_INCLUDED",
+        ),
+        (
+            replace(
+                _boot_cache_diagnostic(),
+                ldconfig_input=_LdConfigInputAuthority(
+                    False, False, 0, False, valid=False,
+                ),
+            ),
+            "LDCONFIG_SERVICE_CONFIRMED",
+            "INPUT_AUTHORITY_UNKNOWN",
+        ),
+        (
+            _boot_cache_diagnostic(
+                ldconfig_executed=False,
+                other_executed=True,
+            ),
+            "ATTRIBUTION_INSUFFICIENT",
+            "WRITER_NOT_CONFIRMED",
+        ),
+    ),
+)
+def test_boot_cache_writer_classification_is_fixed_and_evidence_bound(
+    diagnostic: _BootCacheAttributionDiagnostic,
+    writer_class: str,
+    input_class: str,
+) -> None:
+    assert diagnostic.writer_classification == writer_class
+    assert diagnostic.writer_input_classification == input_class
+    _validate_boot_cache_attribution(diagnostic)
+
+
+def test_boot_cache_change_is_not_hidden_by_missing_or_untrusted_post_cache() -> None:
+    missing = replace(
+        _boot_cache_diagnostic(),
+        post_boot=_LoaderCacheSnapshot(
+            False, False, False, 0, 0, 0, 0, "",
+        ),
+    )
+    assert missing.cache_changed
+    assert missing.mutation_during_boot == "YES"
+    assert missing.writer_classification == "ATTRIBUTION_INSUFFICIENT"
+    weak_mode = replace(
+        _boot_cache_diagnostic(),
+        post_boot=replace(_cache_snapshot("2" * 64), mode=0o666),
+    )
+    assert weak_mode.cache_changed
+    assert weak_mode.writer_classification == "ATTRIBUTION_INSUFFICIENT"
+
+
+def test_boot_cache_writer_safe_output_is_allowlisted_and_path_free() -> None:
+    diagnostic = _boot_cache_diagnostic()
+    output = diagnostic.safe_message()
+    assert "BOOT_CACHE_WRITER_CLASS=LDCONFIG_SERVICE_CONFIRMED" in output
+    assert "BOOT_CACHE_WRITER_INPUT_CLASS=QUALIFICATION_RUNTIME_NOT_INCLUDED" in output
+    assert "CACHE_MUTATION_OCCURRED_DURING_BOOT=YES" in output
+    assert "LDCONFIG_EXECUTED_BEFORE_POST_BOOT_OBSERVATION=YES" in output
+    assert "CACHE_WRITER_EXECUTED_UNITS=ldconfig.service" in output
+    assert "/" not in output
+    assert re.search(r"\b[0-9a-f]{64}\b", output) is None
+    assert _LIBPYTHON_SONAME not in output
+    assert not any(marker in output for marker in _PROTECTED_SECRET_MARKERS)
+
+
+def test_cache_writer_query_is_fixed_read_only_and_rejects_unknown_unit() -> None:
+    calls = []
+
+    def runner(command, **kwargs):
+        calls.append((command, kwargs))
+        values = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "0",
+            "InactiveExitTimestampMonotonic": "140",
+            "ActiveEnterTimestampMonotonic": "140",
+            "ExecMainStartTimestampMonotonic": "120",
+            "ExecMainExitTimestampMonotonic": "140",
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "".join(f"{name}={values[name]}\n" for name in _CACHE_WRITER_PROPERTIES),
+            "",
+        )
+
+    state = _cache_writer_service_state(
+        "pdi-p3d-1234567812345678",
+        "ldconfig.service",
+        runner=runner,
+    )
+    assert state.executed
+    command, kwargs = calls[0]
+    assert command[:5] == (
+        str(SYSTEMCTL),
+        "--machine=pdi-p3d-1234567812345678",
+        "--no-pager",
+        "show",
+        "ldconfig.service",
+    )
+    assert command[5:] == tuple(
+        f"--property={name}" for name in _CACHE_WRITER_PROPERTIES
+    )
+    assert kwargs["shell"] is False
+    assert kwargs["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    with pytest.raises(
+        AssertionError,
+        match="BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED",
+    ):
+        _cache_writer_service_state(
+            "pdi-p3d-1234567812345678",
+            "arbitrary.service",
+            runner=runner,
+        )
+
+    missing = _cache_writer_service_state(
+        "pdi-p3d-1234567812345678",
+        "ldconfig.service",
+        runner=lambda command, **kwargs: subprocess.CompletedProcess(
+            command,
+            4,
+            "LoadState=not-found\n",
+            "Unit ldconfig.service could not be found.\n",
+        ),
+    )
+    assert missing.load_state == "not-found"
+    assert not missing.executed
+
+
+def test_boot_cache_attribution_collects_post_boot_authority_read_only() -> None:
+    trusted = _TrustedLibpython(
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3/lib") / _LIBPYTHON_SONAME,
+        Path("/run/pdi-p3d-wp7-runtime.A1b2C3/lib"),
+        "3" * 64,
+    )
+
+    def capture(leader, uid, gid, command):
+        assert (leader, uid, gid) == (4321, 998, 997)
+        if command[0] == str(TEST):
+            path = command[-1]
+            if path in {"/etc/ld.so.conf", "/etc/ld.so.conf.d"}:
+                return subprocess.CompletedProcess(command, 1, "", "")
+            return subprocess.CompletedProcess(
+                command, 1 if command[1] == "-L" else 0, "", "",
+            )
+        if command[0] == str(STAT):
+            return subprocess.CompletedProcess(
+                command, 0, "128:0:0:644:regular file\n", "",
+            )
+        if command[0] == str(SHA256SUM):
+            return subprocess.CompletedProcess(
+                command, 0, f"{'2' * 64}  /etc/ld.so.cache\n", "",
+            )
+        raise AssertionError("UNEXPECTED_ATTRIBUTION_COMMAND")
+
+    def systemd_runner(command, **kwargs):
+        unit = command[4]
+        executed = unit == "ldconfig.service"
+        values = {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "ExecMainCode": "1" if executed else "0",
+            "ExecMainStatus": "0",
+            "InactiveExitTimestampMonotonic": "140" if executed else "0",
+            "ActiveEnterTimestampMonotonic": "140" if executed else "0",
+            "ExecMainStartTimestampMonotonic": "120" if executed else "0",
+            "ExecMainExitTimestampMonotonic": "140" if executed else "0",
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "".join(f"{name}={values[name]}\n" for name in _CACHE_WRITER_PROPERTIES),
+            "",
+        )
+
+    diagnostic = _collect_boot_cache_attribution(
+        machine="pdi-p3d-1234567812345678",
+        leader=4321,
+        runtime_uid=998,
+        runtime_gid=997,
+        trusted=trusted,
+        pre_boot=_cache_snapshot("1" * 64),
+        nspawn_start_monotonic_us=100,
+        manager_registration_monotonic_us=150,
+        post_libpython_entry_count=0,
+        capture=capture,
+        systemd_runner=systemd_runner,
+        monotonic_ns=lambda: 200_000,
+    )
+    assert diagnostic.writer_classification == "LDCONFIG_SERVICE_CONFIRMED"
+    assert (
+        diagnostic.writer_input_classification
+        == "QUALIFICATION_RUNTIME_NOT_INCLUDED"
+    )
+    assert diagnostic.mutation_during_boot == "YES"
+
+
+def test_ldconfig_input_parser_rejects_raw_secret_and_unsafe_path() -> None:
+    assert _validate_ld_so_conf_payload(
+        "/run/pdi-p3d-wp7-runtime.A1b2C3/lib\n"
+        "include /etc/ld.so.conf.d/*.conf\n"
+    ) == ("/run/pdi-p3d-wp7-runtime.A1b2C3/lib",)
+    for payload in (
+        "DATABASE__URL=postgresql://secret\n",
+        "/run/../tmp/escape\n",
+        "relative/path\n",
+    ):
+        with pytest.raises(
+            AssertionError,
+            match="BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED",
+        ):
+            _validate_ld_so_conf_payload(payload)
+
+
+def test_ldconfig_input_authority_finds_runtime_only_in_conf_d() -> None:
+    runtime = Path("/run/pdi-p3d-wp7-runtime.A1b2C3")
+    trusted = _TrustedLibpython(
+        runtime / "lib" / _LIBPYTHON_SONAME,
+        runtime / "lib",
+        "1" * 64,
+    )
+    main = Path("/etc/ld.so.conf")
+    conf_a = Path("/etc/ld.so.conf.d/a.conf")
+    conf_b = Path("/etc/ld.so.conf.d/b.conf")
+
+    def capture(leader, uid, gid, command):
+        assert (leader, uid, gid) == (4321, 998, 997)
+        if command[0] == str(TEST):
+            return subprocess.CompletedProcess(
+                command, 1 if command[1] == "-L" else 0, "", "",
+            )
+        if command[0] == str(FIND):
+            return subprocess.CompletedProcess(
+                command, 0, f"{conf_b}\n{conf_a}\n", "",
+            )
+        if command[0] == str(CAT):
+            payload = {
+                str(main): "include /etc/ld.so.conf.d/*.conf\n",
+                str(conf_a): f"{trusted.directory}\n",
+                str(conf_b): "/usr/local/lib\n",
+            }[command[-1]]
+            return subprocess.CompletedProcess(command, 0, payload, "")
+        raise AssertionError("UNEXPECTED_LDCONFIG_INPUT_COMMAND")
+
+    authority = _ldconfig_input_authority(
+        4321,
+        998,
+        997,
+        trusted,
+        capture=capture,
+    )
+    assert authority.main_present
+    assert not authority.main_includes_runtime
+    assert authority.conf_d_file_count == 2
+    assert authority.conf_d_includes_runtime
+    assert authority.includes_runtime
+
+
+def test_boot_cache_safe_output_rejects_raw_journal_or_runtime_path() -> None:
+    raw_journal = replace(
+        _boot_cache_diagnostic(),
+        ldconfig_journal_class="started /run/private",
+    )
+    with pytest.raises(
+        AssertionError,
+        match="BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED",
+    ):
+        raw_journal.safe_values()
+    unsafe_state = replace(
+        _boot_cache_diagnostic().ldconfig_state,
+        unit="/run/pdi-p3d-wp7-runtime.private",
+    )
+    unsafe_diagnostic = replace(
+        _boot_cache_diagnostic(),
+        writer_states=(
+            unsafe_state,
+            *_boot_cache_diagnostic().writer_states[1:],
+        ),
+    )
+    with pytest.raises(
+        AssertionError,
+        match="BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED",
+    ):
+        unsafe_diagnostic.safe_values()
 
 
 def test_container_python_preflight_requires_both_runtimes_and_clean_elf() -> None:
@@ -4771,6 +5961,9 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
             nspawn_stderr = diagnostic_root / "nspawn.stderr"
             diagnostic_streams.append(_secure_diagnostic_stream(nspawn_stdout))
             diagnostic_streams.append(_secure_diagnostic_stream(nspawn_stderr))
+            pre_boot_cache = _host_loader_cache_snapshot(root)
+            assert pre_boot_cache.sha256 == host_loader_cache_sha256
+            nspawn_start_monotonic_us = time.monotonic_ns() // 1000
             machine_process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL,
                 stdout=diagnostic_streams[0], stderr=diagnostic_streams[1],
@@ -4789,6 +5982,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                     "synthetic-immich-api-key",
                 ),
             )
+            manager_registration_monotonic_us = time.monotonic_ns() // 1000
             try:
                 loader_cache_diagnostic = (
                     _verify_container_loader_cache_visibility(
@@ -4804,6 +5998,27 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                 )
             except _ContainerLoaderCacheDiagnosticError as exc:
                 print(exc.diagnostic.safe_message())
+                try:
+                    cache_attribution = _collect_boot_cache_attribution(
+                        machine=machine,
+                        leader=leader,
+                        runtime_uid=account.pw_uid,
+                        runtime_gid=group.gr_gid,
+                        trusted=trusted_libpython,
+                        pre_boot=pre_boot_cache,
+                        nspawn_start_monotonic_us=nspawn_start_monotonic_us,
+                        manager_registration_monotonic_us=(
+                            manager_registration_monotonic_us
+                        ),
+                        post_libpython_entry_count=(
+                            exc.diagnostic.libpython_entry_count
+                        ),
+                    )
+                except AssertionError:
+                    raise AssertionError(
+                        "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_INVALID"
+                    ) from None
+                print(cache_attribution.safe_message())
                 raise AssertionError(
                     "CONTAINER_LOADER_CACHE_DIAGNOSTIC_INVALID"
                 ) from None

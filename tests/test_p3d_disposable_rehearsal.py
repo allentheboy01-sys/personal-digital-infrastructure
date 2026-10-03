@@ -1003,3 +1003,44 @@ def test_wp7_container_loader_cache_diagnostic_is_pre_workload_only() -> None:
     assert 'CONTAINER_LOADER_CACHE_DIAGNOSTIC_CLASS' in integration
     assert "LD_LIBRARY_PATH=" not in integration
     assert "LD_PRELOAD=" not in integration
+
+
+def test_wp7_boot_cache_attribution_is_read_only_and_pre_workload() -> None:
+    integration = (
+        Path(__file__).parents[1]
+        / "tests/integration/test_p3d_disposable_rehearsal.py"
+    ).read_text(encoding="utf-8")
+    rehearsal = integration.index(
+        "def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal()"
+    )
+    loader_diagnostic = integration.index(
+        "_verify_container_loader_cache_visibility(", rehearsal
+    )
+    attribution = integration.index(
+        "_collect_boot_cache_attribution(", loader_diagnostic
+    )
+    python_preflight = integration.index(
+        "_verify_container_python_preflight(", attribution
+    )
+    formal_lock = integration.index(
+        'Path(f"/proc/{leader}/root/run/lock/pdi-sync.lock")',
+        python_preflight,
+    )
+    assert loader_diagnostic < attribution < python_preflight < formal_lock
+    writer_query_start = integration.index(
+        "def _cache_writer_service_state("
+    )
+    writer_query_end = integration.index(
+        "def _allowlisted_cache_writer_states(", writer_query_start
+    )
+    writer_query = integration[writer_query_start:writer_query_end]
+    assert '"show"' in writer_query
+    assert all(
+        f'"{action}"' not in writer_query
+        for action in ("start", "stop", "restart", "enable", "disable")
+    )
+    assert '"ldconfig.service"' in integration
+    assert '"systemd-update-done.service"' in integration
+    assert '"systemd-tmpfiles-setup.service"' in integration
+    assert '"systemd-tmpfiles-setup-dev.service"' in integration
+    assert "journalctl" not in writer_query
