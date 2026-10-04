@@ -898,10 +898,65 @@ def test_dedicated_ci_requires_real_unskipped_systemd_rehearsal() -> None:
     assert "test -x /usr/bin/systemd-nspawn" in workflow
     assert "test -x /usr/bin/machinectl" in workflow
     assert '--junitxml="$rehearsal_report"' in workflow
-    assert '"skipped": 0' in workflow
-    assert "P3D_SERVICE_START_COUNT=6" in workflow
-    assert "P3D_TIMER_ENABLE_COUNT=0" in workflow
-    assert "RUNTIME_PIPELINE_COVERAGE=6/6" in workflow
+    assert 'assert totals["tests"] > 0, totals' in workflow
+    assert 'assert totals["failures"] == 0, totals' in workflow
+    assert 'assert totals["errors"] == 0, totals' in workflow
+    assert 'assert totals["skipped"] == 0, totals' in workflow
+    assert 'totals == {"tests": 1' not in workflow
+    required_markers = (
+        "P3D_DISPOSABLE_REHEARSAL=PASS",
+        "SYSTEMD_MANAGER_REAL=PASS",
+        "SYSTEMD_MANAGER_ISOLATED=PASS",
+        "P3D_SERVICE_START_COUNT=6",
+        "P3D_TIMER_ENABLE_COUNT=0",
+        "POSTGRESQL_MAJOR=16",
+        "RUNTIME_PIPELINE_COVERAGE=6/6",
+        "POST_REHEARSAL_RUNTIME_LEDGER_PROOF=PASS",
+        "TIMERS_FINAL_STATE=DISABLED_INACTIVE",
+        "PRODUCTION_TOUCHED=NO",
+    )
+    for marker in required_markers:
+        assert f"grep -Fx '{marker}' \"$rehearsal_log\"" in workflow
+    assert 'rm -f -- "$rehearsal_log" "$rehearsal_report"' in workflow
+
+
+@pytest.mark.parametrize(
+    ("totals", "accepted"),
+    (
+        ({"tests": 1, "failures": 0, "errors": 0, "skipped": 0}, True),
+        ({"tests": 140, "failures": 0, "errors": 0, "skipped": 0}, True),
+        ({"tests": 0, "failures": 0, "errors": 0, "skipped": 0}, False),
+        ({"tests": 1, "failures": 1, "errors": 0, "skipped": 0}, False),
+        ({"tests": 1, "failures": 0, "errors": 1, "skipped": 0}, False),
+        ({"tests": 1, "failures": 0, "errors": 0, "skipped": 1}, False),
+    ),
+)
+def test_dedicated_ci_junit_contract_accepts_any_nonempty_clean_suite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    totals: dict[str, int],
+    accepted: bool,
+) -> None:
+    workflow = (Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text()
+    start_marker = '          python - "$rehearsal_report" <<\'PY\'\n'
+    end_marker = "\n          PY\n"
+    validator = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+    validator = "\n".join(
+        line.removeprefix("          ") for line in validator.splitlines()
+    )
+    report = tmp_path / "wp7.xml"
+    report.write_text(
+        '<testsuite tests="{tests}" failures="{failures}" errors="{errors}" '
+        'skipped="{skipped}" />'.format(**totals),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("sys.argv", ["python", str(report)])
+
+    if accepted:
+        exec(compile(validator, ".github/workflows/ci.yml", "exec"), {})
+    else:
+        with pytest.raises(AssertionError):
+            exec(compile(validator, ".github/workflows/ci.yml", "exec"), {})
 
 
 def test_dedicated_ci_keeps_runtime_visible_with_private_tmp() -> None:

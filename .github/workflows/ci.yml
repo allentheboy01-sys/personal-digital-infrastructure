@@ -645,7 +645,10 @@ jobs:
               name: sum(int(suite.attrib.get(name, "0")) for suite in suites)
               for name in ("tests", "failures", "errors", "skipped")
           }
-          assert totals == {"tests": 1, "failures": 0, "errors": 0, "skipped": 0}, totals
+          assert totals["tests"] > 0, totals
+          assert totals["failures"] == 0, totals
+          assert totals["errors"] == 0, totals
+          assert totals["skipped"] == 0, totals
           PY
           grep -Fx 'P3D_DISPOSABLE_REHEARSAL=PASS' "$rehearsal_log"
           grep -Fx 'SYSTEMD_MANAGER_REAL=PASS' "$rehearsal_log"
