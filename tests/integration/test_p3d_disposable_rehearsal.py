@@ -180,6 +180,10 @@ _CACHE_WRITER_INPUT_CLASSES = {
     "WRITER_NOT_CONFIRMED",
     "INPUT_AUTHORITY_UNKNOWN",
 }
+_BOOT_LOADER_AUTHORITY_CLASSES = {
+    "TRUSTED_REBUILT_CACHE",
+    "TRUSTED_IDEMPOTENT_CACHE",
+}
 _LDCONFIG_JOURNAL_CLASSES = {
     "EXECUTED_SUCCESS",
     "EXECUTED_FAILED",
@@ -2850,28 +2854,64 @@ def _verify_container_loader_cache_visibility(
 def _verify_boot_loader_authority(
     loader: _ContainerLoaderCacheDiagnostic,
     attribution: _BootCacheAttributionDiagnostic,
-) -> None:
+) -> str:
     _validate_container_loader_cache_diagnostic(loader)
     _validate_boot_cache_attribution(attribution)
     ldconfig = attribution.ldconfig_state
-    if (
-        loader.classification
-        not in {"LOADER_CACHE_EFFECTIVE", "BOOT_REBUILT_CACHE_TRUSTED"}
-        or attribution.writer_classification != "LDCONFIG_SERVICE_CONFIRMED"
-        or attribution.writer_input_classification
-        != "QUALIFICATION_RUNTIME_INCLUDED"
-        or not attribution.ldconfig_input.main_present
-        or not attribution.ldconfig_input.main_includes_runtime
-        or attribution.ldconfig_input.conf_d_file_count != 0
-        or attribution.ldconfig_input.conf_d_includes_runtime
-        or not attribution.ldconfig_input.valid
-        or attribution.post_libpython_entry_count != 1
-        or loader.libpython_entry_count != 1
-        or ldconfig.load_state != "loaded"
-        or ldconfig.result != "success"
-        or ldconfig.exec_main_status != 0
-    ):
+    common_authority = (
+        attribution.pre_boot.identity_valid
+        and attribution.post_boot.identity_valid
+        and loader.host_cache_present
+        and loader.host_cache_sha256_valid
+        and loader.container_cache_present
+        and loader.container_cache_regular
+        and loader.libpython_entry_count == 1
+        and loader.cache_target_visible
+        and loader.cache_target_identity_match
+        and loader.base_python_visible
+        and loader.libpython_visible
+        and loader.base_loader_direct == "RESOLVED"
+        and loader.candidate_loader_direct == "RESOLVED"
+        and loader.base_loader_default_cache == "RESOLVED"
+        and ldconfig.executed
+        and ldconfig.load_state == "loaded"
+        and ldconfig.result == "success"
+        and ldconfig.exec_main_status == 0
+        and attribution.writer_before_post_observation(ldconfig) == "YES"
+        and attribution.ldconfig_input.main_present
+        and attribution.ldconfig_input.main_includes_runtime
+        and attribution.ldconfig_input.conf_d_file_count == 0
+        and not attribution.ldconfig_input.conf_d_includes_runtime
+        and attribution.ldconfig_input.valid
+        and attribution.post_libpython_entry_count == 1
+    )
+    if not common_authority:
         raise AssertionError("BOOT_LOADER_AUTHORITY_INVALID")
+    rebuilt = (
+        attribution.cache_changed
+        and loader.classification == "BOOT_REBUILT_CACHE_TRUSTED"
+        and not loader.container_cache_bytes_match_host
+        and attribution.writer_classification == "LDCONFIG_SERVICE_CONFIRMED"
+        and attribution.writer_input_classification
+        == "QUALIFICATION_RUNTIME_INCLUDED"
+    )
+    idempotent = (
+        not attribution.cache_changed
+        and attribution.pre_boot.sha256 == attribution.post_boot.sha256
+        and loader.classification == "LOADER_CACHE_EFFECTIVE"
+        and loader.container_cache_bytes_match_host
+        and attribution.writer_classification == "CACHE_NOT_CHANGED"
+        and attribution.writer_input_classification == "WRITER_NOT_CONFIRMED"
+    )
+    if rebuilt:
+        authority_class = "TRUSTED_REBUILT_CACHE"
+    elif idempotent:
+        authority_class = "TRUSTED_IDEMPOTENT_CACHE"
+    else:
+        raise AssertionError("BOOT_LOADER_AUTHORITY_INVALID")
+    if authority_class not in _BOOT_LOADER_AUTHORITY_CLASSES:
+        raise AssertionError("BOOT_LOADER_AUTHORITY_INVALID")
+    return authority_class
 
 
 def _collect_boot_cache_attribution(
@@ -4418,15 +4458,17 @@ def _cache_writer_state(
     executed: bool = False,
     start: int = 0,
     exit: int = 0,
+    result: str = "success",
+    status: int = 0,
 ) -> _CacheWriterServiceState:
     return _CacheWriterServiceState(
         unit,
         "loaded",
         "inactive",
         "dead",
-        "success",
+        result,
         1 if executed else 0,
-        0,
+        status if executed else 0,
         exit if executed else 0,
         exit if executed else 0,
         start if executed else 0,
@@ -4443,6 +4485,8 @@ def _boot_cache_diagnostic(
     other_executed: bool = False,
     input_included: bool = False,
     post_libpython_entry_count: int = 0,
+    ldconfig_result: str = "success",
+    ldconfig_status: int = 0,
 ) -> _BootCacheAttributionDiagnostic:
     states = tuple(
         _cache_writer_state(
@@ -4450,6 +4494,8 @@ def _boot_cache_diagnostic(
             executed=(ldconfig_executed if index == 0 else other_executed),
             start=(ldconfig_start if index == 0 else 125),
             exit=(ldconfig_exit if index == 0 else 135),
+            result=(ldconfig_result if index == 0 else "success"),
+            status=(ldconfig_status if index == 0 else 0),
         )
         for index, unit in enumerate(_CACHE_WRITER_UNITS)
     )
@@ -4564,7 +4610,137 @@ def test_boot_rebuilt_cache_with_trusted_writer_and_input_is_accepted() -> None:
         attribution.writer_input_classification
         == "QUALIFICATION_RUNTIME_INCLUDED"
     )
-    _verify_boot_loader_authority(loader, attribution)
+    assert (
+        _verify_boot_loader_authority(loader, attribution)
+        == "TRUSTED_REBUILT_CACHE"
+    )
+
+
+def test_idempotent_boot_cache_with_successful_ldconfig_is_accepted() -> None:
+    loader = _effective_container_loader_cache_diagnostic()
+    attribution = _boot_cache_diagnostic(
+        changed=False,
+        input_included=True,
+        post_libpython_entry_count=1,
+    )
+    assert attribution.writer_classification == "CACHE_NOT_CHANGED"
+    assert attribution.writer_input_classification == "WRITER_NOT_CONFIRMED"
+    assert (
+        _verify_boot_loader_authority(loader, attribution)
+        == "TRUSTED_IDEMPOTENT_CACHE"
+    )
+
+
+@pytest.mark.parametrize(
+    "attribution",
+    (
+        _boot_cache_diagnostic(
+            changed=False,
+            ldconfig_executed=False,
+            input_included=True,
+            post_libpython_entry_count=1,
+        ),
+        _boot_cache_diagnostic(
+            changed=False,
+            input_included=True,
+            post_libpython_entry_count=1,
+            ldconfig_result="exit-code",
+        ),
+        _boot_cache_diagnostic(
+            changed=False,
+            input_included=True,
+            post_libpython_entry_count=1,
+            ldconfig_status=1,
+        ),
+        _boot_cache_diagnostic(
+            changed=False,
+            ldconfig_start=250,
+            ldconfig_exit=260,
+            input_included=True,
+            post_libpython_entry_count=1,
+        ),
+    ),
+)
+def test_idempotent_boot_cache_rejects_invalid_ldconfig_execution(
+    attribution: _BootCacheAttributionDiagnostic,
+) -> None:
+    with pytest.raises(AssertionError, match="BOOT_LOADER_AUTHORITY_INVALID"):
+        _verify_boot_loader_authority(
+            _effective_container_loader_cache_diagnostic(),
+            attribution,
+        )
+
+
+@pytest.mark.parametrize(
+    "input_authority",
+    (
+        _LdConfigInputAuthority(False, False, 0, False),
+        _LdConfigInputAuthority(True, False, 0, False),
+        _LdConfigInputAuthority(True, True, 1, False, valid=False),
+    ),
+)
+def test_idempotent_boot_cache_rejects_invalid_loader_input_authority(
+    input_authority: _LdConfigInputAuthority,
+) -> None:
+    attribution = replace(
+        _boot_cache_diagnostic(
+            changed=False,
+            input_included=True,
+            post_libpython_entry_count=1,
+        ),
+        ldconfig_input=input_authority,
+    )
+    with pytest.raises(AssertionError, match="BOOT_LOADER_AUTHORITY_INVALID"):
+        _verify_boot_loader_authority(
+            _effective_container_loader_cache_diagnostic(),
+            attribution,
+        )
+
+
+@pytest.mark.parametrize(
+    "loader_changes,post_count",
+    (
+        (
+            {
+                "libpython_entry_count": 0,
+                "cache_target_visible": False,
+                "cache_target_identity_match": False,
+            },
+            0,
+        ),
+        ({"cache_target_identity_match": False}, 1),
+        ({"base_loader_direct": "NOT_FOUND"}, 1),
+        ({"candidate_loader_direct": "NOT_FOUND"}, 1),
+        ({"base_loader_default_cache": "NOT_FOUND"}, 1),
+    ),
+)
+def test_idempotent_boot_cache_rejects_incomplete_runtime_closure(
+    loader_changes: dict[str, object],
+    post_count: int,
+) -> None:
+    attribution = _boot_cache_diagnostic(
+        changed=False,
+        input_included=True,
+        post_libpython_entry_count=post_count,
+    )
+    with pytest.raises(AssertionError, match="BOOT_LOADER_AUTHORITY_INVALID"):
+        _verify_boot_loader_authority(
+            _effective_container_loader_cache_diagnostic(**loader_changes),
+            attribution,
+        )
+
+
+def test_boot_loader_authority_classification_is_fixed_and_path_free() -> None:
+    assert _BOOT_LOADER_AUTHORITY_CLASSES == {
+        "TRUSTED_REBUILT_CACHE",
+        "TRUSTED_IDEMPOTENT_CACHE",
+    }
+    for authority_class in _BOOT_LOADER_AUTHORITY_CLASSES:
+        assert re.fullmatch(r"[A-Z_]+", authority_class)
+        assert "/" not in authority_class
+        assert not any(
+            marker in authority_class for marker in _PROTECTED_SECRET_MARKERS
+        )
 
 
 def test_boot_rebuilt_cache_without_runtime_input_is_rejected() -> None:
@@ -6378,7 +6554,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                 ) from None
             print(cache_attribution.safe_message())
             try:
-                _verify_boot_loader_authority(
+                boot_loader_authority_class = _verify_boot_loader_authority(
                     loader_cache_diagnostic,
                     cache_attribution,
                 )
@@ -6386,6 +6562,10 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                 raise AssertionError(
                     "CONTAINER_LOADER_CACHE_DIAGNOSTIC_INVALID"
                 ) from None
+            print(
+                "BOOT_LOADER_AUTHORITY_CLASS="
+                f"{boot_loader_authority_class}"
+            )
             try:
                 python_preflight = _verify_container_python_preflight(
                     leader=leader,
