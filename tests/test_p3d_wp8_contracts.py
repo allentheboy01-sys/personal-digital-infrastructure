@@ -154,6 +154,23 @@ def runtime(evidence: WP8PhaseAEvidenceV1 | None = None) -> WP8RuntimeLedgerProo
     )
 
 
+def alternate_runtime(
+    evidence: WP8PhaseAEvidenceV1 | None = None,
+) -> WP8RuntimeLedgerProofV1:
+    evidence = evidence or phase_a()
+    records = list(pipeline_records())
+    records[0] = replace(
+        records[0], pipeline_run_id="91111111-2222-4333-8444-555555555555"
+    )
+    return WP8RuntimeLedgerProofV1.build(
+        candidate_sha=evidence.candidate_sha,
+        phase_a_context_fingerprint=evidence.phase_a_context_fingerprint,
+        rehearsal_operation_id=OPERATION,
+        runtime_boundary_fingerprint=H4,
+        pipeline_records=tuple(records),
+    )
+
+
 def snapshot() -> WP8InvariantSnapshotV1:
     return WP8InvariantSnapshotV1.from_mapping({
         "version": 1,
@@ -190,6 +207,13 @@ def invariant(evidence: WP8PhaseAEvidenceV1 | None = None) -> WP8InvariantProofV
         before=evidence.invariant_baseline,
         after=WP8InvariantSnapshotV1.from_mapping(evidence.invariant_baseline.to_mapping()),
     )
+
+
+def alternate_invariant() -> WP8InvariantProofV1:
+    mapping = invariant().to_mapping()
+    mapping["phase_a_evidence_fingerprint"] = HC
+    refingerprint(mapping, "invariant_proof_fingerprint")
+    return WP8InvariantProofV1.from_mapping(mapping)
 
 
 def cleanup(
@@ -499,6 +523,232 @@ def test_full_state_and_journal_chain_is_exact() -> None:
     )
 
 
+def test_journal_records_explicit_proof_stage_authority() -> None:
+    state, events = complete_state()
+    assert validate_rehearsal_journal_chain(events, state)
+    authorities = {
+        event.proof_authority_action.value: event
+        for event in events
+        if event.proof_authority_action.value != "CARRY_FORWARD"
+    }
+    assert set(authorities) == {
+        "ESTABLISH_RUNTIME_LEDGER", "ESTABLISH_INVARIANT", "ESTABLISH_CLEANUP",
+    }
+    assert authorities["ESTABLISH_RUNTIME_LEDGER"].to_state is (
+        WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED
+    )
+    assert authorities["ESTABLISH_RUNTIME_LEDGER"].proof_authority_fingerprint == (
+        runtime().runtime_ledger_fingerprint
+    )
+    assert authorities["ESTABLISH_INVARIANT"].to_state is (
+        WP8RehearsalPhase.INVARIANTS_VERIFIED
+    )
+    assert authorities["ESTABLISH_INVARIANT"].proof_authority_fingerprint == (
+        invariant().invariant_proof_fingerprint
+    )
+    assert authorities["ESTABLISH_CLEANUP"].to_state is (
+        WP8RehearsalPhase.SERVICES_STOPPED
+    )
+    assert authorities["ESTABLISH_CLEANUP"].proof_authority_fingerprint == (
+        cleanup().cleanup_proof_fingerprint
+    )
+
+
+def test_runtime_authority_cannot_be_substituted_after_binding() -> None:
+    state, events = stopped_state()
+    proof_b = alternate_runtime()
+    assert proof_b.runtime_ledger_fingerprint != runtime().runtime_ledger_fingerprint
+    assert proof_b.pipeline_records[0].pipeline_run_id != runtime().pipeline_records[0].pipeline_run_id
+    with pytest.raises(WP8ContractError) as caught:
+        transition_rehearsal_state(
+            state, WP8RehearsalPhase.REHEARSAL_COMPLETE,
+            sequence=len(events) + 1, timestamp_utc=timestamp(40),
+            runtime_ledger_fingerprint=proof_b.runtime_ledger_fingerprint,
+        )
+    assert caught.value.code is WP8FailureCode.PROTECTED_STATE_TAMPER
+    with pytest.raises(WP8ContractError):
+        transition_rehearsal_state(
+            state, WP8RehearsalPhase.REHEARSAL_COMPLETE,
+            sequence=len(events) + 1, timestamp_utc=timestamp(40),
+            invariant_proof_fingerprint=H1,
+        )
+
+
+def test_journal_and_completion_reject_rehashed_runtime_substitution() -> None:
+    inputs = completion_inputs()
+    marker = WP8RehearsalCompleteV1.build(**inputs)
+    proof_b = alternate_runtime()
+    events = list(inputs["journal_events"])
+    final_mapping = events[-1].to_mapping()
+    final_mapping["evidence_fingerprints"] = sorted({
+        *final_mapping["evidence_fingerprints"],
+        proof_b.runtime_ledger_fingerprint,
+    })
+    refingerprint(final_mapping, "event_fingerprint")
+    events[-1] = WP8RehearsalJournalEventV1.from_mapping(final_mapping)
+    state_mapping = inputs["state"].to_mapping()
+    state_mapping["runtime_ledger_fingerprint"] = proof_b.runtime_ledger_fingerprint
+    state_mapping["journal_head_fingerprint"] = events[-1].event_fingerprint
+    refingerprint(state_mapping, "state_fingerprint")
+    substituted_state = WP8RehearsalStateV1.from_mapping(state_mapping)
+    with pytest.raises(WP8ContractError) as caught:
+        validate_rehearsal_journal_chain(tuple(events), substituted_state)
+    assert caught.value.code is WP8FailureCode.PROTECTED_STATE_TAMPER
+    inputs.update(
+        runtime_ledger=proof_b,
+        state=substituted_state,
+        journal_events=tuple(events),
+    )
+    with pytest.raises(WP8ContractError) as caught:
+        WP8RehearsalCompleteV1.build(**inputs)
+    assert caught.value.code is WP8FailureCode.PROTECTED_STATE_TAMPER
+    validation = {key: value for key, value in inputs.items() if key != "completed_at_utc"}
+    with pytest.raises(WP8ContractError):
+        validate_rehearsal_completion(marker, **validation)
+
+
+def test_journal_and_completion_reject_rehashed_invariant_substitution() -> None:
+    inputs = completion_inputs()
+    proof_b = alternate_invariant()
+    events = list(inputs["journal_events"])
+    final_mapping = events[-1].to_mapping()
+    final_mapping["evidence_fingerprints"] = sorted({
+        *final_mapping["evidence_fingerprints"],
+        proof_b.invariant_proof_fingerprint,
+    })
+    refingerprint(final_mapping, "event_fingerprint")
+    events[-1] = WP8RehearsalJournalEventV1.from_mapping(final_mapping)
+    state_mapping = inputs["state"].to_mapping()
+    state_mapping["invariant_proof_fingerprint"] = proof_b.invariant_proof_fingerprint
+    state_mapping["journal_head_fingerprint"] = events[-1].event_fingerprint
+    refingerprint(state_mapping, "state_fingerprint")
+    substituted_state = WP8RehearsalStateV1.from_mapping(state_mapping)
+    with pytest.raises(WP8ContractError):
+        validate_rehearsal_journal_chain(tuple(events), substituted_state)
+    inputs.update(
+        invariant_proof=proof_b,
+        state=substituted_state,
+        journal_events=tuple(events),
+    )
+    with pytest.raises(WP8ContractError):
+        WP8RehearsalCompleteV1.build(**inputs)
+
+
+def test_rehashed_journal_cannot_reclassify_proof_authority_action() -> None:
+    _, events = complete_state()
+    runtime_event = next(
+        event for event in events
+        if event.to_state is WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED
+    )
+    mapping = runtime_event.to_mapping()
+    mapping["proof_authority_action"] = "CARRY_FORWARD"
+    mapping["proof_authority_fingerprint"] = None
+    refingerprint(mapping, "event_fingerprint")
+    with pytest.raises(WP8ContractError) as caught:
+        WP8RehearsalJournalEventV1.from_mapping(mapping)
+    assert caught.value.code is WP8FailureCode.PROTECTED_STATE_TAMPER
+
+
+def test_normal_phase_proof_legality_matrix_is_exhaustive() -> None:
+    runtime_index = NORMAL_PHASES.index(WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED)
+    invariant_index = NORMAL_PHASES.index(WP8RehearsalPhase.INVARIANTS_VERIFIED)
+    cleanup_index = NORMAL_PHASES.index(WP8RehearsalPhase.SERVICES_STOPPED)
+    for index, phase in enumerate(NORMAL_PHASES):
+        state = initial_state() if phase is WP8RehearsalPhase.NEW else state_prefix(phase)[0]
+        expected = (index >= runtime_index, index >= invariant_index, index >= cleanup_index)
+        assert (
+            state.runtime_ledger_fingerprint is not None,
+            state.invariant_proof_fingerprint is not None,
+            state.cleanup_proof_fingerprint is not None,
+        ) == expected
+        for proof_name, present in zip((
+            "runtime_ledger_fingerprint",
+            "invariant_proof_fingerprint",
+            "cleanup_proof_fingerprint",
+        ), expected):
+            mapping = state.to_mapping()
+            if proof_name == "cleanup_proof_fingerprint":
+                if present:
+                    mapping["cleanup_proof_fingerprint"] = None
+                    mapping["cleanup_proof"] = None
+                else:
+                    mapping["cleanup_proof_fingerprint"] = cleanup().cleanup_proof_fingerprint
+                    mapping["cleanup_proof"] = cleanup().to_mapping()
+            else:
+                mapping[proof_name] = None if present else H1
+            refingerprint(mapping, "state_fingerprint")
+            with pytest.raises(WP8ContractError):
+                WP8RehearsalStateV1.from_mapping(mapping)
+
+
+@pytest.mark.parametrize("phase", [
+    WP8RehearsalPhase.CURRENT_PROMOTED,
+    WP8RehearsalPhase.SERVICE_1_EXECUTING,
+    WP8RehearsalPhase.SERVICE_3_VERIFIED,
+    WP8RehearsalPhase.SERVICES_EXECUTED,
+])
+def test_early_abort_cannot_invent_runtime_or_invariant_proofs(phase) -> None:
+    state, events = state_prefix(phase)
+    with pytest.raises(WP8ContractError) as caught:
+        transition_rehearsal_state(
+            state, WP8RehearsalPhase.ABORTED,
+            sequence=len(events) + 1, timestamp_utc=timestamp(50),
+            primary_failure_code=WP8FailureCode.CURRENT_DRIFT,
+            runtime_ledger_fingerprint=runtime().runtime_ledger_fingerprint,
+            invariant_proof_fingerprint=invariant().invariant_proof_fingerprint,
+            cleanup_proof=cleanup(),
+        )
+    assert caught.value.code is WP8FailureCode.PROTECTED_STATE_TAMPER
+    aborted, _ = transition_rehearsal_state(
+        state, WP8RehearsalPhase.ABORTED,
+        sequence=len(events) + 1, timestamp_utc=timestamp(50),
+        primary_failure_code=WP8FailureCode.CURRENT_DRIFT,
+        cleanup_proof=cleanup(),
+    )
+    mapping = aborted.to_mapping()
+    mapping["runtime_ledger_fingerprint"] = runtime().runtime_ledger_fingerprint
+    mapping["invariant_proof_fingerprint"] = invariant().invariant_proof_fingerprint
+    refingerprint(mapping, "state_fingerprint")
+    with pytest.raises(WP8ContractError) as caught:
+        WP8RehearsalStateV1.from_mapping(mapping)
+    assert caught.value.code is WP8FailureCode.PROTECTED_STATE_TAMPER
+
+
+@pytest.mark.parametrize("phase", NORMAL_PHASES[4:-1])
+def test_every_post_mutation_failure_inherits_only_established_proofs(phase) -> None:
+    state, events = state_prefix(phase)
+    kwargs = {} if state.cleanup_proof is not None else {"cleanup_proof": cleanup()}
+    aborted, event = transition_rehearsal_state(
+        state, WP8RehearsalPhase.ABORTED,
+        sequence=len(events) + 1, timestamp_utc=timestamp(50),
+        primary_failure_code=WP8FailureCode.CURRENT_DRIFT,
+        **kwargs,
+    )
+    assert aborted.runtime_ledger_fingerprint == state.runtime_ledger_fingerprint
+    assert aborted.invariant_proof_fingerprint == state.invariant_proof_fingerprint
+    assert aborted.cleanup_proof.result is WP8CleanupResult.PASS
+    assert validate_rehearsal_journal_chain((*events, event), aborted)
+
+
+@pytest.mark.parametrize("phase", [
+    WP8RehearsalPhase.CURRENT_PROMOTED,
+    WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED,
+    WP8RehearsalPhase.INVARIANTS_VERIFIED,
+])
+def test_abort_not_confirmed_inherits_exact_failure_point_authority(phase) -> None:
+    state, events = state_prefix(phase)
+    aborted, event = transition_rehearsal_state(
+        state, WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
+        sequence=len(events) + 1, timestamp_utc=timestamp(50),
+        primary_failure_code=WP8FailureCode.CURRENT_DRIFT,
+        cleanup_failure_code=WP8FailureCode.CLEANUP_FAILED,
+        cleanup_proof=cleanup(result=WP8CleanupResult.FAIL),
+    )
+    assert aborted.runtime_ledger_fingerprint == state.runtime_ledger_fingerprint
+    assert aborted.invariant_proof_fingerprint == state.invariant_proof_fingerprint
+    assert validate_rehearsal_journal_chain((*events, event), aborted)
+
+
 def test_journal_rejects_sequence_chain_context_and_timestamp_drift() -> None:
     state, events = stopped_state()
     with pytest.raises(WP8ContractError):
@@ -743,8 +993,16 @@ def state_prefix(target: WP8RehearsalPhase):
     state = initial_state()
     events = []
     for sequence, phase in enumerate(NORMAL_PHASES[1:], start=1):
+        kwargs = {}
+        if phase is WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED:
+            kwargs["runtime_ledger_fingerprint"] = runtime().runtime_ledger_fingerprint
+        if phase is WP8RehearsalPhase.INVARIANTS_VERIFIED:
+            kwargs["invariant_proof_fingerprint"] = invariant().invariant_proof_fingerprint
+        if phase is WP8RehearsalPhase.SERVICES_STOPPED:
+            kwargs["cleanup_proof"] = cleanup()
         state, event = transition_rehearsal_state(
             state, phase, sequence=sequence, timestamp_utc=timestamp(sequence + 4),
+            **kwargs,
         )
         events.append(event)
         if phase is target:
@@ -966,6 +1224,10 @@ def test_equal_but_foreign_baseline_is_not_reviewed_authority() -> None:
             foreign.invariant_proof_fingerprint if item == old_hash else item
             for item in changed["evidence_fingerprints"]
         )
+        if changed["proof_authority_action"] == "ESTABLISH_INVARIANT":
+            changed["proof_authority_fingerprint"] = (
+                foreign.invariant_proof_fingerprint
+            )
         changed["previous_event_fingerprint"] = previous
         refingerprint(changed, "event_fingerprint")
         parsed = WP8RehearsalJournalEventV1.from_mapping(changed)

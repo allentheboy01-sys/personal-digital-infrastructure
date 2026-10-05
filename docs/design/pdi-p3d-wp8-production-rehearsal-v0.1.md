@@ -145,6 +145,44 @@ and cleanup journal events. `ABORTED`, `SERVICES_STOPPED`, and the normal
 FAIL/non-confirmed proof. Hash presence, clearing a failure code, or reusing
 a failed proof cannot manufacture cleanup success.
 
+### Proof-stage authority
+
+`PROOF_STAGE_AUTHORITY=STRICT`. Proof authority is established by an exact
+journal transition, not by membership in a generic evidence-fingerprint set:
+
+- runtime-ledger authority is absent through `SERVICES_EXECUTED`, is first
+  established by the transition into `RUNTIME_LEDGER_VERIFIED`, and its exact
+  fingerprint is immutable afterward;
+- invariant authority is absent before `INVARIANTS_VERIFIED`, is first
+  established by the transition into that phase, and is immutable afterward;
+- cleanup authority is established only by a transition that actually records
+  an exact cleanup proof: normal entry into `SERVICES_STOPPED`, post-mutation
+  failure cleanup into `ABORTED` or `ABORT_NOT_CONFIRMED`, or cleanup recovery.
+
+Every journal event has a fixed proof-authority action: carry existing
+authority, establish runtime, establish invariant, establish cleanup, or
+replace cleanup during recovery. The action is determined by its source and
+target phases and, for an establishing event, binds the exact proof
+fingerprint. Runtime and invariant references cannot be restated, cleared, or
+replaced after establishment. A failure state inherits exactly the proof
+authority that existed at its recorded `failed_phase`; it cannot attach a
+future-phase proof even if that proof and its fingerprint are otherwise valid.
+
+The only replacement exception is cleanup recovery from
+`ABORT_NOT_CONFIRMED`. Such a recovery may update the cleanup proof and
+cleanup-specific failure status, including proving final `ABORTED`, while it
+preserves the operation UUID, candidate, Phase A context, authorization,
+primary failure, failed phase, failed pipeline, runtime proof, invariant
+proof, and preceding execution history. A cleanup proof already established
+by normal `SERVICES_STOPPED` is carried forward rather than replaced.
+
+Full-chain validation independently reconstructs runtime, invariant, and
+cleanup authority from these establishing events and requires the final state
+to equal the reconstructed identities. Completion additionally requires each
+supplied proof object, state reference, and journal-derived authority to have
+the same exact fingerprint. A later valid proof added only to generic evidence
+cannot substitute for the proof established at its authorized phase.
+
 On first failure, state and journal preserve `primary_failure_code`,
 `failed_phase`, `failed_pipeline_key`, and `failure_mutation_boundary`
 (`PRE_MUTATION` or `POST_MUTATION`). Recovery from `ABORT_NOT_CONFIRMED` may

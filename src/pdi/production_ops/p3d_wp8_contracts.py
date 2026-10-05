@@ -1007,6 +1007,21 @@ FAILURE_PHASES = frozenset({
 })
 
 
+def _proof_presence_after_phase(
+    phase: WP8RehearsalPhase,
+) -> tuple[bool, bool, bool]:
+    """Return runtime, invariant, cleanup authority established by ``phase``."""
+    try:
+        index = NORMAL_PHASES.index(phase)
+    except ValueError:
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    return (
+        index >= NORMAL_PHASES.index(WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED),
+        index >= NORMAL_PHASES.index(WP8RehearsalPhase.INVARIANTS_VERIFIED),
+        index >= NORMAL_PHASES.index(WP8RehearsalPhase.SERVICES_STOPPED),
+    )
+
+
 def _failure_provenance(
     primary: WP8FailureCode | None,
     phase: Any,
@@ -1173,34 +1188,17 @@ class WP8RehearsalStateV1:
                 _fail()
         elif journal_head is None:
             _fail()
-        normal_runtime_phases = frozenset({
-            WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED,
-            WP8RehearsalPhase.INVARIANTS_VERIFIED,
-            WP8RehearsalPhase.SERVICES_STOPPED,
-            WP8RehearsalPhase.REHEARSAL_COMPLETE,
-        })
-        normal_invariant_phases = frozenset({
-            WP8RehearsalPhase.INVARIANTS_VERIFIED,
-            WP8RehearsalPhase.SERVICES_STOPPED,
-            WP8RehearsalPhase.REHEARSAL_COMPLETE,
-        })
-        normal_cleanup_phases = frozenset({
-            WP8RehearsalPhase.SERVICES_STOPPED,
-            WP8RehearsalPhase.REHEARSAL_COMPLETE,
-        })
-        if phase in normal_runtime_phases and runtime is None:
-            _fail()
-        if phase in normal_invariant_phases and invariant is None:
-            _fail()
-        if phase in normal_cleanup_phases and cleanup is None:
-            _fail()
         normal_phase = phase in NORMAL_PHASES
-        if normal_phase and phase not in normal_runtime_phases and runtime is not None:
-            _fail()
-        if normal_phase and phase not in normal_invariant_phases and invariant is not None:
-            _fail()
-        if normal_phase and phase not in normal_cleanup_phases and cleanup is not None:
-            _fail()
+        if normal_phase:
+            expected_runtime, expected_invariant, expected_cleanup = (
+                _proof_presence_after_phase(phase)
+            )
+            if (
+                (runtime is not None) != expected_runtime
+                or (invariant is not None) != expected_invariant
+                or (cleanup is not None) != expected_cleanup
+            ):
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         failure_phase = phase in {
             WP8RehearsalPhase.FAILED,
             WP8RehearsalPhase.ABORTED,
@@ -1214,6 +1212,15 @@ class WP8RehearsalStateV1:
             runtime, invariant, cleanup, cleanup_failure,
         )):
             _fail()
+        if failure_phase and phase is not WP8RehearsalPhase.FAILED:
+            expected_runtime, expected_invariant, _ = _proof_presence_after_phase(
+                failed_phase
+            )
+            if (
+                (runtime is not None) != expected_runtime
+                or (invariant is not None) != expected_invariant
+            ):
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         if phase is WP8RehearsalPhase.ABORTED and (
             cleanup_proof is None or cleanup_proof.result is not WP8CleanupResult.PASS
             or cleanup_failure is not None
@@ -1224,7 +1231,7 @@ class WP8RehearsalStateV1:
             or cleanup_failure is not WP8FailureCode.CLEANUP_FAILED
         ):
             _fail()
-        if phase in normal_cleanup_phases and (
+        if normal_phase and expected_cleanup and (
             cleanup_proof is None or cleanup_proof.result is not WP8CleanupResult.PASS
         ):
             _fail(WP8FailureCode.CLEANUP_FAILED)
@@ -1299,6 +1306,14 @@ class WP8EventClass(str, Enum):
     CLEANUP_RECOVERY = "CLEANUP_RECOVERY"
 
 
+class WP8ProofAuthorityAction(str, Enum):
+    CARRY_FORWARD = "CARRY_FORWARD"
+    ESTABLISH_RUNTIME_LEDGER = "ESTABLISH_RUNTIME_LEDGER"
+    ESTABLISH_INVARIANT = "ESTABLISH_INVARIANT"
+    ESTABLISH_CLEANUP = "ESTABLISH_CLEANUP"
+    REPLACE_CLEANUP = "REPLACE_CLEANUP"
+
+
 def _event_class(
     source: WP8RehearsalPhase,
     target: WP8RehearsalPhase,
@@ -1316,6 +1331,26 @@ def _event_class(
     return WP8EventClass.STATE_TRANSITION
 
 
+def _proof_authority_action(
+    source: WP8RehearsalPhase,
+    target: WP8RehearsalPhase,
+) -> WP8ProofAuthorityAction:
+    if source is WP8RehearsalPhase.ABORT_NOT_CONFIRMED:
+        return WP8ProofAuthorityAction.REPLACE_CLEANUP
+    if target is WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED:
+        return WP8ProofAuthorityAction.ESTABLISH_RUNTIME_LEDGER
+    if target is WP8RehearsalPhase.INVARIANTS_VERIFIED:
+        return WP8ProofAuthorityAction.ESTABLISH_INVARIANT
+    if target is WP8RehearsalPhase.SERVICES_STOPPED:
+        return WP8ProofAuthorityAction.ESTABLISH_CLEANUP
+    if target in {
+        WP8RehearsalPhase.ABORTED,
+        WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
+    } and source is not WP8RehearsalPhase.SERVICES_STOPPED:
+        return WP8ProofAuthorityAction.ESTABLISH_CLEANUP
+    return WP8ProofAuthorityAction.CARRY_FORWARD
+
+
 @dataclass(frozen=True, slots=True)
 class WP8RehearsalJournalEventV1:
     sequence: int
@@ -1326,6 +1361,8 @@ class WP8RehearsalJournalEventV1:
     from_state: WP8RehearsalPhase
     to_state: WP8RehearsalPhase
     event_class: WP8EventClass
+    proof_authority_action: WP8ProofAuthorityAction
+    proof_authority_fingerprint: str | None
     previous_event_fingerprint: str | None
     timestamp_utc: str
     pipeline_key: str | None
@@ -1342,6 +1379,7 @@ class WP8RehearsalJournalEventV1:
         "version", "sequence", "operation_id", "candidate_sha",
         "phase_a_context_fingerprint", "authorization_fingerprint",
         "from_state", "to_state", "event_class",
+        "proof_authority_action", "proof_authority_fingerprint",
         "previous_event_fingerprint", "timestamp_utc", "pipeline_key",
         "failed_pipeline_key", "failed_phase", "failure_mutation_boundary", "cleanup_proof",
         "evidence_fingerprints", "primary_failure_code",
@@ -1361,6 +1399,7 @@ class WP8RehearsalJournalEventV1:
         cleanup_failure_code: WP8FailureCode | None = None,
         failed_pipeline_key: str | None = None,
         cleanup_proof: WP8CleanupProofV1 | None = None,
+        proof_authority_fingerprint: str | None = None,
     ) -> "WP8RehearsalJournalEventV1":
         state = WP8RehearsalStateV1.from_mapping(state.to_mapping())
         target = _enum(WP8RehearsalPhase, target)
@@ -1387,6 +1426,20 @@ class WP8RehearsalJournalEventV1:
         fingerprints = tuple(sorted(_sha256(item) for item in evidence_fingerprints))
         if len(set(fingerprints)) != len(fingerprints):
             _fail()
+        action = _proof_authority_action(state.phase, target)
+        authority_fingerprint = (
+            None if proof_authority_fingerprint is None
+            else _sha256(proof_authority_fingerprint)
+        )
+        if (action is WP8ProofAuthorityAction.CARRY_FORWARD) != (
+            authority_fingerprint is None
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        if (
+            authority_fingerprint is not None
+            and authority_fingerprint not in fingerprints
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         value: dict[str, Any] = {
             "version": 1,
             "sequence": sequence,
@@ -1397,6 +1450,8 @@ class WP8RehearsalJournalEventV1:
             "from_state": state.phase.value,
             "to_state": target.value,
             "event_class": _event_class(state.phase, target).value,
+            "proof_authority_action": action.value,
+            "proof_authority_fingerprint": authority_fingerprint,
             "previous_event_fingerprint": state.journal_head_fingerprint,
             "timestamp_utc": timestamp_utc,
             "pipeline_key": pipeline_key,
@@ -1427,6 +1482,17 @@ class WP8RehearsalJournalEventV1:
         event_class = _enum(WP8EventClass, value["event_class"])
         if event_class is not _event_class(source, target):
             _fail()
+        action = _enum(WP8ProofAuthorityAction, value["proof_authority_action"])
+        if action is not _proof_authority_action(source, target):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        authority_fingerprint = (
+            None if value["proof_authority_fingerprint"] is None
+            else _sha256(value["proof_authority_fingerprint"])
+        )
+        if (action is WP8ProofAuthorityAction.CARRY_FORWARD) != (
+            authority_fingerprint is None
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         previous = None if value["previous_event_fingerprint"] is None else _sha256(
             value["previous_event_fingerprint"]
         )
@@ -1444,6 +1510,8 @@ class WP8RehearsalJournalEventV1:
         fingerprints = tuple(sorted(_sha256(item) for item in raw_fingerprints))
         if len(fingerprints) != len(set(fingerprints)) or tuple(raw_fingerprints) != fingerprints:
             _fail()
+        if authority_fingerprint is not None and authority_fingerprint not in fingerprints:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         primary = None if value["primary_failure_code"] is None else _enum(
             WP8FailureCode, value["primary_failure_code"]
         )
@@ -1493,6 +1561,15 @@ class WP8RehearsalJournalEventV1:
                 != (target is WP8RehearsalPhase.ABORT_NOT_CONFIRMED)
             ):
                 _fail(WP8FailureCode.CLEANUP_FAILED)
+        cleanup_actions = {
+            WP8ProofAuthorityAction.ESTABLISH_CLEANUP,
+            WP8ProofAuthorityAction.REPLACE_CLEANUP,
+        }
+        if action in cleanup_actions and (
+            cleanup_proof is None
+            or authority_fingerprint != cleanup_proof.cleanup_proof_fingerprint
+        ):
+            _fail(WP8FailureCode.CLEANUP_FAILED)
         event_fingerprint = _sha256(value["event_fingerprint"])
         if event_fingerprint != _fingerprint_without(value, "event_fingerprint"):
             _fail(WP8FailureCode.CONTRACT_FINGERPRINT_MISMATCH)
@@ -1505,6 +1582,8 @@ class WP8RehearsalJournalEventV1:
             source,
             target,
             event_class,
+            action,
+            authority_fingerprint,
             previous,
             _timestamp(value["timestamp_utc"]),
             pipeline,
@@ -1529,6 +1608,8 @@ class WP8RehearsalJournalEventV1:
             "from_state": self.from_state.value,
             "to_state": self.to_state.value,
             "event_class": self.event_class.value,
+            "proof_authority_action": self.proof_authority_action.value,
+            "proof_authority_fingerprint": self.proof_authority_fingerprint,
             "previous_event_fingerprint": self.previous_event_fingerprint,
             "timestamp_utc": self.timestamp_utc,
             "pipeline_key": self.pipeline_key,
@@ -1598,17 +1679,56 @@ def transition_rehearsal_state(
     ):
         _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
     runtime = state.runtime_ledger_fingerprint
-    invariant = state.invariant_proof_fingerprint
-    if runtime_ledger_fingerprint is not None:
+    if target is WP8RehearsalPhase.RUNTIME_LEDGER_VERIFIED:
+        if runtime is not None or runtime_ledger_fingerprint is None:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         runtime = _sha256(runtime_ledger_fingerprint)
-    if invariant_proof_fingerprint is not None:
+    elif runtime_ledger_fingerprint is not None:
+        # Runtime authority is established once at its verified phase. Abort
+        # inherits it and later normal phases may neither replace nor restate it.
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    invariant = state.invariant_proof_fingerprint
+    if target is WP8RehearsalPhase.INVARIANTS_VERIFIED:
+        if invariant is not None or invariant_proof_fingerprint is None:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         invariant = _sha256(invariant_proof_fingerprint)
+    elif invariant_proof_fingerprint is not None:
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+
+    supplied_cleanup = None
     if cleanup_proof is not None:
-        cleanup_proof = WP8CleanupProofV1.from_mapping(cleanup_proof.to_mapping())
+        supplied_cleanup = WP8CleanupProofV1.from_mapping(cleanup_proof.to_mapping())
+    cleanup_targets = {
+        WP8RehearsalPhase.SERVICES_STOPPED,
+        WP8RehearsalPhase.ABORTED,
+        WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
+    }
+    if retry:
+        if supplied_cleanup is None:
+            _fail(WP8FailureCode.CLEANUP_FAILED)
+        cleanup_proof = supplied_cleanup
+    elif target is WP8RehearsalPhase.SERVICES_STOPPED:
+        if state.cleanup_proof is not None or supplied_cleanup is None:
+            _fail(WP8FailureCode.CLEANUP_FAILED)
+        cleanup_proof = supplied_cleanup
+    elif target in FAILURE_PHASES and target is not WP8RehearsalPhase.FAILED:
+        if state.cleanup_proof is None:
+            if supplied_cleanup is None:
+                _fail(WP8FailureCode.CLEANUP_FAILED)
+            cleanup_proof = supplied_cleanup
+        else:
+            if supplied_cleanup is not None and supplied_cleanup != state.cleanup_proof:
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+            cleanup_proof = state.cleanup_proof
     elif target is WP8RehearsalPhase.REHEARSAL_COMPLETE:
+        if supplied_cleanup is not None:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         cleanup_proof = state.cleanup_proof
-    # Aborts and cleanup retries require a newly supplied exact proof, never
-    # infer success from a stale hash or from clearing a failure code.
+    else:
+        if supplied_cleanup is not None or target in cleanup_targets:
+            _fail(WP8FailureCode.CLEANUP_FAILED)
+        cleanup_proof = state.cleanup_proof
+
     cleanup = None if cleanup_proof is None else cleanup_proof.cleanup_proof_fingerprint
     combined_evidence = tuple(sorted(set(
         tuple(evidence_fingerprints) + tuple(
@@ -1625,6 +1745,13 @@ def transition_rehearsal_state(
         cleanup_failure_code=cleanup_failure,
         failed_pipeline_key=failed_pipeline_key,
         cleanup_proof=cleanup_proof,
+        proof_authority_fingerprint={
+            WP8ProofAuthorityAction.ESTABLISH_RUNTIME_LEDGER: runtime,
+            WP8ProofAuthorityAction.ESTABLISH_INVARIANT: invariant,
+            WP8ProofAuthorityAction.ESTABLISH_CLEANUP: cleanup,
+            WP8ProofAuthorityAction.REPLACE_CLEANUP: cleanup,
+            WP8ProofAuthorityAction.CARRY_FORWARD: None,
+        }[_proof_authority_action(state.phase, target)],
     )
     value = {
         **state.to_mapping(),
@@ -1645,10 +1772,10 @@ def transition_rehearsal_state(
     return WP8RehearsalStateV1.from_mapping(value), event
 
 
-def validate_rehearsal_journal_chain(
+def _derive_rehearsal_journal_proof_authority(
     events: Sequence[WP8RehearsalJournalEventV1],
     state: WP8RehearsalStateV1,
-) -> bool:
+) -> tuple[str | None, str | None, str | None]:
     if not isinstance(events, (list, tuple)) or not events:
         _fail()
     normalized = tuple(
@@ -1661,7 +1788,9 @@ def validate_rehearsal_journal_chain(
         _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
     previous: WP8RehearsalJournalEventV1 | None = None
     first_failure: tuple[Any, ...] | None = None
-    cumulative_evidence: set[str] = set()
+    runtime_authority: str | None = None
+    invariant_authority: str | None = None
+    cleanup_authority: str | None = None
     for expected_sequence, event in enumerate(normalized, start=1):
         if (
             event.sequence != expected_sequence
@@ -1688,7 +1817,45 @@ def validate_rehearsal_journal_chain(
             or event.timestamp_utc < previous.timestamp_utc
         ):
             _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
-        cumulative_evidence.update(event.evidence_fingerprints)
+        action = event.proof_authority_action
+        authority = event.proof_authority_fingerprint
+        if action is WP8ProofAuthorityAction.ESTABLISH_RUNTIME_LEDGER:
+            if runtime_authority is not None:
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+            runtime_authority = authority
+        elif action is WP8ProofAuthorityAction.ESTABLISH_INVARIANT:
+            if invariant_authority is not None or runtime_authority is None:
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+            invariant_authority = authority
+        elif action is WP8ProofAuthorityAction.ESTABLISH_CLEANUP:
+            if cleanup_authority is not None:
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+            cleanup_authority = authority
+        elif action is WP8ProofAuthorityAction.REPLACE_CLEANUP:
+            if cleanup_authority is None:
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+            cleanup_authority = authority
+        elif action is not WP8ProofAuthorityAction.CARRY_FORWARD:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        if event.cleanup_proof is not None and (
+            cleanup_authority != event.cleanup_proof.cleanup_proof_fingerprint
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        if event.to_state in NORMAL_PHASES:
+            expected_runtime, expected_invariant, expected_cleanup = (
+                _proof_presence_after_phase(event.to_state)
+            )
+        else:
+            expected_runtime, expected_invariant, _ = _proof_presence_after_phase(
+                event.failed_phase
+            )
+            expected_cleanup = event.to_state is not WP8RehearsalPhase.FAILED
+        if (
+            (runtime_authority is not None) != expected_runtime
+            or (invariant_authority is not None) != expected_invariant
+            or (cleanup_authority is not None) != expected_cleanup
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         previous = event
     final = normalized[-1]
     if (
@@ -1701,16 +1868,25 @@ def validate_rehearsal_journal_chain(
         or final.failed_phase is not state.failed_phase
         or final.failure_mutation_boundary != state.failure_mutation_boundary
         or final.cleanup_proof != state.cleanup_proof
-        or any(
-            fingerprint is not None and fingerprint not in cumulative_evidence
-            for fingerprint in (
-                state.runtime_ledger_fingerprint,
-                state.invariant_proof_fingerprint,
-                state.cleanup_proof_fingerprint,
-            )
+        or (
+            runtime_authority,
+            invariant_authority,
+            cleanup_authority,
+        ) != (
+            state.runtime_ledger_fingerprint,
+            state.invariant_proof_fingerprint,
+            state.cleanup_proof_fingerprint,
         )
     ):
         _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    return runtime_authority, invariant_authority, cleanup_authority
+
+
+def validate_rehearsal_journal_chain(
+    events: Sequence[WP8RehearsalJournalEventV1],
+    state: WP8RehearsalStateV1,
+) -> bool:
+    _derive_rehearsal_journal_proof_authority(events, state)
     return True
 
 
@@ -2146,7 +2322,9 @@ class WP8RehearsalCompleteV1:
         )
         cleanup_proof = WP8CleanupProofV1.from_mapping(cleanup_proof.to_mapping())
         state = WP8RehearsalStateV1.from_mapping(state.to_mapping())
-        validate_rehearsal_journal_chain(journal_events, state)
+        journal_runtime, journal_invariant, journal_cleanup = (
+            _derive_rehearsal_journal_proof_authority(journal_events, state)
+        )
         validate_review_result(review, evidence)
         if cleanup_proof.result is not WP8CleanupResult.PASS:
             _fail(WP8FailureCode.CLEANUP_FAILED)
@@ -2158,6 +2336,9 @@ class WP8RehearsalCompleteV1:
             != invariant_proof.invariant_proof_fingerprint
             or state.cleanup_proof_fingerprint
             != cleanup_proof.cleanup_proof_fingerprint
+            or journal_runtime != runtime_ledger.runtime_ledger_fingerprint
+            or journal_invariant != invariant_proof.invariant_proof_fingerprint
+            or journal_cleanup != cleanup_proof.cleanup_proof_fingerprint
             or state.journal_head_fingerprint is None
         ):
             _fail(WP8FailureCode.CONTRACT_TRANSITION_INVALID)
