@@ -15,6 +15,7 @@ import unicodedata
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
+from pdi.production_ops.contracts import HEAD as EXPECTED_ALEMBIC_REVISION
 from pdi.production_ops.p3d_preparation_contracts import (
     CANONICAL_P3D_PIPELINE_KEYS,
     canonical_json_bytes,
@@ -186,6 +187,77 @@ def _version(value: Any) -> None:
         _fail(WP8FailureCode.CONTRACT_VERSION_UNSUPPORTED)
 
 
+@dataclass(frozen=True, slots=True)
+class WP8InvariantSnapshotV1:
+    """Unchanged authority facts, observed independently before and after B.
+
+    P3C fingerprints describe stable authority/health, not moving writer
+    counters or timestamps. Business observations are intentionally excluded.
+    This schema does not collect facts or grant migration authority.
+    """
+
+    schema_fingerprint: str
+    migration_tree_fingerprint: str
+    alembic_revision: str
+    principal_route_fingerprint: str
+    db_identity_fingerprint: str
+    provider_identity_fingerprint: str
+    enabled_scope_fingerprint: str
+    source_identity_fingerprint: str
+    sync_state_fingerprint: str
+    protected_environment_fingerprint: str
+    registry_fingerprint: str
+    unit_profile_asset_fingerprint: str
+    gate_a_authority_binding_fingerprint: str
+    gate_b_authority_binding_fingerprint: str
+    gate_c_authority_binding_fingerprint: str
+    p3c_state_fingerprint: str
+    p3c_systemd_fingerprint: str
+    p3d_timer_state: str
+    legacy_writer_state: str
+    legacy_enrichment_state: str
+    gmail_state: str
+    integration_test_state: str
+
+    HASH_FIELDS = (
+        "schema_fingerprint", "migration_tree_fingerprint",
+        "principal_route_fingerprint", "db_identity_fingerprint",
+        "provider_identity_fingerprint", "enabled_scope_fingerprint",
+        "source_identity_fingerprint", "sync_state_fingerprint",
+        "protected_environment_fingerprint", "registry_fingerprint",
+        "unit_profile_asset_fingerprint", "gate_a_authority_binding_fingerprint",
+        "gate_b_authority_binding_fingerprint", "gate_c_authority_binding_fingerprint",
+        "p3c_state_fingerprint", "p3c_systemd_fingerprint",
+    )
+    FIXED = {
+        "alembic_revision": EXPECTED_ALEMBIC_REVISION,
+        "p3d_timer_state": "DISABLED_INACTIVE",
+        "legacy_writer_state": "DISABLED_INACTIVE",
+        "legacy_enrichment_state": "DISABLED_INACTIVE",
+        "gmail_state": "DISABLED",
+        "integration_test_state": "DISABLED",
+    }
+    FIELDS = frozenset({"version", *HASH_FIELDS, *FIXED})
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "WP8InvariantSnapshotV1":
+        _exact(value, cls.FIELDS)
+        _reject_secret_material(value)
+        _version(value["version"])
+        if any(value[name] != expected for name, expected in cls.FIXED.items()):
+            _fail(WP8FailureCode.INVARIANT_FAILED)
+        return cls(**{
+            **{name: _sha256(value[name]) for name in cls.HASH_FIELDS},
+            **{name: value[name] for name in cls.FIXED},
+        })
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            **{name: getattr(self, name) for name in (*self.HASH_FIELDS, *self.FIXED)},
+        }
+
+
 PHASE_A_CONTEXT_FIELDS = (
     "candidate_sha",
     "rollback_source_sha",
@@ -210,6 +282,7 @@ PHASE_A_CONTEXT_FIELDS = (
     "current_state",
     "p3d_timer_state",
     "read_only_db_guarantee",
+    "invariant_baseline",
 )
 
 
@@ -240,6 +313,7 @@ class WP8PhaseAEvidenceV1:
     read_only_db_guarantee: str
     runtime_pipeline_coverage: str
     post_rehearsal_runtime_ledger_proof: str
+    invariant_baseline: WP8InvariantSnapshotV1
     phase_a_context_fingerprint: str
     phase_a_evidence_fingerprint: str
 
@@ -256,6 +330,7 @@ class WP8PhaseAEvidenceV1:
         "protected_environment_fingerprint", "registry_fingerprint",
         "current_state", "p3d_timer_state", "read_only_db_guarantee",
         "runtime_pipeline_coverage", "post_rehearsal_runtime_ledger_proof",
+        "invariant_baseline",
         "phase_a_context_fingerprint", "phase_a_evidence_fingerprint",
     })
 
@@ -281,6 +356,7 @@ class WP8PhaseAEvidenceV1:
         p3c_systemd_fingerprint: str,
         protected_environment_fingerprint: str,
         registry_fingerprint: str,
+        invariant_baseline: WP8InvariantSnapshotV1,
     ) -> "WP8PhaseAEvidenceV1":
         value: dict[str, Any] = {
             "version": 1,
@@ -310,6 +386,9 @@ class WP8PhaseAEvidenceV1:
             "read_only_db_guarantee": "PASS",
             "runtime_pipeline_coverage": "0/6",
             "post_rehearsal_runtime_ledger_proof": "NOT_APPLICABLE_PRE_REHEARSAL",
+            "invariant_baseline": WP8InvariantSnapshotV1.from_mapping(
+                invariant_baseline.to_mapping()
+            ).to_mapping(),
         }
         value["phase_a_context_fingerprint"] = contract_fingerprint({
             field: value[field] for field in PHASE_A_CONTEXT_FIELDS
@@ -367,6 +446,16 @@ class WP8PhaseAEvidenceV1:
         ):
             _fail()
         scope_count = _integer(value["enabled_scope_count"], minimum=1)
+        baseline = WP8InvariantSnapshotV1.from_mapping(value["invariant_baseline"])
+        for name in (
+            "db_identity_fingerprint", "enabled_scope_fingerprint",
+            "protected_environment_fingerprint", "registry_fingerprint",
+            "unit_profile_asset_fingerprint", "gate_a_authority_binding_fingerprint",
+            "gate_b_authority_binding_fingerprint", "gate_c_authority_binding_fingerprint",
+            "p3c_state_fingerprint", "p3c_systemd_fingerprint",
+        ):
+            if getattr(baseline, name) != hashes[name]:
+                _fail(WP8FailureCode.INVARIANT_FAILED)
         expected_context = contract_fingerprint({
             field: value[field] for field in PHASE_A_CONTEXT_FIELDS
         })
@@ -403,6 +492,7 @@ class WP8PhaseAEvidenceV1:
             "PASS",
             "0/6",
             "NOT_APPLICABLE_PRE_REHEARSAL",
+            baseline,
             hashes["phase_a_context_fingerprint"],
             hashes["phase_a_evidence_fingerprint"],
         )
@@ -436,6 +526,7 @@ class WP8PhaseAEvidenceV1:
             "read_only_db_guarantee": self.read_only_db_guarantee,
             "runtime_pipeline_coverage": self.runtime_pipeline_coverage,
             "post_rehearsal_runtime_ledger_proof": self.post_rehearsal_runtime_ledger_proof,
+            "invariant_baseline": self.invariant_baseline.to_mapping(),
             "phase_a_context_fingerprint": self.phase_a_context_fingerprint,
             "phase_a_evidence_fingerprint": self.phase_a_evidence_fingerprint,
         }
@@ -757,6 +848,8 @@ def validate_rehearsal_authorization(
     evidence = WP8PhaseAEvidenceV1.from_mapping(evidence.to_mapping())
     review = WP8AReviewResultV1.from_mapping(review.to_mapping())
     validate_review_result(review, evidence)
+    if type(consumed) is not bool:
+        _fail(WP8FailureCode.AUTHORIZATION_INVALID)
     if consumed:
         _fail(WP8FailureCode.AUTHORIZATION_REPLAY)
     instant = _timestamp(at_utc)
@@ -908,6 +1001,67 @@ def _service_pipeline_for_transition(
     return None
 
 
+FAILURE_PHASES = frozenset({
+    WP8RehearsalPhase.FAILED, WP8RehearsalPhase.ABORTED,
+    WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
+})
+
+
+def _failure_provenance(
+    primary: WP8FailureCode | None,
+    phase: Any,
+    pipeline: Any,
+    boundary: Any,
+) -> tuple[WP8RehearsalPhase | None, str | None, str | None]:
+    if primary is None:
+        if any(item is not None for item in (phase, pipeline, boundary)):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        return None, None, None
+    failed_phase = _enum(WP8RehearsalPhase, phase)
+    if failed_phase not in PRE_MUTATION_PHASES | POST_MUTATION_PHASES:
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    expected_boundary = (
+        "PRE_MUTATION" if failed_phase in PRE_MUTATION_PHASES else "POST_MUTATION"
+    )
+    expected_pipeline = _service_pipeline_for_transition(failed_phase, failed_phase)
+    if boundary != expected_boundary:
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    if expected_pipeline is not None:
+        if pipeline != expected_pipeline:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    elif pipeline is not None and (
+        pipeline not in WP8_CANONICAL_PIPELINE_KEYS
+        or primary not in {
+            WP8FailureCode.SERVICE_CONTRACT_INVALID,
+            WP8FailureCode.RUNTIME_LEDGER_INVALID,
+        }
+    ):
+        # Aggregate unit/ledger validation may identify a particular canonical
+        # pipeline outside a service pair. Other authority failures cannot.
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    if primary is WP8FailureCode.SERVICE_EXECUTION_FAILED and expected_pipeline is None:
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    return failed_phase, pipeline, boundary
+
+
+def _bound_cleanup(
+    value: Any, fingerprint: str | None, operation_id: str,
+    candidate_sha: str, context: str,
+) -> "WP8CleanupProofV1 | None":
+    if value is None:
+        if fingerprint is not None:
+            _fail(WP8FailureCode.CLEANUP_FAILED)
+        return None
+    proof = WP8CleanupProofV1.from_mapping(value)
+    if (
+        proof.cleanup_proof_fingerprint != fingerprint
+        or (proof.rehearsal_operation_id, proof.candidate_sha,
+            proof.phase_a_context_fingerprint) != (operation_id, candidate_sha, context)
+    ):
+        _fail(WP8FailureCode.CLEANUP_FAILED)
+    return proof
+
+
 @dataclass(frozen=True, slots=True)
 class WP8RehearsalStateV1:
     operation_id: str
@@ -920,9 +1074,12 @@ class WP8RehearsalStateV1:
     runtime_ledger_fingerprint: str | None
     invariant_proof_fingerprint: str | None
     cleanup_proof_fingerprint: str | None
+    cleanup_proof: WP8CleanupProofV1 | None
     primary_failure_code: WP8FailureCode | None
     cleanup_failure_code: WP8FailureCode | None
     failed_pipeline_key: str | None
+    failed_phase: WP8RehearsalPhase | None
+    failure_mutation_boundary: str | None
     journal_head_fingerprint: str | None
     state_fingerprint: str
 
@@ -931,6 +1088,7 @@ class WP8RehearsalStateV1:
         "authorization_fingerprint", "phase", "started_at_utc", "updated_at_utc",
         "runtime_ledger_fingerprint", "invariant_proof_fingerprint",
         "cleanup_proof_fingerprint", "primary_failure_code",
+        "cleanup_proof", "failed_phase", "failure_mutation_boundary",
         "cleanup_failure_code", "failed_pipeline_key", "journal_head_fingerprint",
         "state_fingerprint",
     })
@@ -957,9 +1115,12 @@ class WP8RehearsalStateV1:
             "runtime_ledger_fingerprint": None,
             "invariant_proof_fingerprint": None,
             "cleanup_proof_fingerprint": None,
+            "cleanup_proof": None,
             "primary_failure_code": None,
             "cleanup_failure_code": None,
             "failed_pipeline_key": None,
+            "failed_phase": None,
+            "failure_mutation_boundary": None,
             "journal_head_fingerprint": None,
         }
         value["state_fingerprint"] = contract_fingerprint(value)
@@ -993,6 +1154,14 @@ class WP8RehearsalStateV1:
         failed_pipeline = value["failed_pipeline_key"]
         if failed_pipeline is not None and failed_pipeline not in WP8_CANONICAL_PIPELINE_KEYS:
             _fail(WP8FailureCode.CONTRACT_PIPELINE_SET_INVALID)
+        failed_phase, failed_pipeline, boundary = _failure_provenance(
+            primary, value["failed_phase"], failed_pipeline,
+            value["failure_mutation_boundary"],
+        )
+        cleanup_proof = _bound_cleanup(
+            value["cleanup_proof"], cleanup, value["operation_id"],
+            value["candidate_sha"], value["phase_a_context_fingerprint"],
+        )
         journal_head = None if value["journal_head_fingerprint"] is None else _sha256(
             value["journal_head_fingerprint"]
         )
@@ -1042,17 +1211,27 @@ class WP8RehearsalStateV1:
         if primary is not None and primary not in OPERATION_FAILURE_CODES:
             _fail()
         if phase is WP8RehearsalPhase.FAILED and any(item is not None for item in (
-            runtime, invariant, cleanup, cleanup_failure, failed_pipeline,
+            runtime, invariant, cleanup, cleanup_failure,
         )):
             _fail()
         if phase is WP8RehearsalPhase.ABORTED and (
-            cleanup is None or cleanup_failure is not None
+            cleanup_proof is None or cleanup_proof.result is not WP8CleanupResult.PASS
+            or cleanup_failure is not None
         ):
             _fail()
         if phase is WP8RehearsalPhase.ABORT_NOT_CONFIRMED and (
-            cleanup is None or cleanup_failure is not WP8FailureCode.CLEANUP_FAILED
+            cleanup_proof is None or cleanup_proof.result is not WP8CleanupResult.FAIL
+            or cleanup_failure is not WP8FailureCode.CLEANUP_FAILED
         ):
             _fail()
+        if phase in normal_cleanup_phases and (
+            cleanup_proof is None or cleanup_proof.result is not WP8CleanupResult.PASS
+        ):
+            _fail(WP8FailureCode.CLEANUP_FAILED)
+        if failure_phase and (
+            (phase is WP8RehearsalPhase.FAILED) != (boundary == "PRE_MUTATION")
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         if not failure_phase and any(item is not None for item in (
             primary, cleanup_failure, failed_pipeline,
         )):
@@ -1071,9 +1250,12 @@ class WP8RehearsalStateV1:
             runtime,
             invariant,
             cleanup,
+            cleanup_proof,
             primary,
             cleanup_failure,
             failed_pipeline,
+            failed_phase,
+            boundary,
             journal_head,
             state_fingerprint,
         )
@@ -1091,6 +1273,9 @@ class WP8RehearsalStateV1:
             "runtime_ledger_fingerprint": self.runtime_ledger_fingerprint,
             "invariant_proof_fingerprint": self.invariant_proof_fingerprint,
             "cleanup_proof_fingerprint": self.cleanup_proof_fingerprint,
+            "cleanup_proof": (
+                None if self.cleanup_proof is None else self.cleanup_proof.to_mapping()
+            ),
             "primary_failure_code": (
                 None if self.primary_failure_code is None
                 else self.primary_failure_code.value
@@ -1100,6 +1285,8 @@ class WP8RehearsalStateV1:
                 else self.cleanup_failure_code.value
             ),
             "failed_pipeline_key": self.failed_pipeline_key,
+            "failed_phase": None if self.failed_phase is None else self.failed_phase.value,
+            "failure_mutation_boundary": self.failure_mutation_boundary,
             "journal_head_fingerprint": self.journal_head_fingerprint,
             "state_fingerprint": self.state_fingerprint,
         }
@@ -1142,6 +1329,10 @@ class WP8RehearsalJournalEventV1:
     previous_event_fingerprint: str | None
     timestamp_utc: str
     pipeline_key: str | None
+    failed_pipeline_key: str | None
+    failed_phase: WP8RehearsalPhase | None
+    failure_mutation_boundary: str | None
+    cleanup_proof: WP8CleanupProofV1 | None
     evidence_fingerprints: tuple[str, ...]
     primary_failure_code: WP8FailureCode | None
     cleanup_failure_code: WP8FailureCode | None
@@ -1152,6 +1343,7 @@ class WP8RehearsalJournalEventV1:
         "phase_a_context_fingerprint", "authorization_fingerprint",
         "from_state", "to_state", "event_class",
         "previous_event_fingerprint", "timestamp_utc", "pipeline_key",
+        "failed_pipeline_key", "failed_phase", "failure_mutation_boundary", "cleanup_proof",
         "evidence_fingerprints", "primary_failure_code",
         "cleanup_failure_code", "event_fingerprint",
     })
@@ -1168,25 +1360,30 @@ class WP8RehearsalJournalEventV1:
         primary_failure_code: WP8FailureCode | None = None,
         cleanup_failure_code: WP8FailureCode | None = None,
         failed_pipeline_key: str | None = None,
+        cleanup_proof: WP8CleanupProofV1 | None = None,
     ) -> "WP8RehearsalJournalEventV1":
         state = WP8RehearsalStateV1.from_mapping(state.to_mapping())
         target = _enum(WP8RehearsalPhase, target)
         validate_wp8_transition(state.phase, target)
         pipeline_key = _service_pipeline_for_transition(state.phase, target)
-        if failed_pipeline_key is not None:
-            if target not in {
-                WP8RehearsalPhase.FAILED,
-                WP8RehearsalPhase.ABORTED,
-                WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
-            } or failed_pipeline_key not in WP8_CANONICAL_PIPELINE_KEYS:
-                _fail(WP8FailureCode.CONTRACT_PIPELINE_SET_INVALID)
-            pipeline_key = failed_pipeline_key
+        failed_phase = state.failed_phase
+        boundary = state.failure_mutation_boundary
+        if target in FAILURE_PHASES and state.primary_failure_code is None:
+            failed_phase = state.phase
+            boundary = "PRE_MUTATION" if state.phase in PRE_MUTATION_PHASES else "POST_MUTATION"
         if primary_failure_code is not None:
             primary_failure_code = _enum(WP8FailureCode, primary_failure_code)
             if primary_failure_code not in OPERATION_FAILURE_CODES:
                 _fail()
         if cleanup_failure_code is not None:
             cleanup_failure_code = _enum(WP8FailureCode, cleanup_failure_code)
+        if state.phase is WP8RehearsalPhase.ABORT_NOT_CONFIRMED and (
+            primary_failure_code is not state.primary_failure_code
+            or failed_pipeline_key != state.failed_pipeline_key
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        if _timestamp(timestamp_utc) < state.updated_at_utc:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         fingerprints = tuple(sorted(_sha256(item) for item in evidence_fingerprints))
         if len(set(fingerprints)) != len(fingerprints):
             _fail()
@@ -1203,6 +1400,10 @@ class WP8RehearsalJournalEventV1:
             "previous_event_fingerprint": state.journal_head_fingerprint,
             "timestamp_utc": timestamp_utc,
             "pipeline_key": pipeline_key,
+            "failed_pipeline_key": failed_pipeline_key,
+            "failed_phase": None if failed_phase is None else failed_phase.value,
+            "failure_mutation_boundary": boundary,
+            "cleanup_proof": None if cleanup_proof is None else cleanup_proof.to_mapping(),
             "evidence_fingerprints": list(fingerprints),
             "primary_failure_code": (
                 None if primary_failure_code is None else primary_failure_code.value
@@ -1235,17 +1436,13 @@ class WP8RehearsalJournalEventV1:
         expected_pipeline = _service_pipeline_for_transition(source, target)
         if pipeline is not None and pipeline not in WP8_CANONICAL_PIPELINE_KEYS:
             _fail(WP8FailureCode.CONTRACT_PIPELINE_SET_INVALID)
-        if target not in {
-            WP8RehearsalPhase.FAILED,
-            WP8RehearsalPhase.ABORTED,
-            WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
-        } and pipeline != expected_pipeline:
+        if pipeline != expected_pipeline:
             _fail(WP8FailureCode.CONTRACT_PIPELINE_SET_INVALID)
         raw_fingerprints = value["evidence_fingerprints"]
         if not isinstance(raw_fingerprints, (list, tuple)):
             _fail()
         fingerprints = tuple(sorted(_sha256(item) for item in raw_fingerprints))
-        if len(fingerprints) != len(set(fingerprints)):
+        if len(fingerprints) != len(set(fingerprints)) or tuple(raw_fingerprints) != fingerprints:
             _fail()
         primary = None if value["primary_failure_code"] is None else _enum(
             WP8FailureCode, value["primary_failure_code"]
@@ -1266,6 +1463,36 @@ class WP8RehearsalJournalEventV1:
             cleanup is WP8FailureCode.CLEANUP_FAILED
         ):
             _fail()
+        if target is not WP8RehearsalPhase.ABORT_NOT_CONFIRMED and cleanup is not None:
+            _fail()
+        failed_phase, failed_pipeline, boundary = _failure_provenance(
+            primary, value["failed_phase"], value["failed_pipeline_key"],
+            value["failure_mutation_boundary"],
+        )
+        if failure_target and source is not WP8RehearsalPhase.ABORT_NOT_CONFIRMED:
+            if failed_phase is not source:
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        if failure_target and (target is WP8RehearsalPhase.FAILED) != (boundary == "PRE_MUTATION"):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        cleanup_proof = None if value["cleanup_proof"] is None else WP8CleanupProofV1.from_mapping(
+            value["cleanup_proof"]
+        )
+        requires_cleanup = target in {
+            WP8RehearsalPhase.ABORTED, WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
+            WP8RehearsalPhase.SERVICES_STOPPED, WP8RehearsalPhase.REHEARSAL_COMPLETE,
+        }
+        if requires_cleanup != (cleanup_proof is not None):
+            _fail(WP8FailureCode.CLEANUP_FAILED)
+        if cleanup_proof is not None:
+            if (
+                (cleanup_proof.rehearsal_operation_id, cleanup_proof.candidate_sha,
+                 cleanup_proof.phase_a_context_fingerprint)
+                != (value["operation_id"], value["candidate_sha"], value["phase_a_context_fingerprint"])
+                or cleanup_proof.cleanup_proof_fingerprint not in fingerprints
+                or (cleanup_proof.result is WP8CleanupResult.FAIL)
+                != (target is WP8RehearsalPhase.ABORT_NOT_CONFIRMED)
+            ):
+                _fail(WP8FailureCode.CLEANUP_FAILED)
         event_fingerprint = _sha256(value["event_fingerprint"])
         if event_fingerprint != _fingerprint_without(value, "event_fingerprint"):
             _fail(WP8FailureCode.CONTRACT_FINGERPRINT_MISMATCH)
@@ -1281,6 +1508,10 @@ class WP8RehearsalJournalEventV1:
             previous,
             _timestamp(value["timestamp_utc"]),
             pipeline,
+            failed_pipeline,
+            failed_phase,
+            boundary,
+            cleanup_proof,
             fingerprints,
             primary,
             cleanup,
@@ -1301,6 +1532,10 @@ class WP8RehearsalJournalEventV1:
             "previous_event_fingerprint": self.previous_event_fingerprint,
             "timestamp_utc": self.timestamp_utc,
             "pipeline_key": self.pipeline_key,
+            "failed_pipeline_key": self.failed_pipeline_key,
+            "failed_phase": None if self.failed_phase is None else self.failed_phase.value,
+            "failure_mutation_boundary": self.failure_mutation_boundary,
+            "cleanup_proof": None if self.cleanup_proof is None else self.cleanup_proof.to_mapping(),
             "evidence_fingerprints": list(self.evidence_fingerprints),
             "primary_failure_code": (
                 None if self.primary_failure_code is None
@@ -1322,7 +1557,7 @@ def transition_rehearsal_state(
     timestamp_utc: str,
     runtime_ledger_fingerprint: str | None = None,
     invariant_proof_fingerprint: str | None = None,
-    cleanup_proof_fingerprint: str | None = None,
+    cleanup_proof: WP8CleanupProofV1 | None = None,
     primary_failure_code: WP8FailureCode | None = None,
     cleanup_failure_code: WP8FailureCode | None = None,
     failed_pipeline_key: str | None = None,
@@ -1330,33 +1565,56 @@ def transition_rehearsal_state(
 ) -> tuple[WP8RehearsalStateV1, WP8RehearsalJournalEventV1]:
     state = WP8RehearsalStateV1.from_mapping(state.to_mapping())
     target = _enum(WP8RehearsalPhase, target)
+    validate_wp8_transition(state.phase, target)
     timestamp = _timestamp(timestamp_utc)
     if timestamp < state.updated_at_utc:
         _fail()
+    primary = None if primary_failure_code is None else _enum(WP8FailureCode, primary_failure_code)
+    cleanup_failure = None if cleanup_failure_code is None else _enum(WP8FailureCode, cleanup_failure_code)
+    retry = state.phase is WP8RehearsalPhase.ABORT_NOT_CONFIRMED
+    if retry:
+        # A retry can change cleanup evidence, never original failure or
+        # previously verified runtime/invariant proof, and cannot replay B.
+        if (
+            primary is not None and primary is not state.primary_failure_code
+            or failed_pipeline_key is not None and failed_pipeline_key != state.failed_pipeline_key
+            or runtime_ledger_fingerprint is not None
+            or invariant_proof_fingerprint is not None
+            or evidence_fingerprints
+        ):
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        primary = state.primary_failure_code
+        failed_pipeline_key = state.failed_pipeline_key
+    failed_phase = state.failed_phase
+    boundary = state.failure_mutation_boundary
+    if target in FAILURE_PHASES and not retry:
+        failed_phase = state.phase
+        boundary = "PRE_MUTATION" if state.phase in PRE_MUTATION_PHASES else "POST_MUTATION"
+        expected_pipeline = _service_pipeline_for_transition(state.phase, state.phase)
+        if failed_pipeline_key is None:
+            failed_pipeline_key = expected_pipeline
+    if target not in FAILURE_PHASES and any(
+        item is not None for item in (primary, cleanup_failure, failed_pipeline_key)
+    ):
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
     runtime = state.runtime_ledger_fingerprint
     invariant = state.invariant_proof_fingerprint
-    cleanup = state.cleanup_proof_fingerprint
     if runtime_ledger_fingerprint is not None:
         runtime = _sha256(runtime_ledger_fingerprint)
     if invariant_proof_fingerprint is not None:
         invariant = _sha256(invariant_proof_fingerprint)
-    if cleanup_proof_fingerprint is not None:
-        cleanup = _sha256(cleanup_proof_fingerprint)
-    primary = primary_failure_code or state.primary_failure_code
-    cleanup_failure = cleanup_failure_code
-    failed_pipeline = failed_pipeline_key or state.failed_pipeline_key
-    if target not in {
-        WP8RehearsalPhase.FAILED,
-        WP8RehearsalPhase.ABORTED,
-        WP8RehearsalPhase.ABORT_NOT_CONFIRMED,
-    }:
-        primary = None
-        cleanup_failure = None
-        failed_pipeline = None
-    combined_evidence = tuple(evidence_fingerprints) + tuple(
-        item for item in (runtime, invariant, cleanup) if item is not None
-    )
-    combined_evidence = tuple(sorted(set(combined_evidence)))
+    if cleanup_proof is not None:
+        cleanup_proof = WP8CleanupProofV1.from_mapping(cleanup_proof.to_mapping())
+    elif target is WP8RehearsalPhase.REHEARSAL_COMPLETE:
+        cleanup_proof = state.cleanup_proof
+    # Aborts and cleanup retries require a newly supplied exact proof, never
+    # infer success from a stale hash or from clearing a failure code.
+    cleanup = None if cleanup_proof is None else cleanup_proof.cleanup_proof_fingerprint
+    combined_evidence = tuple(sorted(set(
+        tuple(evidence_fingerprints) + tuple(
+            item for item in (runtime, invariant, cleanup) if item is not None
+        )
+    )))
     event = WP8RehearsalJournalEventV1.build(
         sequence=sequence,
         state=state,
@@ -1365,7 +1623,8 @@ def transition_rehearsal_state(
         evidence_fingerprints=combined_evidence,
         primary_failure_code=primary,
         cleanup_failure_code=cleanup_failure,
-        failed_pipeline_key=failed_pipeline,
+        failed_pipeline_key=failed_pipeline_key,
+        cleanup_proof=cleanup_proof,
     )
     value = {
         **state.to_mapping(),
@@ -1374,11 +1633,12 @@ def transition_rehearsal_state(
         "runtime_ledger_fingerprint": runtime,
         "invariant_proof_fingerprint": invariant,
         "cleanup_proof_fingerprint": cleanup,
+        "cleanup_proof": None if cleanup_proof is None else cleanup_proof.to_mapping(),
         "primary_failure_code": None if primary is None else primary.value,
-        "cleanup_failure_code": (
-            None if cleanup_failure is None else cleanup_failure.value
-        ),
-        "failed_pipeline_key": failed_pipeline,
+        "cleanup_failure_code": None if cleanup_failure is None else cleanup_failure.value,
+        "failed_pipeline_key": failed_pipeline_key,
+        "failed_phase": None if failed_phase is None else failed_phase.value,
+        "failure_mutation_boundary": boundary,
         "journal_head_fingerprint": event.event_fingerprint,
     }
     value["state_fingerprint"] = _fingerprint_without(value, "state_fingerprint")
@@ -1400,6 +1660,7 @@ def validate_rehearsal_journal_chain(
     if first.sequence != 1 or first.from_state is not WP8RehearsalPhase.NEW:
         _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
     previous: WP8RehearsalJournalEventV1 | None = None
+    first_failure: tuple[Any, ...] | None = None
     cumulative_evidence: set[str] = set()
     for expected_sequence, event in enumerate(normalized, start=1):
         if (
@@ -1410,6 +1671,17 @@ def validate_rehearsal_journal_chain(
             or event.authorization_fingerprint != state.authorization_fingerprint
         ):
             _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        if event.timestamp_utc < state.started_at_utc:
+            _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+        if event.primary_failure_code is not None:
+            provenance = (
+                event.primary_failure_code, event.failed_phase,
+                event.failed_pipeline_key, event.failure_mutation_boundary,
+            )
+            if first_failure is None:
+                first_failure = provenance
+            elif provenance != first_failure:
+                _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
         if previous is not None and (
             event.previous_event_fingerprint != previous.event_fingerprint
             or event.from_state is not previous.to_state
@@ -1425,7 +1697,10 @@ def validate_rehearsal_journal_chain(
         or final.event_fingerprint != state.journal_head_fingerprint
         or final.primary_failure_code is not state.primary_failure_code
         or final.cleanup_failure_code is not state.cleanup_failure_code
-        or final.pipeline_key != state.failed_pipeline_key
+        or final.failed_pipeline_key != state.failed_pipeline_key
+        or final.failed_phase is not state.failed_phase
+        or final.failure_mutation_boundary != state.failure_mutation_boundary
+        or final.cleanup_proof != state.cleanup_proof
         or any(
             fingerprint is not None and fingerprint not in cumulative_evidence
             for fingerprint in (
@@ -1606,36 +1881,18 @@ class WP8RuntimeLedgerProofV1:
 class WP8InvariantProofV1:
     candidate_sha: str
     phase_a_context_fingerprint: str
+    phase_a_evidence_fingerprint: str
     rehearsal_operation_id: str
-    protected_environment_fingerprint: str
-    registry_fingerprint: str
-    unit_profile_asset_fingerprint: str
-    gate_a_authority_binding_fingerprint: str
-    gate_b_authority_binding_fingerprint: str
-    gate_c_authority_binding_fingerprint: str
-    schema_fingerprint: str
-    alembic_revision: str
-    principal_route_db_identity_fingerprint: str
-    provider_identity_fingerprint: str
-    enabled_scope_fingerprint: str
-    source_identity_fingerprint: str
-    sync_state_fingerprint: str
+    before: WP8InvariantSnapshotV1
+    after: WP8InvariantSnapshotV1
     invariant_proof_fingerprint: str
 
     FIELDS = frozenset({
         "version", "candidate_sha", "phase_a_context_fingerprint",
-        "rehearsal_operation_id", "p3d_timer_state", "p3d_service_state",
-        "p3c_state", "legacy_enrichment_state", "current_state",
-        "candidate_release_state", "protected_environment_fingerprint",
-        "registry_fingerprint", "unit_profile_asset_fingerprint",
-        "gate_a_authority_binding_fingerprint",
-        "gate_b_authority_binding_fingerprint",
-        "gate_c_authority_binding_fingerprint", "schema_fingerprint",
-        "alembic_revision", "principal_route_db_identity_fingerprint",
-        "provider_identity_fingerprint", "enabled_scope_fingerprint",
-        "source_identity_fingerprint", "sync_state_fingerprint", "gmail_state",
-        "integration_test_state", "approved_business_write_classification",
-        "invariant_result", "invariant_proof_fingerprint",
+        "phase_a_evidence_fingerprint", "rehearsal_operation_id", "before", "after",
+        "p3d_service_state", "current_state", "candidate_release_state",
+        "approved_business_write_classification", "invariant_result",
+        "invariant_proof_fingerprint",
     })
 
     @classmethod
@@ -1644,39 +1901,28 @@ class WP8InvariantProofV1:
         evidence: WP8PhaseAEvidenceV1,
         *,
         rehearsal_operation_id: str,
-        schema_fingerprint: str,
-        alembic_revision: str,
-        provider_identity_fingerprint: str,
-        source_identity_fingerprint: str,
-        sync_state_fingerprint: str,
+        before: WP8InvariantSnapshotV1,
+        after: WP8InvariantSnapshotV1,
     ) -> "WP8InvariantProofV1":
         evidence = WP8PhaseAEvidenceV1.from_mapping(evidence.to_mapping())
+        before = WP8InvariantSnapshotV1.from_mapping(before.to_mapping())
+        after = WP8InvariantSnapshotV1.from_mapping(after.to_mapping())
+        # Do not manufacture final observations by copying A fields. Both
+        # independently observed snapshots must be supplied and baseline must
+        # equal the exact reviewed, authorized Phase A snapshot.
+        if before != evidence.invariant_baseline:
+            _fail(WP8FailureCode.INVARIANT_FAILED)
         value: dict[str, Any] = {
             "version": 1,
             "candidate_sha": evidence.candidate_sha,
             "phase_a_context_fingerprint": evidence.phase_a_context_fingerprint,
+            "phase_a_evidence_fingerprint": evidence.phase_a_evidence_fingerprint,
             "rehearsal_operation_id": rehearsal_operation_id,
-            "p3d_timer_state": "DISABLED_INACTIVE",
+            "before": before.to_mapping(),
+            "after": after.to_mapping(),
             "p3d_service_state": "INACTIVE",
-            "p3c_state": "UNCHANGED_HEALTHY",
-            "legacy_enrichment_state": "DISABLED_INACTIVE",
             "current_state": "EXACT_CANDIDATE",
             "candidate_release_state": "EXACT_IMMUTABLE",
-            "protected_environment_fingerprint": evidence.protected_environment_fingerprint,
-            "registry_fingerprint": evidence.registry_fingerprint,
-            "unit_profile_asset_fingerprint": evidence.unit_profile_asset_fingerprint,
-            "gate_a_authority_binding_fingerprint": evidence.gate_a_authority_binding_fingerprint,
-            "gate_b_authority_binding_fingerprint": evidence.gate_b_authority_binding_fingerprint,
-            "gate_c_authority_binding_fingerprint": evidence.gate_c_authority_binding_fingerprint,
-            "schema_fingerprint": schema_fingerprint,
-            "alembic_revision": alembic_revision,
-            "principal_route_db_identity_fingerprint": evidence.db_identity_fingerprint,
-            "provider_identity_fingerprint": provider_identity_fingerprint,
-            "enabled_scope_fingerprint": evidence.enabled_scope_fingerprint,
-            "source_identity_fingerprint": source_identity_fingerprint,
-            "sync_state_fingerprint": sync_state_fingerprint,
-            "gmail_state": "DISABLED",
-            "integration_test_state": "DISABLED",
             "approved_business_write_classification": "EXPECTED_ENRICHMENT_ONLY",
             "invariant_result": "PASS",
         }
@@ -1689,58 +1935,27 @@ class WP8InvariantProofV1:
         _reject_secret_material(value)
         _version(value["version"])
         fixed = {
-            "p3d_timer_state": "DISABLED_INACTIVE",
             "p3d_service_state": "INACTIVE",
-            "p3c_state": "UNCHANGED_HEALTHY",
-            "legacy_enrichment_state": "DISABLED_INACTIVE",
             "current_state": "EXACT_CANDIDATE",
             "candidate_release_state": "EXACT_IMMUTABLE",
-            "gmail_state": "DISABLED",
-            "integration_test_state": "DISABLED",
             "approved_business_write_classification": "EXPECTED_ENRICHMENT_ONLY",
             "invariant_result": "PASS",
         }
         if any(value[name] != expected for name, expected in fixed.items()):
             _fail(WP8FailureCode.INVARIANT_FAILED)
-        hashes = {
-            name: _sha256(value[name])
-            for name in (
-                "phase_a_context_fingerprint", "protected_environment_fingerprint",
-                "registry_fingerprint", "unit_profile_asset_fingerprint",
-                "gate_a_authority_binding_fingerprint",
-                "gate_b_authority_binding_fingerprint",
-                "gate_c_authority_binding_fingerprint", "schema_fingerprint",
-                "principal_route_db_identity_fingerprint",
-                "provider_identity_fingerprint", "enabled_scope_fingerprint",
-                "source_identity_fingerprint", "sync_state_fingerprint",
-                "invariant_proof_fingerprint",
-            )
-        }
-        if hashes["invariant_proof_fingerprint"] != _fingerprint_without(
-            value, "invariant_proof_fingerprint"
-        ):
+        before = WP8InvariantSnapshotV1.from_mapping(value["before"])
+        after = WP8InvariantSnapshotV1.from_mapping(value["after"])
+        if before != after:
+            _fail(WP8FailureCode.INVARIANT_FAILED)
+        fingerprint = _sha256(value["invariant_proof_fingerprint"])
+        if fingerprint != _fingerprint_without(value, "invariant_proof_fingerprint"):
             _fail(WP8FailureCode.CONTRACT_FINGERPRINT_MISMATCH)
-        alembic = _safe_text(value["alembic_revision"])
-        if re.fullmatch(r"[0-9a-f]{12}", alembic) is None:
-            _fail()
         return cls(
             _git_sha(value["candidate_sha"]),
-            hashes["phase_a_context_fingerprint"],
+            _sha256(value["phase_a_context_fingerprint"]),
+            _sha256(value["phase_a_evidence_fingerprint"]),
             _canonical_uuid(value["rehearsal_operation_id"]),
-            hashes["protected_environment_fingerprint"],
-            hashes["registry_fingerprint"],
-            hashes["unit_profile_asset_fingerprint"],
-            hashes["gate_a_authority_binding_fingerprint"],
-            hashes["gate_b_authority_binding_fingerprint"],
-            hashes["gate_c_authority_binding_fingerprint"],
-            hashes["schema_fingerprint"],
-            alembic,
-            hashes["principal_route_db_identity_fingerprint"],
-            hashes["provider_identity_fingerprint"],
-            hashes["enabled_scope_fingerprint"],
-            hashes["source_identity_fingerprint"],
-            hashes["sync_state_fingerprint"],
-            hashes["invariant_proof_fingerprint"],
+            before, after, fingerprint,
         )
 
     def to_mapping(self) -> dict[str, Any]:
@@ -1748,28 +1963,13 @@ class WP8InvariantProofV1:
             "version": 1,
             "candidate_sha": self.candidate_sha,
             "phase_a_context_fingerprint": self.phase_a_context_fingerprint,
+            "phase_a_evidence_fingerprint": self.phase_a_evidence_fingerprint,
             "rehearsal_operation_id": self.rehearsal_operation_id,
-            "p3d_timer_state": "DISABLED_INACTIVE",
+            "before": self.before.to_mapping(),
+            "after": self.after.to_mapping(),
             "p3d_service_state": "INACTIVE",
-            "p3c_state": "UNCHANGED_HEALTHY",
-            "legacy_enrichment_state": "DISABLED_INACTIVE",
             "current_state": "EXACT_CANDIDATE",
             "candidate_release_state": "EXACT_IMMUTABLE",
-            "protected_environment_fingerprint": self.protected_environment_fingerprint,
-            "registry_fingerprint": self.registry_fingerprint,
-            "unit_profile_asset_fingerprint": self.unit_profile_asset_fingerprint,
-            "gate_a_authority_binding_fingerprint": self.gate_a_authority_binding_fingerprint,
-            "gate_b_authority_binding_fingerprint": self.gate_b_authority_binding_fingerprint,
-            "gate_c_authority_binding_fingerprint": self.gate_c_authority_binding_fingerprint,
-            "schema_fingerprint": self.schema_fingerprint,
-            "alembic_revision": self.alembic_revision,
-            "principal_route_db_identity_fingerprint": self.principal_route_db_identity_fingerprint,
-            "provider_identity_fingerprint": self.provider_identity_fingerprint,
-            "enabled_scope_fingerprint": self.enabled_scope_fingerprint,
-            "source_identity_fingerprint": self.source_identity_fingerprint,
-            "sync_state_fingerprint": self.sync_state_fingerprint,
-            "gmail_state": "DISABLED",
-            "integration_test_state": "DISABLED",
             "approved_business_write_classification": "EXPECTED_ENRICHMENT_ONLY",
             "invariant_result": "PASS",
             "invariant_proof_fingerprint": self.invariant_proof_fingerprint,
@@ -1888,6 +2088,10 @@ class WP8CleanupProofV1:
 
 @dataclass(frozen=True, slots=True)
 class WP8RehearsalCompleteV1:
+    """B execution evidence is reviewable; independent B review is pending.
+
+    Never denotes final WP8 lifecycle completion or mutation authorization.
+    """
     rehearsal_operation_id: str
     candidate_sha: str
     phase_a_evidence_fingerprint: str
@@ -1910,7 +2114,8 @@ class WP8RehearsalCompleteV1:
         "invariant_proof_fingerprint", "cleanup_proof_fingerprint",
         "rehearsal_state_fingerprint", "journal_head_fingerprint",
         "runtime_pipeline_coverage", "p3d_service_state", "p3d_timer_state",
-        "p3c_state", "wp8_end_boundary", "completed_at_utc",
+        "p3c_state", "execution_end_boundary", "wp8_final_end_boundary",
+        "wp8_final_end_boundary_reached", "independent_b_review_state", "completed_at_utc",
         "completion_fingerprint",
     })
 
@@ -1926,6 +2131,7 @@ class WP8RehearsalCompleteV1:
         cleanup_proof: WP8CleanupProofV1,
         state: WP8RehearsalStateV1,
         completed_at_utc: str,
+        journal_events: Sequence[WP8RehearsalJournalEventV1],
     ) -> "WP8RehearsalCompleteV1":
         evidence = WP8PhaseAEvidenceV1.from_mapping(evidence.to_mapping())
         review = WP8AReviewResultV1.from_mapping(review.to_mapping())
@@ -1940,6 +2146,7 @@ class WP8RehearsalCompleteV1:
         )
         cleanup_proof = WP8CleanupProofV1.from_mapping(cleanup_proof.to_mapping())
         state = WP8RehearsalStateV1.from_mapping(state.to_mapping())
+        validate_rehearsal_journal_chain(journal_events, state)
         validate_review_result(review, evidence)
         if cleanup_proof.result is not WP8CleanupResult.PASS:
             _fail(WP8FailureCode.CLEANUP_FAILED)
@@ -1957,27 +2164,21 @@ class WP8RehearsalCompleteV1:
         completed = _timestamp(completed_at_utc)
         if completed < state.updated_at_utc:
             _fail(WP8FailureCode.CONTRACT_TRANSITION_INVALID)
-        invariant_bindings = (
-            invariant_proof.protected_environment_fingerprint,
-            invariant_proof.registry_fingerprint,
-            invariant_proof.unit_profile_asset_fingerprint,
-            invariant_proof.gate_a_authority_binding_fingerprint,
-            invariant_proof.gate_b_authority_binding_fingerprint,
-            invariant_proof.gate_c_authority_binding_fingerprint,
-            invariant_proof.principal_route_db_identity_fingerprint,
-            invariant_proof.enabled_scope_fingerprint,
+        # Revalidate the exact execution authority, not just its hash shape.
+        # consumed=False here only re-evaluates the bound authorization's
+        # original eligibility; it neither consumes nor reissues authority.
+        validate_rehearsal_authorization(
+            authorization, evidence, review, at_utc=state.started_at_utc, consumed=False
         )
-        expected_invariant_bindings = (
-            evidence.protected_environment_fingerprint,
-            evidence.registry_fingerprint,
-            evidence.unit_profile_asset_fingerprint,
-            evidence.gate_a_authority_binding_fingerprint,
-            evidence.gate_b_authority_binding_fingerprint,
-            evidence.gate_c_authority_binding_fingerprint,
-            evidence.db_identity_fingerprint,
-            evidence.enabled_scope_fingerprint,
+        validate_rehearsal_authorization(
+            authorization, evidence, review, at_utc=completed, consumed=False
         )
-        if invariant_bindings != expected_invariant_bindings:
+        if state.authorization_fingerprint != authorization.authorization_fingerprint:
+            _fail(WP8FailureCode.AUTHORIZATION_INVALID)
+        if (
+            invariant_proof.before != evidence.invariant_baseline
+            or invariant_proof.phase_a_evidence_fingerprint != evidence.phase_a_evidence_fingerprint
+        ):
             _fail(WP8FailureCode.INVARIANT_FAILED)
         bindings = {
             (authorization.candidate_sha, authorization.phase_a_context_fingerprint,
@@ -2018,7 +2219,10 @@ class WP8RehearsalCompleteV1:
             "p3d_service_state": "INACTIVE",
             "p3d_timer_state": "DISABLED_INACTIVE",
             "p3c_state": "UNCHANGED_HEALTHY",
-            "wp8_end_boundary": "AFTER_B_RUNTIME_LEDGER_INVARIANT_PROOF",
+            "execution_end_boundary": "B_RUNTIME_LEDGER_INVARIANT_PROOF_REVIEWABLE",
+            "wp8_final_end_boundary": "AFTER_B_RUNTIME_LEDGER_INVARIANT_PROOF_AND_INDEPENDENT_REVIEW",
+            "wp8_final_end_boundary_reached": False,
+            "independent_b_review_state": "PENDING",
             "completed_at_utc": completed,
         }
         value["completion_fingerprint"] = contract_fingerprint(value)
@@ -2035,9 +2239,13 @@ class WP8RehearsalCompleteV1:
             "p3d_service_state": "INACTIVE",
             "p3d_timer_state": "DISABLED_INACTIVE",
             "p3c_state": "UNCHANGED_HEALTHY",
-            "wp8_end_boundary": "AFTER_B_RUNTIME_LEDGER_INVARIANT_PROOF",
+            "execution_end_boundary": "B_RUNTIME_LEDGER_INVARIANT_PROOF_REVIEWABLE",
+            "wp8_final_end_boundary": "AFTER_B_RUNTIME_LEDGER_INVARIANT_PROOF_AND_INDEPENDENT_REVIEW",
+            "independent_b_review_state": "PENDING",
         }
         if any(value[name] != expected for name, expected in fixed.items()):
+            _fail()
+        if value["wp8_final_end_boundary_reached"] is not False:
             _fail()
         fingerprint = _sha256(value["completion_fingerprint"])
         if fingerprint != _fingerprint_without(value, "completion_fingerprint"):
@@ -2077,15 +2285,82 @@ class WP8RehearsalCompleteV1:
             "p3d_service_state": "INACTIVE",
             "p3d_timer_state": "DISABLED_INACTIVE",
             "p3c_state": "UNCHANGED_HEALTHY",
-            "wp8_end_boundary": "AFTER_B_RUNTIME_LEDGER_INVARIANT_PROOF",
+            "execution_end_boundary": "B_RUNTIME_LEDGER_INVARIANT_PROOF_REVIEWABLE",
+            "wp8_final_end_boundary": "AFTER_B_RUNTIME_LEDGER_INVARIANT_PROOF_AND_INDEPENDENT_REVIEW",
+            "wp8_final_end_boundary_reached": False,
+            "independent_b_review_state": "PENDING",
             "completed_at_utc": self.completed_at_utc,
             "completion_fingerprint": self.completion_fingerprint,
         }
 
 
-def wp8_contract_bytes(value: Any) -> bytes:
-    """Return the frozen canonical representation after strict parsing."""
+def validate_rehearsal_completion(
+    marker: WP8RehearsalCompleteV1,
+    *,
+    evidence: WP8PhaseAEvidenceV1,
+    review: WP8AReviewResultV1,
+    authorization: WP8RehearsalAuthorizationV1,
+    runtime_ledger: WP8RuntimeLedgerProofV1,
+    invariant_proof: WP8InvariantProofV1,
+    cleanup_proof: WP8CleanupProofV1,
+    state: WP8RehearsalStateV1,
+    journal_events: Sequence[WP8RehearsalJournalEventV1],
+) -> bool:
+    """A parsed marker's references are not independent authority.
 
-    if not hasattr(value, "to_mapping"):
+    Consumers must resolve its protected proof objects and revalidate these
+    bindings; parsing alone proves schema/hash, not observed production facts.
+    """
+    marker = WP8RehearsalCompleteV1.from_mapping(marker.to_mapping())
+    expected = WP8RehearsalCompleteV1.build(
+        evidence=evidence, review=review, authorization=authorization,
+        runtime_ledger=runtime_ledger, invariant_proof=invariant_proof,
+        cleanup_proof=cleanup_proof, state=state, journal_events=journal_events,
+        completed_at_utc=marker.completed_at_utc,
+    )
+    if marker != expected:
+        _fail(WP8FailureCode.PROTECTED_STATE_TAMPER)
+    return True
+
+
+def wp8_contract_bytes(value: Any) -> bytes:
+    """Serialize only an exact WP8 type after its strict schema parser.
+
+    Mappings must first pass the desired explicit ``Type.from_mapping``.
+    No duck typing, inferred schema, subclass, or caller-defined serializer.
+    """
+
+    allowed = (
+        WP8InvariantSnapshotV1, WP8PhaseAEvidenceV1, WP8AReviewResultV1,
+        WP8RehearsalAuthorizationV1, WP8RehearsalStateV1,
+        WP8RehearsalJournalEventV1, WP8PipelineRunProofV1,
+        WP8RuntimeLedgerProofV1, WP8InvariantProofV1, WP8CleanupProofV1,
+        WP8RehearsalCompleteV1,
+    )
+    if type(value) not in allowed:
         _fail()
-    return canonical_json_bytes(value.to_mapping())
+    try:
+        # Check nested typed boundaries before invoking their to_mapping;
+        # an unknown nested duck type is not an authorized serializer either.
+        nested = {
+            WP8PhaseAEvidenceV1: (("invariant_baseline", WP8InvariantSnapshotV1),),
+            WP8InvariantProofV1: (("before", WP8InvariantSnapshotV1), ("after", WP8InvariantSnapshotV1)),
+            WP8RehearsalStateV1: (("cleanup_proof", WP8CleanupProofV1),),
+            WP8RehearsalJournalEventV1: (("cleanup_proof", WP8CleanupProofV1),),
+        }
+        for name, expected_type in nested.get(type(value), ()):
+            item = getattr(value, name)
+            nullable = name == "cleanup_proof"
+            if not (nullable and item is None) and type(item) is not expected_type:
+                _fail()
+        if type(value) is WP8RuntimeLedgerProofV1 and (
+            type(value.pipeline_records) is not tuple
+            or any(type(item) is not WP8PipelineRunProofV1 for item in value.pipeline_records)
+        ):
+            _fail()
+        parsed = type(value).from_mapping(value.to_mapping())
+        return canonical_json_bytes(parsed.to_mapping())
+    except WP8ContractError:
+        raise
+    except (AttributeError, TypeError, ValueError):
+        _fail()
