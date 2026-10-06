@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import inspect
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -805,11 +806,147 @@ def test_gate_binding_binds_operation_journal_and_artifact():
     assert module._gate_binding("gate_b", state, (event,), {"release": "d" * 64}) != baseline
 
 
+@dataclass(frozen=True)
+class _FilesystemMutationEntry:
+    kind: int
+    device: int
+    inode: int
+    links: int
+    uid: int
+    gid: int
+    mode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    content_sha256: str | None
+    symlink_target: str | None
+
+
+def _filesystem_mutation_snapshot(root: Path) -> dict[str, _FilesystemMutationEntry]:
+    """Observe persistence, excluding read-access time and never following links.
+
+    This is a local code-path check, not a proof against a privileged actor
+    restoring every observable field. Content hashes also cover same-size
+    rewrites and rewrites with restored mtime.
+    """
+    snapshot = {}
+    for path in (root, *sorted(root.rglob("*"))):
+        info = path.lstat()
+        snapshot[str(path.relative_to(root))] = _FilesystemMutationEntry(
+            kind=stat.S_IFMT(info.st_mode), device=info.st_dev,
+            inode=info.st_ino, links=info.st_nlink,
+            uid=info.st_uid, gid=info.st_gid, mode=stat.S_IMODE(info.st_mode),
+            size=info.st_size, mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns,
+            content_sha256=(hashlib.sha256(path.read_bytes()).hexdigest()
+                            if stat.S_ISREG(info.st_mode) else None),
+            symlink_target=(os.readlink(path) if stat.S_ISLNK(info.st_mode) else None),
+        )
+    return snapshot
+
+
+@pytest.mark.parametrize("kind", ("directory", "file"))
+def test_mutation_snapshot_accepts_read_only_atime_change(tmp_path, monkeypatch, kind):
+    file = tmp_path / "protected.json"
+    file.write_bytes(b"synthetic protected content")
+    before = _filesystem_mutation_snapshot(tmp_path)
+    target = tmp_path if kind == "directory" else file
+    original = Path.lstat
+
+    def accessed(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if path != target:
+            return info
+        # Model only the observed access-time delta: os.utime itself changes
+        # ctime, and real read-atime behavior depends on the filesystem mount.
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        fields["st_atime"] += 60
+        fields["st_atime_ns"] += 60_000_000_000
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(Path, "lstat", accessed)
+    list(tmp_path.iterdir())
+    file.read_bytes()
+    assert target.lstat().st_atime_ns != original(target).st_atime_ns
+    assert _filesystem_mutation_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("attribute", (
+    "st_dev", "st_ino", "st_nlink", "st_uid", "st_gid", "st_mode", "st_size",
+    "st_mtime_ns", "st_ctime_ns",
+))
+def test_mutation_snapshot_rejects_safe_metadata_projection_drift(tmp_path, monkeypatch, attribute):
+    file = tmp_path / "protected.json"
+    file.write_bytes(b"synthetic protected content")
+    before = _filesystem_mutation_snapshot(tmp_path)
+    original = Path.lstat
+
+    def changed(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if path != file:
+            return info
+        # Ownership/ctime checks need no privileged chown or clock control.
+        fields = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+        fields[attribute] += 1
+        return SimpleNamespace(**fields)
+
+    monkeypatch.setattr(Path, "lstat", changed)
+    assert _filesystem_mutation_snapshot(tmp_path) != before
+
+
+@pytest.mark.parametrize("mutation", (
+    "mtime", "mode", "same-size-content", "content-restored-mtime", "truncate",
+    "new", "delete", "rename", "replace", "kind",
+))
+def test_mutation_snapshot_rejects_actual_filesystem_changes(tmp_path, mutation):
+    root = tmp_path / "watched"
+    root.mkdir()
+    file = root / "protected.json"
+    file.write_bytes(b"AAAA")
+    file.chmod(0o644)
+    before = _filesystem_mutation_snapshot(root)
+    original = file.stat()
+    if mutation == "mtime":
+        os.utime(file, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000_000))
+    elif mutation == "mode":
+        file.chmod(0o600)
+    elif mutation in {"same-size-content", "content-restored-mtime"}:
+        file.write_bytes(b"BBBB")
+        if mutation == "content-restored-mtime":
+            os.utime(file, ns=(original.st_atime_ns, original.st_mtime_ns))
+    elif mutation == "truncate":
+        file.write_bytes(b"A")
+    elif mutation == "new":
+        (root / "new.json").write_bytes(b"new")
+    elif mutation == "delete":
+        file.unlink()
+    elif mutation == "rename":
+        file.rename(root / "renamed.json")
+    elif mutation == "replace":
+        replacement = tmp_path / "replacement.json"
+        replacement.write_bytes(b"AAAA")
+        replacement.chmod(0o644)
+        replacement.replace(file)
+    else:
+        file.unlink()
+        file.mkdir()
+    after = _filesystem_mutation_snapshot(root)
+    assert after != before
+    if mutation in {"new", "delete", "rename"}:
+        assert set(after) != set(before)
+    elif mutation == "replace":
+        assert after[file.name].inode != before[file.name].inode
+        assert after[file.name].content_sha256 == before[file.name].content_sha256
+    elif mutation in {"same-size-content", "content-restored-mtime"}:
+        assert after[file.name].size == before[file.name].size
+        assert after[file.name].content_sha256 != before[file.name].content_sha256
+        if mutation == "content-restored-mtime":
+            assert after[file.name].mtime_ns == before[file.name].mtime_ns
+
+
 def test_joined_collection_has_no_mutation_or_provider_path(joined_authorities, monkeypatch):
     import socket
     fixture = joined_authorities
-    before = {str(path.relative_to(fixture.policy.root)): path.stat()
-              for path in fixture.policy.root.rglob("*")}
+    before = _filesystem_mutation_snapshot(fixture.policy.root)
     def forbidden(*_, **kw):
         pytest.fail("Phase A attempted mutation or Provider/workload invocation")
     for name in ("mkdir", "write_text", "write_bytes", "touch", "unlink", "rename", "replace", "symlink_to"):
@@ -817,8 +954,7 @@ def test_joined_collection_has_no_mutation_or_provider_path(joined_authorities, 
     monkeypatch.setattr(subprocess, "run", forbidden)
     monkeypatch.setattr(socket, "create_connection", forbidden)
     fixture.run()
-    after = {str(path.relative_to(fixture.policy.root)): path.stat()
-             for path in fixture.policy.root.rglob("*")}
+    after = _filesystem_mutation_snapshot(fixture.policy.root)
     assert before == after
 
 
