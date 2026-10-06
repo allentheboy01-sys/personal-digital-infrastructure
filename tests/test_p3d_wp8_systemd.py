@@ -31,6 +31,8 @@ H = "1" * 64
 CANARY = "synthetic-password-token@provider.invalid"
 TEMPLATE = Path("deployment/systemd/pdi-scoped-pipeline@.service").read_bytes()
 DEPENDENCY_DIRECTORIES = module._dependency_directories
+DEFAULT_DEPENDENCY_DIRECTORIES = module._default_dependency_directories
+DEFAULT_FRAGMENT = module._default_fragment
 PUBLIC = {"manager_identity", "daemon_reload", "snapshot_p3c", "verify_timers_quiet",
           "verify_service_contract", "start_service", "stop_all_services", "verify_all_services_inactive"}
 
@@ -67,6 +69,42 @@ def timer_values(key):
         SubState="dead", Unit=module._SERVICE_UNITS[key], Job="0")
 
 
+def raw_default_units():
+    # Independent literal v255 Unit projection. NOT generated from production
+    # property/default/edge constants. Unknown requested properties are omitted
+    # by the fake transport, as real systemctl show does.
+    def unit(name, active="active", sub="active", **changes):
+        values = dict(Id=name, Names=name, Following="", LoadState="loaded",
+            FragmentPath="/usr/lib/systemd/system/" + name, DropInPaths="", Transient="no",
+            NeedDaemonReload="no", Wants="", Requires="", Requisite="", BindsTo="", PartOf="",
+            ConsistsOf="", Upholds="", RequiredBy="", RequisiteOf="", WantedBy="", BoundBy="",
+            UpheldBy="", Conflicts="", ConflictedBy="", OnFailure="", OnSuccess="", OnFailureOf="",
+            OnSuccessOf="", Triggers="", TriggeredBy="", PropagatesStopTo="", StopPropagatedFrom="",
+            PropagatesReloadTo="", ReloadPropagatedFrom="", JoinsNamespaceOf="", SliceOf="",
+            RequiresMountsFor="", Before="", After="", ActiveState=active, SubState=sub, Job="0",
+            FailureAction="none", SuccessAction="none", StartLimitAction="none", JobTimeoutAction="none",
+            StopWhenUnneeded="no")
+        values.update(changes)
+        return values
+    units = {
+        "sysinit.target": unit("sysinit.target", Wants="local-fs.target swap.target",
+            Conflicts="emergency.service emergency.target"),
+        "local-fs.target": unit("local-fs.target"), "swap.target": unit("swap.target"),
+        r"system-pdi\x2dscoped\x2dpipeline.slice": unit(r"system-pdi\x2dscoped\x2dpipeline.slice",
+            active="inactive", sub="dead", FragmentPath="", Requires="system.slice", Conflicts="shutdown.target"),
+        "system.slice": unit("system.slice", Requires="-.slice", Conflicts="shutdown.target"),
+        "-.slice": unit("-.slice", FragmentPath=""),
+        "shutdown.target": unit("shutdown.target", "inactive", "dead"),
+        "umount.target": unit("umount.target", "inactive", "dead"),
+        "emergency.target": unit("emergency.target", "inactive", "dead"),
+        "emergency.service": unit("emergency.service", "inactive", "dead", ExecStop="", ExecStopPost=""),
+    }
+    for name in ("-.mount", "tmp.mount", "opt.mount", "opt-pdi.mount", "opt-pdi-current.mount", "var.mount", "var-tmp.mount"):
+        units[name] = unit(name, sub="mounted", Conflicts="umount.target",
+                           FragmentPath="" if name == "-.mount" else "/usr/lib/systemd/system/" + name)
+    return units
+
+
 def show(values):
     return "".join(f"{name}={value}\n" for name, value in values.items())
 
@@ -75,11 +113,12 @@ class FakeRunner:
     def __init__(self):
         self.calls = []
         self.services = {key: service_values(key) for key in KEYS}
+        self.defaults = raw_default_units()
         self.timers = {key: timer_values(key) for key in KEYS}
         self.enabled = {key: (1, "disabled\n") for key in KEYS}
         self.active = {key: (3, "inactive\n") for key in KEYS}
         self.manager = {"Version": "255", "Virtualization": "kvm", "SystemState": "running",
-                        "UnitPath": " ".join(module._UNIT_LOAD_ROOTS)}
+                        "UnitPath": "/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system"}
         self.failures = {}
         self.after_start = {}
         self.fresh = True
@@ -135,6 +174,10 @@ class FakeRunner:
             else:
                 assert verb == "show"
                 stdout = show(self.timers[key])
+        elif unit in self.defaults:
+            assert verb == "show"
+            requested = next(arg for arg in argv if arg.startswith("--property=")).split("=", 1)[1].split(",")
+            stdout = show({name: self.defaults[unit][name] for name in requested if name in self.defaults[unit]})
         else:
             assert unit in module._p3c_units() and verb in {"show", "is-active", "is-enabled"}
             template = unit.endswith("@.service")
@@ -160,11 +203,14 @@ def rig(monkeypatch):
     facts = {"boot": "11111111-2222-4333-8444-555555555555", "namespaces": {"pid": "pid:[1]"},
              "executable_sha256": H, "peer": (1, 0, 0)}
     monkeypatch.setattr(module, "_manager_os_facts", lambda: dict(facts))
+    monkeypatch.setattr(module, "_manager_continuity_facts", lambda: {k: v for k, v in facts.items() if k != "executable_sha256"})
     assets = module._Assets(H, module._template(TEMPLATE))
     monkeypatch.setattr(module, "_read_assets", lambda _: assets)
     monkeypatch.setattr(module, "_verify_candidate", lambda _: H)
     monkeypatch.setattr(module, "_current_candidate", lambda _: None)
     monkeypatch.setattr(module, "_dependency_directories", lambda _: None)
+    monkeypatch.setattr(module, "_default_dependency_directories", lambda *_: None)
+    monkeypatch.setattr(module, "_default_fragment", lambda _: H)
     # Run the actual frozen P3C algorithm over the same injected transport.
     frozen = ProductionReadOnlySystemdStateProvider(runner=module._p3c_read_adapter).snapshot(post_install=True)
     evidence = phase_a()
@@ -249,6 +295,7 @@ def test_every_command_uses_fixed_transport(rig, monkeypatch, command_kind):
                         "DBUS_SYSTEM_BUS_ADDRESS": CANARY}.items():
         monkeypatch.setenv(name, value)
     key = (None if command_kind in {module._Request.MANAGER, module._Request.RELOAD} else
+           "sysinit.target" if command_kind is module._Request.DEFAULT_SHOW else
            module._p3c_units()[0] if command_kind.name.startswith("P3C") else KEYS[0])
     module._systemctl(command_kind, key)
     argv, kwargs = rig.runner.calls[-1]
@@ -620,7 +667,7 @@ def manager_os(monkeypatch):
     state = dict(uid=0, comm="systemd", executable=Path("/usr/lib/systemd/systemd"), trusted=True,
                  root=True, boot="11111111-2222-4333-8444-555555555555", container=False,
                  peer=(1, 0, 0), socket_mode=stat.S_IFSOCK | 0o600, socket_uid=0, socket_gid=0,
-                 namespace_mismatch=None, connected=[])
+                 namespace_mismatch=None, connected=[], executable_inode=2, socket_inode=2)
     original_exists, original_read = Path.exists, Path.read_bytes
     def read_text(path, *_, **__):
         return {"/proc/1/comm": state["comm"], "/proc/sys/kernel/random/boot_id": state["boot"]}[str(path)]
@@ -636,7 +683,7 @@ def manager_os(monkeypatch):
         def __exit__(self, *_):
             pass
         def settimeout(self, timeout):
-            assert timeout == 30
+            assert timeout == 1
         def connect(self, path):
             state["connected"].append(path)
         def getsockopt(self, *args):
@@ -647,8 +694,10 @@ def manager_os(monkeypatch):
     monkeypatch.setattr(Path, "read_text", read_text)
     monkeypatch.setattr(Path, "resolve", resolve)
     monkeypatch.setattr(Path, "read_bytes", lambda path: b"synthetic-systemd" if path == state["executable"] else original_read(path))
-    monkeypatch.setattr(Path, "lstat", lambda _: SimpleNamespace(st_mode=state["socket_mode"],
-                                                                st_uid=state["socket_uid"], st_gid=state["socket_gid"]))
+    monkeypatch.setattr(Path, "lstat", lambda path: SimpleNamespace(
+        st_mode=state["socket_mode"], st_uid=state["socket_uid"], st_gid=state["socket_gid"],
+        st_dev=1, st_ino=state["executable_inode" if path == state["executable"] else "socket_inode"],
+        st_size=17, st_mtime_ns=1, st_ctime_ns=1))
     monkeypatch.setattr(module, "_trusted", lambda *_, **__: state["trusted"])
     monkeypatch.setattr(module.os, "readlink", readlink)
     monkeypatch.setattr(module.os.path, "samefile", lambda a, b: state["root"] and (a, b) == ("/proc/1/root", "/"))
@@ -1169,4 +1218,514 @@ def test_r3_untrusted_dependency_never_appears_in_public_safe_error(rig):
     with pytest.raises(WP8ContractError) as error:
         rig.backend.start_service(KEYS[0])
     assert CANARY not in str(error.value) and error.value.__suppress_context__
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("drift", ("other_active", "other_job", "timer_enabled", "timer_active",
+    "current", "candidate", "target_active", "target_job", "target_graph", "default_graph", "manager"))
+def test_b1_last_full_manager_window_cannot_emit_start(rig, monkeypatch, drift):
+    # Discover the last full OS proof preceding start using the injected trace,
+    # then replay an attack at that precise boundary. No production helper's
+    # manager-call count/order is copied into this test oracle.
+    real_facts, count, last = module._manager_os_facts, [0], []
+    def counted():
+        count[0] += 1
+        return real_facts()
+    def trace(argv, **kwargs):
+        if argv[4] == "start":
+            last.append(count[0])
+        return rig.runner(argv, **kwargs)
+    monkeypatch.setattr(module, "_manager_os_facts", counted)
+    monkeypatch.setattr(module.subprocess, "run", trace)
+    rig.backend.start_service("enrichment.nextcloud_text")
+    assert len(last) == 1 and last[0] > 0
+    rig.runner.calls.clear()
+    rig.runner.services = {key: service_values(key) for key in KEYS}
+    rig.runner.defaults = raw_default_units()
+    backend = module.WP8ProductionSystemdBackend(rig.evidence)
+    count[0], injected = 0, []
+    def attack():
+        count[0] += 1
+        if count[0] == last[0]:
+            injected.append(drift)
+            if drift == "other_active":
+                rig.runner.services["enrichment.immich_geo"].update(ActiveState="active", SubState="running")
+            elif drift == "other_job":
+                rig.runner.services["enrichment.immich_geo"]["Job"] = "123"
+            elif drift == "timer_enabled":
+                rig.runner.enabled["enrichment.immich_geo"] = (0, "enabled\n")
+            elif drift == "timer_active":
+                rig.runner.active["enrichment.immich_geo"] = (0, "active\n")
+            elif drift == "target_active":
+                rig.runner.services["enrichment.nextcloud_text"].update(ActiveState="active", SubState="running")
+            elif drift == "target_job":
+                rig.runner.services["enrichment.nextcloud_text"]["Job"] = "123"
+            elif drift == "target_graph":
+                rig.runner.services["enrichment.nextcloud_text"]["Wants"] += " synthetic-unreviewed.service"
+            elif drift == "default_graph":
+                rig.runner.defaults[r"system-pdi\x2dscoped\x2dpipeline.slice"]["Requires"] = "synthetic-unreviewed.service"
+            elif drift == "manager":
+                rig.facts["boot"] = "21111111-2222-4333-8444-555555555555"
+        return real_facts()
+    monkeypatch.setattr(module, "_manager_os_facts", attack)
+    monkeypatch.setattr(module.subprocess, "run", rig.runner)
+    def runtime(_):
+        return "2" * 64 if injected and drift == "candidate" else H
+    def current(_):
+        if injected and drift == "current":
+            module._fail(WP8FailureCode.CURRENT_DRIFT)
+    monkeypatch.setattr(module, "_verify_candidate", runtime)
+    monkeypatch.setattr(module, "_current_candidate", current)
+    with pytest.raises(WP8ContractError):
+        backend.start_service("enrichment.nextcloud_text")
+    assert injected == [drift] and not rig.runner.mutations()
+
+
+def test_b1_final_bundle_has_no_full_manager_or_slow_validation_after_current(rig, monkeypatch):
+    current_seen, started, events = [False], [False], []
+    def current(_):
+        current_seen[0] = True
+        events.append("current")
+    monkeypatch.setattr(module, "_current_candidate", current)
+    for name in ("_manager_os_facts", "_verify_candidate", "_read_assets", "_dependency_directories",
+                 "_default_dependency_directories", "_default_fragment"):
+        original = getattr(module, name)
+        def checked(*args, _original=original, _name=name, **kwargs):
+            assert not current_seen[0] or started[0], _name + " after final current before start"
+            events.append(_name)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(module, name, checked)
+    def transport(argv, **kwargs):
+        if argv[4] == "start":
+            assert current_seen[0]
+            started[0] = True
+            events.append("start")
+        return rig.runner(argv, **kwargs)
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    assert rig.backend.start_service("enrichment.nextcloud_text").outcome is module._Outcome.SUCCESS
+    assert events.index("current") < events.index("start")
+
+
+def test_b1_cheap_manager_token_never_reads_executable_content_or_queries(manager_os, monkeypatch):
+    full = module._manager_os_facts()
+    identity = module._ManagerIdentity(H, H, "BARE_METAL",
+        contract_fingerprint({k: v for k, v in full.items() if k != "executable_sha256"}))
+    def forbidden(*_, **__):
+        pytest.fail("cheap continuity proof performed slow IO")
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(module.subprocess, "run", forbidden)
+    module._manager_token(identity)
+    manager_os["boot"] = "21111111-2222-4333-8444-555555555555"
+    with pytest.raises(WP8ContractError):
+        module._manager_token(identity)
+
+
+@pytest.mark.parametrize("source,relation,target", (
+    (r"system-pdi\x2dscoped\x2dpipeline.slice", "Requires", "synthetic-second-hop.service"),
+    (r"system-pdi\x2dscoped\x2dpipeline.slice", "Wants", "synthetic-second-hop.service"),
+    ("system.slice", "Conflicts", "pdi-p3c-nextcloud-incremental.timer"),
+    ("system.slice", "ConflictedBy", "pdi-p3c-nextcloud-incremental.timer"),
+    ("system.slice", "OnFailure", "synthetic-handler.service"),
+    ("system.slice", "OnSuccess", "synthetic-handler.service"),
+    ("system.slice", "Upholds", "synthetic-second-hop.service"),
+    ("system.slice", "BindsTo", "synthetic-second-hop.service"),
+    ("system.slice", "Requisite", "synthetic-second-hop.service"),
+    ("shutdown.target", "PropagatesStopTo", "pdi-p3c-nextcloud-incremental.timer"),
+    ("shutdown.target", "RequiredBy", "pdi-p3c-nextcloud-incremental.timer"),
+    (r"system-pdi\x2dscoped\x2dpipeline.slice", "RequiredBy", "pdi-p3c-nextcloud-incremental.timer"),
+))
+@pytest.mark.parametrize("action", ("verify_service_contract", "start_service"))
+def test_b2_raw_transitive_mutation_graph_rejected(rig, source, relation, target, action):
+    rig.runner.defaults[source][relation] = target
+    # Even if the foreign second hop has a P3C conflict, its identity is itself
+    # unauthorized. Do NOT query an arbitrary unit to decide whether to trust it.
+    rig.runner.defaults["synthetic-second-hop.service"] = {
+        "Id": "synthetic-second-hop.service", "Conflicts": "pdi-p3c-nextcloud-incremental.timer"}
+    with pytest.raises(WP8ContractError) as error:
+        getattr(rig.backend, action)("enrichment.nextcloud_text")
+    assert error.value.code is WP8FailureCode.SERVICE_CONTRACT_INVALID
+    assert not rig.runner.mutations()
+    assert not any(call[4:6] == ("show", "synthetic-second-hop.service") for call, _ in rig.runner.calls)
+
+
+@pytest.mark.parametrize("relation", ("Before", "After", "PartOf", "StopPropagatedFrom", "WantedBy", "SliceOf"))
+def test_b2_non_start_edges_are_not_walked_as_an_undirected_graph(rig, relation):
+    rig.runner.defaults["system.slice"][relation] = "synthetic-order-or-inverse.service"
+    assert rig.backend.start_service("enrichment.nextcloud_text").outcome is module._Outcome.SUCCESS
+    assert not any(call[5] == "synthetic-order-or-inverse.service" for call, _ in rig.runner.calls if len(call) > 5)
+
+
+def test_b2_requisite_checks_active_authority_without_starting_its_dependencies(rig):
+    rig.runner.defaults["system.slice"]["Requisite"] = "swap.target"
+    # VERIFY_ACTIVE does not pull swap.target's Wants into the transaction. It
+    # remains separately reached/checked as START through sysinit.target, so
+    # removing that actual start edge isolates this directional test.
+    rig.runner.defaults["sysinit.target"]["Wants"] = "local-fs.target"
+    rig.runner.defaults["swap.target"]["Wants"] = "synthetic-not-started.service"
+    assert rig.backend.start_service("enrichment.nextcloud_text").outcome is module._Outcome.SUCCESS
+    rig.runner.services["enrichment.nextcloud_text"] = service_values("enrichment.nextcloud_text")
+    rig.runner.calls.clear()
+    rig.runner.defaults["swap.target"]["ActiveState"] = "inactive"
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+def test_b2_reviewed_cycle_terminates_with_deterministic_complete_fingerprint(rig):
+    rig.runner.defaults["swap.target"]["Requires"] = "sysinit.target"
+    first = rig.backend.verify_service_contract("enrichment.nextcloud_text")
+    second = rig.backend.verify_service_contract("enrichment.nextcloud_text")
+    assert first == second and not rig.runner.mutations()
+    assert len(rig.runner.calls) < 200
+
+
+@pytest.mark.parametrize("limit,value", (("_MAX_CLOSURE_NODES", 2), ("_MAX_CLOSURE_EDGES", 2), ("_MAX_CLOSURE_DEPTH", 1)))
+def test_b2_each_graph_limit_fails_closed_not_truncated(rig, monkeypatch, limit, value):
+    monkeypatch.setattr(module, limit, value)  # internal test API, never operator-configurable
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+def test_b2_real_fixed_edge_limit_rejects_large_authorized_graph(rig):
+    names = ("sysinit.target", "local-fs.target", "swap.target", r"system-pdi\x2dscoped\x2dpipeline.slice",
+             "system.slice", "-.slice", "tmp.mount", "-.mount", "opt.mount", "opt-pdi.mount",
+             "opt-pdi-current.mount", "var.mount", "var-tmp.mount")
+    for name in names:
+        rig.runner.defaults[name]["Wants"] = " ".join(names)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("field,value", (("Id", "synthetic-other.target"), ("Names", "sysinit.target alias.target"),
+    ("LoadState", "not-found"), ("NeedDaemonReload", "yes"), ("DropInPaths", "/run/foreign.conf"),
+    ("Transient", "yes"), ("Following", "alias.target"), ("Job", "123"),
+    ("ActiveState", "inactive"), ("SubState", "failed"), ("FailureAction", "reboot"),
+    ("StopWhenUnneeded", "yes"), ("RequiresMountsFor", "/foreign")))
+def test_b2_default_name_alone_is_not_authority(rig, field, value):
+    rig.runner.defaults["sysinit.target"][field] = value
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+def test_b2_missing_raw_default_property_is_not_filled_by_the_fake(rig):
+    del rig.runner.defaults["sysinit.target"]["Conflicts"]
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+def test_b2_final_loaded_closure_drift_refused_without_new_graph_traversal(rig, monkeypatch):
+    calls = []
+    original = module._closure_continuity
+    def changed(closure):
+        calls.append(closure)
+        rig.runner.defaults["system.slice"]["Requires"] = "synthetic-second-hop.service"
+        return original(closure)
+    monkeypatch.setattr(module, "_closure_continuity", changed)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert len(calls) == 1 and not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("value", ("", None, "00000000000000000000000000000000", "abc", "2" * 31,
+    "2" * 33, "g" * 32, "ABCDEF0123456789ABCDEF0123456789", " 22222222222222222222222222222222",
+    "22222222222222222222222222222222 ", "11111111111111111111111111111111"))
+def test_b3_raw_post_invocation_requires_new_canonical_nonzero_id(rig, value):
+    rig.runner.after_start["InvocationID"] = value
+    with pytest.raises(WP8ContractError) as error:
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert error.value.code is WP8FailureCode.SERVICE_EXECUTION_FAILED
+    assert len(rig.runner.mutations()) == 1  # never retry after ambiguous execution
+
+
+@pytest.mark.parametrize("prior", ("", "00000000000000000000000000000000", "11111111111111111111111111111111"))
+def test_b3_no_prior_invocation_still_requires_valid_new_nonzero_id(rig, prior):
+    rig.runner.services["enrichment.nextcloud_text"]["InvocationID"] = prior
+    rig.runner.after_start["InvocationID"] = "abcdef0123456789abcdef0123456789"
+    assert rig.backend.start_service("enrichment.nextcloud_text").outcome is module._Outcome.SUCCESS
+
+
+def test_b3_missing_invocation_property_is_rejected_not_defaulted(rig, monkeypatch):
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if argv[4] == "start":
+            del rig.runner.services["enrichment.nextcloud_text"]["InvocationID"]
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert len(rig.runner.mutations()) == 1
+
+
+@pytest.mark.parametrize("version", ("255", "255.4-1ubuntu8", "255.4-1ubuntu8.14", "255.4-1ubuntu8.17"))
+def test_b4_raw_known_supported_version_representations(rig, version):
+    rig.runner.manager["Version"] = version
+    assert len(rig.backend.manager_identity().fingerprint) == 64
+
+
+@pytest.mark.parametrize("version", ("255 future-version-256-unreviewed", "255malformed", "254", "256",
+    "255\n256", "255 arbitrary free text", " 255", "255 ", "255\t", "255\x00", "255 256",
+    "255.4-1ubuntu8.14 future 256", "255.4-1ubuntu8.014", "255.4-1ubuntu8.0", "255.4-1ubuntu8.14.256",
+    "255.5", "255.4-2ubuntu8", "255.4-1ubuntu9", "255.4-1ubuntu8~256", "255.4-1ubuntu8+256"))
+def test_b4_raw_malformed_or_unreviewed_version_never_authorizes_start(rig, version):
+    rig.runner.manager["Version"] = version
+    with pytest.raises(WP8ContractError) as error:
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert error.value.code is WP8FailureCode.SYSTEMD_MANAGER_INVALID
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("field,value", (("boot", "21111111-2222-4333-8444-555555555555"),
+    ("peer", (123, 0, 0)), ("comm", "python"), ("namespace_mismatch", "pid"),
+    ("namespace_mismatch", "mnt"), ("namespace_mismatch", "user"), ("namespace_mismatch", "time"),
+    ("executable_inode", 3), ("socket_inode", 3)))
+def test_b1_cheap_continuity_binds_original_boot_peer_namespaces_and_inodes(manager_os, monkeypatch, field, value):
+    full = module._manager_os_facts()
+    identity = module._ManagerIdentity(H, H, "BARE_METAL",
+        contract_fingerprint({k: v for k, v in full.items() if k != "executable_sha256"}))
+    def forbidden(*_, **__):
+        pytest.fail("cheap token performed full proof or systemctl query")
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(module.subprocess, "run", forbidden)
+    manager_os[field] = value
+    with pytest.raises(WP8ContractError) as error:
+        module._manager_token(identity)
+    assert error.value.code is WP8FailureCode.SYSTEMD_MANAGER_INVALID
+
+
+@pytest.mark.parametrize("suffix", ("wants", "requires"))
+@pytest.mark.parametrize("case", ("absent", "empty", "trusted_link", "relative_link", "missing_loaded_edge",
+    "foreign_name", "file", "link_owner", "link_gid", "directory_owner", "directory_group", "directory_link",
+    "parent_group", "target_owner", "target_group", "target_link", "target_parent_owner", "target_escape",
+    "intermediate_user_alias", "limit"))
+def test_b2_actual_default_directory_reconciles_root_trust_links_and_loaded_graph(monkeypatch, suffix, case):
+    # All stat/link/directory observations are virtual. Execute the actual WP8
+    # helper AND frozen trusted_path logic, never read a host unit directory.
+    root = Path("/etc/systemd/system")
+    packaged = Path("/usr/lib/systemd/system")
+    directory = root / ("sysinit.target." + suffix)
+    entry, target = directory / "swap.target", packaged / "swap.target"
+    metadata = {p: SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+        for p in {root, *root.parents, packaged, *packaged.parents}}
+    if case != "absent":
+        metadata[directory] = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+    metadata[entry] = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0, st_gid=0)
+    metadata[target] = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0)
+    text_target = str(target)
+    entries = [entry] if case not in {"absent", "empty"} else []
+    values = raw_default_units()["sysinit.target"]
+    values["Wants" if suffix == "wants" else "Requires"] = "swap.target"
+    if case == "relative_link":
+        target = root / "swap.target"
+        metadata[target] = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0)
+        text_target = "../swap.target"
+        metadata[directory / ".."] = metadata[root]
+        metadata[directory / ".." / "swap.target"] = metadata[target]
+    elif case == "missing_loaded_edge":
+        values["Wants" if suffix == "wants" else "Requires"] = ""
+    elif case == "foreign_name":
+        entries = [directory / "synthetic-unreviewed.service"]
+    elif case == "file":
+        metadata[entry].st_mode = stat.S_IFREG | 0o644
+    elif case == "link_owner":
+        metadata[entry].st_uid = 1000
+    elif case == "link_gid":
+        metadata[entry].st_gid = 1000
+    elif case == "directory_owner":
+        metadata[directory].st_uid = 1000
+    elif case == "directory_group":
+        metadata[directory].st_mode |= 0o020
+    elif case == "directory_link":
+        metadata[directory].st_mode = stat.S_IFLNK | 0o777
+    elif case == "parent_group":
+        metadata[root].st_mode |= 0o020
+    elif case == "target_owner":
+        metadata[target].st_uid = 1000
+    elif case == "target_group":
+        metadata[target].st_mode |= 0o020
+    elif case == "target_link":
+        metadata[target].st_mode = stat.S_IFLNK | 0o777
+    elif case == "target_parent_owner":
+        metadata[packaged].st_uid = 1000
+    elif case == "target_escape":
+        text_target = "/synthetic-outside/swap.target"
+        metadata[Path(text_target)] = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0)
+        metadata[Path("/synthetic-outside")] = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+    elif case == "intermediate_user_alias":
+        text_target = "/synthetic-user/alias.target"
+        metadata[Path(text_target)] = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=1000, st_gid=1000)
+        metadata[Path("/synthetic-user")] = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=1000, st_gid=1000)
+    elif case == "limit":
+        # Repeated entries test the independent total entry budget without
+        # materializing an arbitrary host directory or expanding authority.
+        entries *= 129
+    def lstat(path):
+        if path not in metadata:
+            raise FileNotFoundError
+        return metadata[path]
+    def iterdir(path):
+        assert path == directory
+        return iter(entries)
+    def readlink(path):
+        assert path == entry
+        return text_target
+    def resolve(path, *, strict):
+        assert strict and path == (Path(text_target) if text_target.startswith("/") else directory / text_target)
+        return target if case != "target_escape" else Path(text_target)
+    monkeypatch.setattr(module, "_UNIT_LOAD_ROOTS", (str(root), str(packaged)))
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(Path, "resolve", resolve)
+    monkeypatch.setattr(module.os, "readlink", readlink)
+    if case in {"absent", "empty", "trusted_link", "relative_link"}:
+        DEFAULT_DEPENDENCY_DIRECTORIES("sysinit.target", values)
+    else:
+        with pytest.raises(WP8ContractError) as error:
+            DEFAULT_DEPENDENCY_DIRECTORIES("sysinit.target", values)
+        assert error.value.code is WP8FailureCode.SERVICE_CONTRACT_INVALID
+
+
+@pytest.mark.parametrize("case", ("trusted", "foreign_path", "wrong_name", "file_owner", "file_group",
+    "file_link", "parent_owner", "parent_group"))
+def test_b2_actual_default_fragment_authority_is_exact_and_root_controlled(monkeypatch, case):
+    values = raw_default_units()["sysinit.target"]
+    target = Path("/usr/lib/systemd/system/sysinit.target")
+    metadata = {p: SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0) for p in target.parents}
+    metadata[target] = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_gid=0)
+    if case == "foreign_path":
+        values["FragmentPath"] = "/tmp/sysinit.target"
+    elif case == "wrong_name":
+        values["FragmentPath"] = "/usr/lib/systemd/system/swap.target"
+    elif case == "file_owner":
+        metadata[target].st_uid = 1000
+    elif case == "file_group":
+        metadata[target].st_mode |= 0o020
+    elif case == "file_link":
+        metadata[target].st_mode = stat.S_IFLNK | 0o777
+    elif case == "parent_owner":
+        metadata[target.parent].st_uid = 1000
+    elif case == "parent_group":
+        metadata[target.parent].st_mode |= 0o020
+    reads = []
+    def lstat(path):
+        if path not in metadata:
+            raise FileNotFoundError
+        return metadata[path]
+    def read(path):
+        reads.append(path)
+        assert path == target
+        return b"synthetic root-controlled default unit"
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    if case == "trusted":
+        assert DEFAULT_FRAGMENT(values) == hashlib.sha256(read(target)).hexdigest()
+    else:
+        with pytest.raises(WP8ContractError):
+            DEFAULT_FRAGMENT(values)
+        assert reads == []
+
+
+@pytest.mark.parametrize("unit", (r"system-pdi\x2dscoped\x2dpipeline.slice", "system.slice", "-.slice", "-.mount"))
+def test_b2_only_explicit_v255_implicit_units_have_no_fragment(unit):
+    assert DEFAULT_FRAGMENT(dict(Id=unit, FragmentPath="")) == "IMPLICIT_V255_UNIT"
+
+
+@pytest.mark.parametrize("action", ("verify_service_contract", "start_service"))
+@pytest.mark.parametrize("helper", ("_default_fragment", "_default_dependency_directories"))
+def test_b2_transitive_filesystem_failure_is_wired_and_sanitized(rig, monkeypatch, action, helper):
+    def rejected(*_):
+        raise PermissionError(CANARY)
+    monkeypatch.setattr(module, helper, rejected)
+    with pytest.raises(WP8ContractError) as error:
+        getattr(rig.backend, action)("enrichment.nextcloud_text")
+    assert error.value.code is WP8FailureCode.SERVICE_CONTRACT_INVALID and error.value.__suppress_context__
+    assert CANARY not in str(error.value) and not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("unit", ("synthetic-second-hop.service", "pdi-p3c-nextcloud-incremental.timer"))
+def test_b2_default_read_transport_never_accepts_foreign_unit_arguments(rig, unit):
+    with pytest.raises(WP8ContractError):
+        module._systemctl(module._Request.DEFAULT_SHOW, unit)
+    assert not rig.runner.calls
+
+
+def test_b2_stop_direction_does_not_start_stop_targets_outgoing_wants(rig):
+    rig.runner.defaults["shutdown.target"]["Wants"] = "synthetic-not-started.service"
+    assert rig.backend.start_service("enrichment.nextcloud_text").outcome is module._Outcome.SUCCESS
+    assert not any(call[4:6] == ("show", "synthetic-not-started.service") for call, _ in rig.runner.calls)
+
+
+def test_b1_complete_final_bundle_follows_every_slow_proof_and_fence_immediately_precedes_start(rig, monkeypatch):
+    events = []
+    for name in ("_manager_os_facts", "_verify_candidate", "_read_assets", "_dependency_directories",
+                 "_default_dependency_directories", "_default_fragment"):
+        original = getattr(module, name)
+        def slow(*args, _original=original, **kwargs):
+            result = _original(*args, **kwargs)
+            events.append(("slow",))
+            return result
+        monkeypatch.setattr(module, name, slow)
+    token, clock = module._manager_token, module.time.monotonic_ns
+    def continuity(identity):
+        token(identity)
+        events.append(("token",))
+    def current(_):
+        events.append(("current",))
+    def fence():
+        events.append(("fence",))
+        return clock()
+    def transport(argv, **kwargs):
+        events.append((argv[4], argv[5] if len(argv) > 5 and not argv[5].startswith("--") else None))
+        return rig.runner(argv, **kwargs)
+    monkeypatch.setattr(module, "_manager_token", continuity)
+    monkeypatch.setattr(module, "_current_candidate", current)
+    monkeypatch.setattr(module.time, "monotonic_ns", fence)
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    rig.backend.start_service("enrichment.nextcloud_text")
+    start = next(i for i, event in enumerate(events) if event[0] == "start")
+    last_slow = max(i for i, event in enumerate(events[:start]) if event == ("slow",))
+    final = events[last_slow + 1:start]
+    assert ("token",) in final and ("current",) in final
+    for key in ("enrichment.nextcloud_text", "enrichment.nextcloud_documents", "enrichment.file_metadata",
+                "enrichment.immich_geo", "enrichment.immich_metadata", "enrichment.immich_ocr"):
+        assert ("show", f"pdi-scoped-pipeline@{key}.service") in final
+        timer = module._timer_units()[key]
+        assert ("show", timer) in final
+        assert ("is-enabled", timer) in final and ("is-active", timer) in final
+    assert final[-2:] == [("show", "pdi-scoped-pipeline@enrichment.nextcloud_text.service"), ("fence",)]
+    assert len(rig.runner.mutations()) == 1
+
+
+@pytest.mark.parametrize("prior", (None, "bad", "ABCDEF0123456789ABCDEF0123456789", " 11111111111111111111111111111111"))
+def test_b3_malformed_prior_identity_rejected_before_mutation(rig, prior):
+    rig.runner.services["enrichment.nextcloud_text"]["InvocationID"] = prior
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+def test_b2_authorized_slice_activation_is_not_a_post_start_authority_drift(rig, monkeypatch):
+    # Semantic fake models the actual v255 slice start side effect, rather than
+    # claiming that all default activity remains byte-identical across start.
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if argv[4] == "start":
+            rig.runner.defaults[r"system-pdi\x2dscoped\x2dpipeline.slice"].update(ActiveState="active", SubState="active")
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    assert rig.backend.start_service("enrichment.nextcloud_text").outcome is module._Outcome.SUCCESS
+    assert len(rig.runner.mutations()) == 1
+
+
+def test_b2_activity_is_still_sealed_before_start_even_when_slice_transition_is_authorized(rig, monkeypatch):
+    original = module._closure_continuity
+    def changed(closure):
+        rig.runner.defaults[r"system-pdi\x2dscoped\x2dpipeline.slice"].update(ActiveState="active", SubState="active")
+        return original(closure)
+    monkeypatch.setattr(module, "_closure_continuity", changed)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
     assert not rig.runner.mutations()

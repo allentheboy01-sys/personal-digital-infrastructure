@@ -82,6 +82,28 @@ _SERVICE_PROPERTIES = (*_IDENTITY_PROPERTIES, "Names", "Following",
 )
 _TIMER_PROPERTIES = (*_IDENTITY_PROPERTIES, "ActiveState", "SubState", "Unit", "Job")
 _MANAGER_PROPERTIES = ("Version", "Virtualization", "SystemState", "UnitPath")
+# One explicit v255 representation policy: upstream 255, or Ubuntu Noble's
+# 255.4-1ubuntu8[.N] package grammar. No free text, other major, or distro suffix.
+_VERSION_PATTERN = r"(?:255|255\.4-1ubuntu8(?:\.[1-9][0-9]*)?)"
+# Read authority is finite and is NOT an execution API for these units. Unknown
+# host boot/mount/service dependencies require a separate authority review;
+# being root-owned, already active or named systemd-* does not grant authority.
+_DEFAULT_START_UNITS = frozenset({
+    "sysinit.target", "local-fs.target", "swap.target", _DEFAULT_SLICE,
+    "system.slice", "-.slice", "tmp.mount", "-.mount", "opt.mount",
+    "opt-pdi.mount", "opt-pdi-current.mount", "var.mount", "var-tmp.mount",
+})
+_DEFAULT_STOP_UNITS = frozenset({"shutdown.target", "umount.target", "emergency.target", "emergency.service"})
+_DEFAULT_UNITS = _DEFAULT_START_UNITS | _DEFAULT_STOP_UNITS
+_DEFAULT_PROPERTIES = (*_IDENTITY_PROPERTIES, "Names", "Following",
+    *_GRAPH_PROPERTIES, *_ORDERING_PROPERTIES, "ActiveState", "SubState", "Job",
+    "FailureAction", "SuccessAction", "StartLimitAction", "JobTimeoutAction", "StopWhenUnneeded")
+_MAX_CLOSURE_NODES, _MAX_CLOSURE_EDGES, _MAX_CLOSURE_DEPTH = 32, 128, 16
+# v255 unit-dependency-atom.c / transaction.c: these are directed job edges,
+# not undirected dependencies. Requisite verifies activity; its deps are not
+# started. PartOf and StopPropagatedFrom do NOT propagate a stop from this unit.
+_START_RELATIONS = ("Wants", "Requires", "BindsTo", "Upholds")
+_STOP_RELATIONS = ("RequiredBy", "RequisiteOf", "BoundBy", "ConsistsOf", "PropagatesStopTo")
 _FULL_VM = frozenset({
     "kvm", "qemu", "vmware", "microsoft", "oracle", "xen", "bochs", "parallels",
     "bhyve", "uml", "amazon", "apple", "zvm",
@@ -128,6 +150,7 @@ class _Request(Enum):
     P3C_SHOW = "p3c_show"
     P3C_ENABLED = "p3c_enabled"
     P3C_ACTIVE = "p3c_active"
+    DEFAULT_SHOW = "default_show"
 
 
 def _timer_units():
@@ -164,6 +187,12 @@ def _command(request: _Request, key: str | None = None) -> tuple[tuple[str, ...]
     elif request in {_Request.TIMER_SHOW, _Request.TIMER_ENABLED, _Request.TIMER_ACTIVE}:
         unit = _timer_units()[_key(key)]
         properties = _TIMER_PROPERTIES
+    elif request is _Request.DEFAULT_SHOW:
+        if key not in _DEFAULT_UNITS:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        unit, properties = key, _DEFAULT_PROPERTIES
+        if unit.endswith(".service"):
+            properties = (*properties, "ExecStop", "ExecStopPost")
     else:
         if key not in _p3c_units():
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
@@ -226,10 +255,15 @@ class _ManagerIdentity:
     fingerprint: str
     boot_fingerprint: str
     host_class: str
+    continuity_token: str
 
 
-def _manager_os_facts():
-    """No caller-selected /proc, root, bus, or namespace; no filesystem writes."""
+def _manager_continuity_facts():
+    """Bounded /proc + inode + peer observations, no file-content hashing/query.
+
+    These facts only maintain continuity with a preceding FULL manager proof;
+    they are never independently sufficient to authorize a manager.
+    """
     try:
         if os.geteuid() != 0 or Path("/run/systemd/container").exists():
             raise ValueError
@@ -260,14 +294,32 @@ def _manager_os_facts():
         # Socket access bits permit connecting, not replacing the root-owned inode.
         # Bind the peer itself; a root-owned pathname alone is not sufficient.
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(30)
+            connection.settimeout(1)
             connection.connect(str(endpoint))
             peer = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
         if peer != (1, 0, 0):
             raise ValueError
-        return {"boot": boot, "namespaces": namespaces,
-                "executable_sha256": _digest(executable.read_bytes()), "peer": peer}
+        executable_info = executable.lstat()
+        return {"boot": boot, "namespaces": namespaces, "peer": peer,
+                "executable": str(executable),
+                "executable_identity": (executable_info.st_dev, executable_info.st_ino,
+                    executable_info.st_size, executable_info.st_mtime_ns, executable_info.st_ctime_ns),
+                "socket_identity": (info.st_dev, info.st_ino, info.st_ctime_ns)}
     except BaseException:
+        _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
+
+
+def _manager_os_facts():
+    """Full authority proof adds the trusted PID1 executable content hash."""
+    facts = _manager_continuity_facts()
+    try:
+        return {**facts, "executable_sha256": _digest(Path(facts["executable"]).read_bytes())}
+    except BaseException:
+        _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
+
+
+def _manager_token(identity: _ManagerIdentity) -> None:
+    if contract_fingerprint(_manager_continuity_facts()) != identity.continuity_token:
         _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
 
 
@@ -277,7 +329,7 @@ def _observe_manager() -> _ManagerIdentity:
                          WP8FailureCode.SYSTEMD_MANAGER_INVALID)
     after = _manager_os_facts()
     roots = values["UnitPath"].split()
-    if (before != after or not re.fullmatch(r"255(?:[.\s~+-].*)?", values["Version"]) or
+    if (before != after or not re.fullmatch(_VERSION_PATTERN, values["Version"]) or
             not roots or len(roots) != len(set(roots)) or
             not set(roots) <= set(_UNIT_LOAD_ROOTS) or "/etc/systemd/system" not in roots or
             values["SystemState"] not in {"running", "degraded"} or
@@ -287,7 +339,8 @@ def _observe_manager() -> _ManagerIdentity:
                             "version": values["Version"], "virtualization": values["Virtualization"],
                             "unit_path": roots}),
                             _digest(before["boot"].encode()),
-                            "FULL_VM" if values["Virtualization"] else "BARE_METAL")
+                            "FULL_VM" if values["Virtualization"] else "BARE_METAL",
+                            contract_fingerprint({k: v for k, v in before.items() if k != "executable_sha256"}))
 
 
 @dataclass(frozen=True)
@@ -565,6 +618,198 @@ def _check_service(values, key: str, assets: _Assets) -> str:
                                  "template_sha256": contract_fingerprint(assets.template), "graph": graph})
 
 
+class _JobAuthority(str, Enum):
+    START = "START"
+    STOP = "STOP"
+    VERIFY = "VERIFY"
+
+
+def _default_show(unit: str):
+    names = (*_DEFAULT_PROPERTIES, "ExecStop", "ExecStopPost") if unit.endswith(".service") else _DEFAULT_PROPERTIES
+    return _properties(_systemctl(_Request.DEFAULT_SHOW, unit), names)
+
+
+def _default_fragment(values) -> str:
+    unit, fragment = values["Id"], values["FragmentPath"]
+    if not fragment:
+        if unit not in {_DEFAULT_SLICE, "system.slice", "-.slice", "-.mount"}:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        return "IMPLICIT_V255_UNIT"
+    expected = {str(Path(root) / unit) for root in _UNIT_LOAD_ROOTS}
+    if fragment not in expected or not _trusted(Path(fragment), kind="file"):
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    return _digest(Path(fragment).read_bytes())
+
+
+def _default_dependency_directories(unit: str, values) -> None:
+    """Reconcile exact default-unit links with the loaded, reviewed graph.
+
+    Unlike Gate C's PDI template, packaged defaults can legitimately have links.
+    Each link must be root-controlled, resolve to the same exact authorized unit
+    under a fixed load root, and be represented in the current loaded relation.
+    No recursive filesystem crawler or arbitrary unit query is introduced.
+    """
+    if unit not in _DEFAULT_UNITS:
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    count = 0
+    for root in _UNIT_LOAD_ROOTS:
+        for suffix, relation in (("wants", "Wants"), ("requires", "Requires")):
+            path = Path(root) / f"{unit}.{suffix}"
+            existing = Path("/")
+            for part in path.parts[1:]:
+                existing /= part
+                try:
+                    existing.lstat()
+                except FileNotFoundError:
+                    break
+                if not _trusted(existing, kind="directory"):
+                    _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+            else:
+                for entry in path.iterdir():
+                    count += 1
+                    if count > _MAX_CLOSURE_EDGES or entry.name not in _DEFAULT_START_UNITS:
+                        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+                    info = entry.lstat()
+                    linked = Path(os.readlink(entry))
+                    linked = linked if linked.is_absolute() else entry.parent / linked
+                    # Validate the literal target chain BEFORE resolution, so a
+                    # root-owned link cannot launder a user-controlled alias.
+                    if not _trusted(linked, kind="file"):
+                        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+                    target = linked.resolve(strict=True)
+                    if (not stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_gid != 0 or
+                            entry.name not in _unit_names(values[relation]) or
+                            str(target) not in {str(Path(r) / entry.name) for r in _UNIT_LOAD_ROOTS} or
+                            not _trusted(target, kind="file")):
+                        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+
+
+def _default_authority(values, unit: str, job: _JobAuthority) -> dict[str, frozenset[str]]:
+    # Name + loaded identity + exact relation direction, never name/root owner
+    # alone. Required base systems are observation-only healthy prerequisites;
+    # this backend does not authorize starting a new OS service or mount.
+    permitted = _DEFAULT_STOP_UNITS if job is _JobAuthority.STOP else _DEFAULT_START_UNITS
+    if (unit not in permitted or values["Id"] != unit or _unit_names(values["Names"]) != {unit} or
+            values["Following"] or values["LoadState"] != "loaded" or values["Transient"] != "no" or
+            values["NeedDaemonReload"] != "no" or values["DropInPaths"] or values["Job"] != "0" or
+            values["StopWhenUnneeded"] != "no" or any(values[name] != "none" for name in
+                ("FailureAction", "SuccessAction", "StartLimitAction", "JobTimeoutAction"))):
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    if job is _JobAuthority.STOP:
+        if values["ActiveState"] != "inactive" or values["SubState"] != "dead":
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        if unit.endswith(".service") and (values["ExecStop"] or values["ExecStopPost"]):
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    elif unit == _DEFAULT_SLICE and job is _JobAuthority.START:
+        if (values["ActiveState"], values["SubState"]) not in {("inactive", "dead"), ("active", "active")}:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    elif values["ActiveState"] != "active" or values["SubState"] != ("mounted" if unit.endswith(".mount") else "active"):
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    graph = {name: _unit_names(values[name]) for name in _GRAPH_PROPERTIES if name != "RequiresMountsFor"}
+    for name in _ORDERING_PROPERTIES:
+        _unit_names(values[name])  # validate representation; do NOT pull jobs in
+    paths = values["RequiresMountsFor"].split()
+    if len(paths) != len(set(paths)) or not set(paths) <= {
+            "/", "/tmp", "/opt", "/opt/pdi", "/opt/pdi/current", "/var", "/var/tmp"}:
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    # No execution handlers, independent triggers, namespace sharing, or reload
+    # side channel is granted for a default prerequisite, in ANY job direction.
+    if any(graph[name] for name in ("OnFailure", "OnSuccess", "Triggers", "JoinsNamespaceOf", "PropagatesReloadTo")):
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    if job is _JobAuthority.START and values["ActiveState"] == "inactive":
+        # Only our per-template slice may newly activate. Failure of that start
+        # must not propagate to a foreign dependent (especially a P3C writer).
+        # The six canonical dependents are independently proved inactive/Job=0
+        # by the complete final bundle; no other consumer is authorized here.
+        if any(not graph[name] <= set(_SERVICE_UNITS.values()) for name in
+               ("RequiredBy", "RequisiteOf", "BoundBy", "ConsistsOf")):
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    return graph
+
+
+def _job_edges(graph, job: _JobAuthority):
+    if job is _JobAuthority.START:
+        for name in _START_RELATIONS:
+            for unit in sorted(graph[name]):
+                yield name, unit, _JobAuthority.START
+        for name in ("Conflicts", "ConflictedBy"):
+            for unit in sorted(graph[name]):
+                yield name, unit, _JobAuthority.STOP
+        for unit in sorted(graph["Requisite"]):
+            yield "Requisite", unit, _JobAuthority.VERIFY
+    elif job is _JobAuthority.STOP:
+        for name in _STOP_RELATIONS:
+            for unit in sorted(graph[name]):
+                yield name, unit, _JobAuthority.STOP
+    # VERIFY_ACTIVE is an activity check, not START. Neither After/Before nor
+    # PartOf/StopPropagatedFrom is an outgoing job expansion in this direction.
+
+
+@dataclass(frozen=True)
+class _StartClosure:
+    fingerprint: str
+    # Private bounded current-state seals, not runtime/DB proof or persistence.
+    observations: tuple[tuple[str, _JobAuthority, str], ...]
+
+
+def _start_closure(key: str, source, assets: _Assets) -> _StartClosure:
+    root = _SERVICE_UNITS[_key(key)]
+    stack = [(root, _JobAuthority.START, 0)]
+    visited, observations, authorities, fragments, edges = set(), [], [], [], []
+    while stack:
+        unit, job, depth = stack.pop()
+        if (unit, job) in visited:
+            continue
+        if depth > _MAX_CLOSURE_DEPTH or len(visited) >= _MAX_CLOSURE_NODES:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        visited.add((unit, job))
+        if unit == root and job is _JobAuthority.START:
+            _check_service(source, key, assets)
+            graph = {name: _unit_names(source[name]) for name in _GRAPH_PROPERTIES if name != "RequiresMountsFor"}
+        else:
+            permitted = _DEFAULT_STOP_UNITS if job is _JobAuthority.STOP else _DEFAULT_START_UNITS
+            if unit not in permitted:
+                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+            values = _default_show(unit)
+            graph = _default_authority(values, unit, job)
+            _default_dependency_directories(unit, values)
+            fragments.append((unit, _default_fragment(values)))
+            observations.append((unit, job, contract_fingerprint(values)))
+            # Activity is independently checked and sealed in the final bundle,
+            # not stable authority. The reviewed per-template slice can legally
+            # become active due to the one authorized start. Keep that expected
+            # change distinct from a changed fragment/graph/action authority.
+            authorities.append((unit, job, contract_fingerprint({k: v for k, v in values.items()
+                if k not in {"ActiveState", "SubState", "Job"}})))
+        successors = tuple(_job_edges(graph, job))
+        if len(edges) + len(successors) > _MAX_CLOSURE_EDGES:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        for relation, target, target_job in successors:
+            edges.append((unit, job.value, relation, target, target_job.value))
+        stack.extend((target, target_job, depth + 1) for _, target, target_job in reversed(successors))
+    return _StartClosure(contract_fingerprint({"root": root, "edges": sorted(edges),
+        "authorities": sorted(authorities), "fragments": sorted(fragments)}), tuple(observations))
+
+
+def _closure_continuity(closure: _StartClosure) -> None:
+    # Only bounded immediate loaded reads. No directory scan, file hash, graph
+    # traversal or new target is introduced after the last full manager proof.
+    for unit, job, fingerprint in closure.observations:
+        values = _default_show(unit)
+        _default_authority(values, unit, job)
+        if contract_fingerprint(values) != fingerprint:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+
+
+def _invocation_id(value, *, prior: bool = False) -> str | None:
+    # An absent prior invocation may be empty/zero; a new invocation never may.
+    if prior and isinstance(value, str) and value in {"", "0" * 32}:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value) or value == "0" * 32:
+        _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
+    return value
+
+
 def _current_candidate(evidence: WP8PhaseAEvidenceV1) -> None:
     """Bounded final readlink/path check; full runtime rehash belongs before fence."""
     from .p3d_pre_rehearsal_evidence import _current_target
@@ -754,9 +999,9 @@ class WP8ProductionSystemdBackend:
         _read_assets(self._evidence)
         return self._observe_timers(allow_stale=allow_stale)
 
-    def _observe_timers(self, *, allow_stale: bool = False) -> _TimerState:
+    def _observe_timers(self, *, allow_stale: bool = False, manager: _ManagerIdentity | None = None) -> _TimerState:
         """Immediate loaded-state reads; no asset traversal/profile hashing."""
-        self.manager_identity()
+        self.manager_identity() if manager is None else _manager_token(manager)
         facts = []
         for key in WP8_CANONICAL_PIPELINE_KEYS:
             values = _properties(_systemctl(_Request.TIMER_SHOW, key), _TIMER_PROPERTIES)
@@ -768,7 +1013,7 @@ class WP8ProductionSystemdBackend:
                     values["Job"] != "0" or values["Unit"] != _SERVICE_UNITS[key]):
                 _fail(WP8FailureCode.PREREQUISITE_DRIFT)
             facts.append({"pipeline": key, "enabled": "disabled", "active": "inactive"})
-        self.manager_identity()
+        self.manager_identity() if manager is None else _manager_token(manager)
         return _TimerState("DISABLED_INACTIVE", contract_fingerprint({"timers": facts}))
 
     def _show(self, key):
@@ -781,10 +1026,13 @@ class WP8ProductionSystemdBackend:
         runtime = _verify_candidate(self._evidence)
         assets = _read_assets(self._evidence)
         _dependency_directories(key)
-        fingerprint = _check_service(self._show(key), key, assets)
+        values = self._show(key)
+        fingerprint = _check_service(values, key, assets)
+        closure = _start_closure(key, values, assets)
         self.manager_identity()
         return contract_fingerprint({"service_contract": fingerprint, "runtime": runtime,
-                                     "context": self._evidence.phase_a_context_fingerprint})
+                                     "context": self._evidence.phase_a_context_fingerprint,
+                                     "closure": closure.fingerprint})
 
     @_boundary(WP8FailureCode.SERVICE_EXECUTION_FAILED)
     def start_service(self, pipeline_key: str) -> _ServiceResult:
@@ -796,29 +1044,44 @@ class WP8ProductionSystemdBackend:
             # Observe all installed timers before taking the contract baseline:
             # loading a timer can expose its benign inverse TriggeredBy edge.
             self.verify_timers_quiet()
-            contract = self.verify_service_contract(key)
+            # Preserve the precise contract-rejection boundary before the
+            # aggregate activity check, which otherwise reports CLEANUP_FAILED.
+            _check_service(self._show(key), key, _read_assets(self._evidence))
             self.verify_all_services_inactive()
             self.snapshot_p3c()
-            # Complete ALL slow authority work before the final observations.
-            # Rehashing after the fence would let an intervening invocation
-            # masquerade as the one requested by the command below.
-            if contract != self.verify_service_contract(key):
-                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+            contract = self.verify_service_contract(key)
+            # The LAST full manager proof is before both fresh static authority
+            # validation and the COMPLETE final mutable-prerequisite bundle.
+            # Drift during this proof cannot be detected only AFTER start.
+            if manager != self.manager_identity():
+                _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
+            runtime = _verify_candidate(self._evidence)
             assets = _read_assets(self._evidence)
             for other in WP8_CANONICAL_PIPELINE_KEYS:
                 _dependency_directories(other)
-            self._observe_timers()
+            source = self._show(key)
+            direct = _check_service(source, key, assets)
+            closure = _start_closure(key, source, assets)
+            if contract != contract_fingerprint({"service_contract": direct, "runtime": runtime,
+                    "context": self._evidence.phase_a_context_fingerprint, "closure": closure.fingerprint}):
+                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+            # From here: bounded current reads only, no full manager proof,
+            # release/profile hashes, directory scan, or recursive graph walk.
+            _manager_token(manager)
+            _closure_continuity(closure)
+            self._observe_timers(manager=manager)
             for other in WP8_CANONICAL_PIPELINE_KEYS:
                 values = self._show(other)
                 _check_service(values, other, assets)
                 _require_inactive(values)
             _current_candidate(self._evidence)
-            if manager != self.manager_identity():
-                _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
+            _manager_token(manager)
             before = self._show(key)
-            _check_service(before, key, assets)
+            if _check_service(before, key, assets) != direct:
+                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
             _require_inactive(before)
             prior_start = int(before["ExecMainStartTimestampMonotonic"])
+            prior_invocation = _invocation_id(before["InvocationID"], prior=True)
             # The last observation before fixed start. No candidate tree walk,
             # manifest/profile hashing or dependency scan may occur in this gap.
             boundary = time.monotonic_ns() // 1000
@@ -834,9 +1097,8 @@ class WP8ProductionSystemdBackend:
                     after["SubState"] != "dead" or after["Job"] != "0" or
                     not (prior_start < start and boundary <= start <= end <= finished)):
                 _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
-            invocation = after["InvocationID"]
-            if invocation and (not re.fullmatch(r"[0-9a-f]{32}", invocation) or
-                               invocation == before["InvocationID"]):
+            invocation = _invocation_id(after["InvocationID"])
+            if invocation == prior_invocation:
                 _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
             if manager != self.manager_identity() or contract != self.verify_service_contract(key):
                 _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
