@@ -30,6 +30,7 @@ KEYS = WP8_CANONICAL_PIPELINE_KEYS
 H = "1" * 64
 CANARY = "synthetic-password-token@provider.invalid"
 TEMPLATE = Path("deployment/systemd/pdi-scoped-pipeline@.service").read_bytes()
+DEPENDENCY_DIRECTORIES = module._dependency_directories
 PUBLIC = {"manager_identity", "daemon_reload", "snapshot_p3c", "verify_timers_quiet",
           "verify_service_contract", "start_service", "stop_all_services", "verify_all_services_inactive"}
 
@@ -37,7 +38,8 @@ PUBLIC = {"manager_identity", "daemon_reload", "snapshot_p3c", "verify_timers_qu
 def service_values(key):
     source = {name: value for section, name, value in module._template(TEMPLATE) if section == "Service"}
     values = {name: "" for name in module._SERVICE_PROPERTIES}
-    values.update(Id=module._SERVICE_UNITS[key], LoadState="loaded", FragmentPath=module._TEMPLATE,
+    values.update(Id=module._SERVICE_UNITS[key], Names=module._SERVICE_UNITS[key],
+        LoadState="loaded", FragmentPath=module._TEMPLATE,
         Transient="no", NeedDaemonReload="no", User="pdi", Group="pdi", Type="oneshot",
         WorkingDirectory=source["WorkingDirectory"],
         EnvironmentFiles=f"/etc/pdi/scoped/units/{key}.env (ignore_errors=no)",
@@ -47,6 +49,11 @@ def service_values(key):
         ReadWritePaths="/run/lock", TimeoutStartUSec="infinity", TimeoutStopUSec="1min",
         KillMode="control-group", StandardOutput="null", StandardError="null",
         RemainAfterExit="no", Restart="no", FailureAction="none", SuccessAction="none",
+        StartLimitAction="none", JobTimeoutAction="none", DefaultDependencies="yes", Slice=module._DEFAULT_SLICE,
+        Wants="tmp.mount", Requires="sysinit.target " + module._DEFAULT_SLICE, Conflicts="shutdown.target",
+        RequiresMountsFor="/opt/pdi/current /var/tmp", TriggeredBy=module._timer_units()[key],
+        After="sysinit.target basic.target tmp.mount systemd-tmpfiles-setup.service network-online.target " +
+              module._DEFAULT_SLICE, Before="shutdown.target", ConditionResult="yes", AssertResult="yes",
         ActiveState="inactive", SubState="dead", Job="0", Result="success", ExecMainCode="1",
         ExecMainStatus="0", ExecMainStartTimestampMonotonic="10", ExecMainExitTimestampMonotonic="20",
         InvocationID="1" * 32)
@@ -57,7 +64,7 @@ def timer_values(key):
     unit = module._timer_units()[key]
     return dict(Id=unit, LoadState="loaded", FragmentPath=f"/etc/systemd/system/{unit}",
         DropInPaths="", Transient="no", NeedDaemonReload="no", ActiveState="inactive",
-        SubState="dead", Unit=module._SERVICE_UNITS[key])
+        SubState="dead", Unit=module._SERVICE_UNITS[key], Job="0")
 
 
 def show(values):
@@ -71,7 +78,8 @@ class FakeRunner:
         self.timers = {key: timer_values(key) for key in KEYS}
         self.enabled = {key: (1, "disabled\n") for key in KEYS}
         self.active = {key: (3, "inactive\n") for key in KEYS}
-        self.manager = {"Version": "255", "Virtualization": "kvm", "SystemState": "running"}
+        self.manager = {"Version": "255", "Virtualization": "kvm", "SystemState": "running",
+                        "UnitPath": " ".join(module._UNIT_LOAD_ROOTS)}
         self.failures = {}
         self.after_start = {}
         self.fresh = True
@@ -155,6 +163,8 @@ def rig(monkeypatch):
     assets = module._Assets(H, module._template(TEMPLATE))
     monkeypatch.setattr(module, "_read_assets", lambda _: assets)
     monkeypatch.setattr(module, "_verify_candidate", lambda _: H)
+    monkeypatch.setattr(module, "_current_candidate", lambda _: None)
+    monkeypatch.setattr(module, "_dependency_directories", lambda _: None)
     # Run the actual frozen P3C algorithm over the same injected transport.
     frozen = ProductionReadOnlySystemdStateProvider(runner=module._p3c_read_adapter).snapshot(post_install=True)
     evidence = phase_a()
@@ -523,8 +533,14 @@ def test_cleanup_success_and_retry_facts(rig):
     assert proof.stop_attempted_pipeline_keys == KEYS
 
 
-def test_cleanup_independent_query_error_is_not_inactive(rig):
-    rig.runner.failures[("show", module._SERVICE_UNITS[KEYS[2]])] = 1
+def test_cleanup_independent_query_error_is_not_inactive(rig, monkeypatch):
+    # The failure is deliberately in the independent FINAL observation, not
+    # the newly required pre-stop authority query (tested separately below).
+    def transport(argv, **kwargs):
+        if len([call for call in rig.runner.mutations() if call[4] == "stop"]) == 6:
+            rig.runner.failures[("show", module._SERVICE_UNITS[KEYS[2]])] = 1
+        return rig.runner(argv, **kwargs)
+    monkeypatch.setattr(module.subprocess, "run", transport)
     result = rig.backend.stop_all_services()
     assert len(result.attempts) == 6 and result.stop_failure_count == 0
     assert result.service_state == "NOT_CONFIRMED" and result.attempts[2].final_state == "NOT_CONFIRMED"
@@ -819,3 +835,338 @@ def test_actual_candidate_verifier_current_and_git_binding(tmp_path, monkeypatch
     with pytest.raises(WP8ContractError) as caught:
         module._verify_candidate(a)
     assert caught.value.code is WP8FailureCode.CURRENT_DRIFT and CANARY not in str(caught.value)
+
+
+@pytest.mark.parametrize("relation", module._GRAPH_PROPERTIES)
+@pytest.mark.parametrize("action", ("verify_service_contract", "start_service", "stop_all_services"))
+def test_r3_extra_loaded_relationship_never_grants_mutation(rig, relation, action):
+    key = KEYS[2]
+    values = rig.runner.services[key]
+    extra = "/unreviewed" if relation == "RequiresMountsFor" else "synthetic-unreviewed.service"
+    values[relation] = (values[relation] + " " + extra).strip()
+    if action == "stop_all_services":
+        result = rig.backend.stop_all_services()
+        assert result.stop_failure_count == 1 and result.service_state == "NOT_CONFIRMED"
+        assert result.attempts[2].outcome is module._Outcome.EVIDENCE_REJECTED
+        assert result.attempts[2].final_state == "NOT_CONFIRMED"
+        assert [call[5] for call in rig.runner.mutations()] == [
+            unit for other, unit in module._SERVICE_UNITS.items() if other != key]
+        with pytest.raises(WP8ContractError):
+            WP8CleanupProofV1.build(rehearsal_operation_id=OPERATION, candidate_sha=rig.evidence.candidate_sha,
+                phase_a_context_fingerprint=rig.evidence.phase_a_context_fingerprint,
+                stop_failure_count=result.stop_failure_count, service_state=result.service_state,
+                timer_state=result.timer_state, p3c_state=result.p3c_state, result=WP8CleanupResult.PASS)
+    else:
+        with pytest.raises(WP8ContractError) as error:
+            getattr(rig.backend, action)(key)
+        assert error.value.code is WP8FailureCode.SERVICE_CONTRACT_INVALID
+        assert not rig.runner.mutations()
+    assert CANARY not in repr(rig.runner.services[key])
+
+
+@pytest.mark.parametrize("relation", ("PropagatesStopTo", "ConsistsOf", "RequiredBy", "RequisiteOf", "BoundBy"))
+@pytest.mark.parametrize("target", (*module._p3c_units(), module._timer_units()[KEYS[0]], "synthetic-other.service"))
+def test_r1_indirect_p3c_timer_stop_propagation_is_not_attempted(rig, relation, target):
+    key = KEYS[0]
+    rig.runner.services[key].update({relation: target, "ActiveState": "active", "SubState": "running"})
+    result = rig.backend.stop_all_services()
+    assert result.stop_failure_count == 1 and result.attempts[0].final_state == "NOT_CONFIRMED"
+    assert [call[5] for call in rig.runner.mutations()] == list(module._SERVICE_UNITS.values())[1:]
+    assert all(call[4] == "stop" and call[5] in module._SERVICE_UNITS.values() for call in rig.runner.mutations())
+    assert not any(call[5] == module._SERVICE_UNITS[key] for call in rig.runner.mutations())
+    assert not any(call[5] == target for call in rig.runner.mutations())
+
+
+def test_r1_rechecks_each_target_instead_of_one_batch_authority(rig, monkeypatch):
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if argv[4:6] == ("stop", module._SERVICE_UNITS[KEYS[0]]):
+            rig.runner.services[KEYS[3]]["PropagatesStopTo"] = module._p3c_units()[0]
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    result = rig.backend.stop_all_services()
+    assert result.stop_failure_count == 1 and result.attempts[3].final_state == "NOT_CONFIRMED"
+    assert [call[5] for call in rig.runner.mutations()] == [
+        unit for key, unit in module._SERVICE_UNITS.items() if key != KEYS[3]]
+
+
+def test_r1_every_stop_is_preceded_by_its_own_current_authority(rig, monkeypatch):
+    events = []
+    def assets(_):
+        events.append("assets")
+        return rig.assets
+    monkeypatch.setattr(module, "_read_assets", assets)
+    monkeypatch.setattr(module, "_dependency_directories", lambda key: events.append(("directories", key)))
+    def transport(argv, **kwargs):
+        if argv[4] == "show" and argv[5] in module._SERVICE_UNITS.values():
+            events.append(("show", argv[5]))
+        elif argv[4] == "stop":
+            events.append(("stop", argv[5]))
+        return rig.runner(argv, **kwargs)
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    result = rig.backend.stop_all_services()
+    assert result.stop_failure_count == 0
+    previous = 0
+    for key in KEYS:
+        index = events.index(("stop", module._SERVICE_UNITS[key]))
+        assert "assets" in events[previous:index]
+        assert ("directories", key) in events[previous:index]
+        assert events[index - 1] == ("show", module._SERVICE_UNITS[key])
+        previous = index + 1
+
+
+@pytest.mark.parametrize("kind", ("asset_rejected", "show_failure", "manager_drift"))
+def test_r1_authority_failure_is_not_a_stop_failure_after_mutation(rig, monkeypatch, kind):
+    if kind == "asset_rejected":
+        monkeypatch.setattr(module, "_read_assets", lambda _: module._fail(WP8FailureCode.SERVICE_CONTRACT_INVALID))
+        unsafe = set(KEYS)
+    elif kind == "show_failure":
+        rig.runner.failures[("show", module._SERVICE_UNITS[KEYS[0]])] = 1
+        unsafe = {KEYS[0]}
+    else:
+        def assets(_):
+            rig.facts["boot"] = "21111111-2222-4333-8444-555555555555"
+            return rig.assets
+        monkeypatch.setattr(module, "_read_assets", assets)
+        unsafe = set(KEYS)
+    result = rig.backend.stop_all_services()
+    assert result.stop_failure_count == len(unsafe) and result.service_state == "NOT_CONFIRMED"
+    assert not any(call[5] == module._SERVICE_UNITS[key] for call in rig.runner.mutations() for key in unsafe)
+    assert all(item.outcome is module._Outcome.EVIDENCE_REJECTED for item in result.attempts
+               if item.pipeline_key in unsafe)
+
+
+def test_r1_interrupted_stop_continues_without_claiming_clean_success(rig):
+    rig.runner.failures[("stop", module._SERVICE_UNITS[KEYS[0]])] = KeyboardInterrupt(CANARY)
+    result = rig.backend.stop_all_services()
+    assert len(rig.runner.mutations()) == 6 and result.stop_failure_count == 1
+    assert CANARY not in repr(result)
+
+
+@pytest.mark.parametrize("timeline", ((1000, 1100, 1200, 1500, 2000), (20000, 24000, 28000, 32000, 40000)))
+@pytest.mark.parametrize("fresh", (False, True))
+def test_r2_final_fence_not_early_validation_fence(rig, monkeypatch, timeline, fresh):
+    early, intervening_start, intervening_end, command_time, finish = timeline
+    clock, verifications, events = [early], [0], []
+    rig.runner.fresh = False
+    def runtime(_):
+        verifications[0] += 1
+        events.append("slow_runtime")
+        if verifications[0] == 2:
+            rig.runner.services[KEYS[0]].update(ExecMainStartTimestampMonotonic=str(intervening_start),
+                ExecMainExitTimestampMonotonic=str(intervening_end), InvocationID="2" * 32)
+            clock[0] = command_time
+        return H
+    def monotonic():
+        events.append(("fence", clock[0]))
+        return clock[0] * 1000
+    def assets(_):
+        events.append("slow_assets")
+        return rig.assets
+    def directories(_):
+        events.append("directory_scan")
+    def transport(argv, **kwargs):
+        if argv[4] == "start":
+            events.append(("start", clock[0]))
+            if fresh:
+                rig.runner.after_start = dict(ExecMainStartTimestampMonotonic=str(command_time + 1),
+                    ExecMainExitTimestampMonotonic=str(command_time + 2), InvocationID="3" * 32)
+        result = rig.runner(argv, **kwargs)
+        if argv[4] == "start":
+            clock[0] = finish
+        return result
+    monkeypatch.setattr(module, "_verify_candidate", runtime)
+    monkeypatch.setattr(module, "_read_assets", assets)
+    monkeypatch.setattr(module, "_dependency_directories", directories)
+    monkeypatch.setattr(module.time, "monotonic_ns", monotonic)
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    if fresh:
+        assert rig.backend.start_service(KEYS[0]).outcome is module._Outcome.SUCCESS
+    else:
+        with pytest.raises(WP8ContractError) as error:
+            rig.backend.start_service(KEYS[0])
+        assert error.value.code is WP8FailureCode.SERVICE_EXECUTION_FAILED
+    index = events.index(("start", command_time))
+    assert events[index - 1] == ("fence", command_time)
+    assert len(rig.runner.mutations()) == 1  # no retry of a rejected/no-op request
+
+
+@pytest.mark.parametrize("drift", ("overlap", "target_job", "other_job", "timer", "timer_job", "manager"))
+def test_r2_drift_during_last_slow_validation_refused_before_start(rig, monkeypatch, drift):
+    verifications = 0
+    def runtime(_):
+        nonlocal verifications
+        verifications += 1
+        if verifications == 2:
+            if drift == "overlap":
+                rig.runner.services[KEYS[3]].update(ActiveState="active", SubState="running")
+            elif drift in {"target_job", "other_job"}:
+                rig.runner.services[KEYS[0 if drift == "target_job" else 3]]["Job"] = "123"
+            elif drift == "timer":
+                rig.runner.enabled[KEYS[3]] = (0, "enabled\n")
+            elif drift == "timer_job":
+                rig.runner.timers[KEYS[3]]["Job"] = "123"
+            else:
+                rig.facts["boot"] = "21111111-2222-4333-8444-555555555555"
+        return H
+    monkeypatch.setattr(module, "_verify_candidate", runtime)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service(KEYS[0])
+    assert verifications == 2 and not rig.runner.mutations()
+
+
+def test_r2_final_current_drift_refused_before_start(rig, monkeypatch):
+    monkeypatch.setattr(module, "_current_candidate", lambda _: module._fail(WP8FailureCode.CURRENT_DRIFT))
+    with pytest.raises(WP8ContractError) as error:
+        rig.backend.start_service(KEYS[0])
+    assert error.value.code is WP8FailureCode.CURRENT_DRIFT and not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("result_property", ("ConditionResult", "AssertResult"))
+@pytest.mark.parametrize("value", ("no", "", "unknown"))
+def test_r2_condition_assert_skip_even_with_fresh_success_is_failure(rig, result_property, value):
+    rig.runner.after_start = {result_property: value}
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service(KEYS[0])
+    assert len(rig.runner.mutations()) == 1
+
+
+def test_r2_manager_drift_after_start_never_retries_or_accepts_fresh_result(rig, monkeypatch):
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if argv[4] == "start":
+            rig.facts["boot"] = "21111111-2222-4333-8444-555555555555"
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service(KEYS[0])
+    assert len(rig.runner.mutations()) == 1
+
+
+def test_r3_actual_systemctl_requested_projection_contains_all_closure_properties(rig, monkeypatch):
+    rig.runner.services[KEYS[0]]["Wants"] += " synthetic-extra.service"
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if argv[4] == "show" and argv[5] == module._SERVICE_UNITS[KEYS[0]]:
+            requested = next(arg for arg in argv if arg.startswith("--property=")).split("=", 1)[1].split(",")
+            assert set(module._GRAPH_PROPERTIES) | set(module._ORDERING_PROPERTIES) <= set(requested)
+            result.stdout = show({name: rig.runner.services[KEYS[0]][name] for name in requested})
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    with pytest.raises(WP8ContractError):
+        rig.backend.verify_service_contract(KEYS[0])
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("change", ("default_requires_missing", "tmp_want_missing", "shutdown_missing",
+    "mount_path_extra", "wrong_slice", "defaults_disabled", "alias", "following"))
+def test_r3_loaded_default_authority_does_not_accept_arbitrary_approximations(rig, change):
+    values = rig.runner.services[KEYS[0]]
+    changes = dict(default_requires_missing={"Requires": ""}, tmp_want_missing={"Wants": ""},
+        shutdown_missing={"Conflicts": ""}, mount_path_extra={"RequiresMountsFor": "/opt/pdi/current /var/tmp /home"},
+        wrong_slice={"Slice": "foreign.slice"}, defaults_disabled={"DefaultDependencies": "no"},
+        alias={"Names": values["Names"] + " foreign.service"}, following={"Following": "foreign.service"})
+    values.update(changes[change])
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service(KEYS[0])
+    assert not rig.runner.mutations()
+
+
+def test_r3_frozen_v255_defaults_and_ordering_only_edges_are_not_workload_authority(rig):
+    for values in rig.runner.services.values():
+        values["Requires"] += " opt.mount var.mount var-tmp.mount"
+        values["After"] += " opt.mount var.mount var-tmp.mount synthetic-order-only.service"
+        values["Before"] += " synthetic-order-only.target"
+    assert rig.backend.start_service(KEYS[0]).outcome is module._Outcome.SUCCESS
+    assert rig.backend.stop_all_services().stop_failure_count == 0
+    assert all(call[5] in module._SERVICE_UNITS.values() for call in rig.runner.mutations())
+
+
+@pytest.mark.parametrize("value", ("/tmp/unreviewed-units", "", "/etc/systemd/system /etc/systemd/system"))
+def test_r3_unknown_manager_load_search_path_cannot_escape_directory_authority(rig, value):
+    rig.runner.manager["UnitPath"] = value
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service(KEYS[0])
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("version", ("254", "256", "255malformed"))
+def test_r3_dependency_semantics_cannot_silently_use_unqualified_version(rig, version):
+    rig.runner.manager["Version"] = version
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service(KEYS[0])
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("unit", (Path(module._TEMPLATE).name, module._SERVICE_UNITS[KEYS[0]]))
+@pytest.mark.parametrize("suffix", ("wants", "requires"))
+@pytest.mark.parametrize("kind", ("absent", "empty", "entry", "symlink", "file", "owner", "gid", "group", "parent", "unreadable"))
+def test_r3_dependency_directory_authority_is_bounded_trusted_and_non_mutating(monkeypatch, unit, suffix, kind):
+    # Test-only virtual metadata; no production path is read or changed. The
+    # actual production helper and frozen trusted_path algorithm execute here.
+    root = Path("/etc/systemd/system")
+    leaf = root / f"{unit}.{suffix}"
+    metadata = {path: SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+                for path in (root, *root.parents)}
+    if kind != "absent":
+        metadata[leaf] = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0, st_gid=0)
+    if kind == "symlink":
+        metadata[leaf].st_mode = stat.S_IFLNK | 0o777
+    elif kind == "file":
+        metadata[leaf].st_mode = stat.S_IFREG | 0o644
+    elif kind == "owner":
+        metadata[leaf].st_uid = 1000
+    elif kind == "gid":
+        metadata[leaf].st_gid = 1000
+    elif kind == "group":
+        metadata[leaf].st_mode = stat.S_IFDIR | 0o775
+    elif kind == "parent":
+        metadata[root].st_uid = 1000
+    def lstat(path):
+        if path == leaf and kind == "unreadable":
+            raise PermissionError(CANARY)
+        if path not in metadata:
+            raise FileNotFoundError
+        return metadata[path]
+    def iterdir(path):
+        assert path == leaf
+        # Even a link to an allowed default is unreviewed filesystem authority.
+        return iter((leaf / "sysinit.target",) if kind == "entry" else ())
+    monkeypatch.setattr(module, "_UNIT_LOAD_ROOTS", (str(root),))
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    if kind in {"absent", "empty"}:
+        DEPENDENCY_DIRECTORIES(KEYS[0])
+    else:
+        with pytest.raises(WP8ContractError) as error:
+            DEPENDENCY_DIRECTORIES(KEYS[0])
+        assert error.value.code is WP8FailureCode.SERVICE_CONTRACT_INVALID
+        assert CANARY not in str(error.value)
+
+
+@pytest.mark.parametrize("action", ("verify_service_contract", "start_service", "stop_all_services"))
+def test_r3_dependency_directory_rejection_is_wired_into_mutation_guard(rig, monkeypatch, action):
+    def directories(key):
+        if key == KEYS[0]:
+            module._fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    monkeypatch.setattr(module, "_dependency_directories", directories)
+    if action == "stop_all_services":
+        result = rig.backend.stop_all_services()
+        assert result.stop_failure_count == 1 and result.service_state == "NOT_CONFIRMED"
+        assert len(rig.runner.mutations()) == 5
+        assert not any(call[5] == module._SERVICE_UNITS[KEYS[0]] for call in rig.runner.mutations())
+        last_stop = max(index for index, (call, _) in enumerate(rig.runner.calls) if call[4] == "stop")
+        final_shows = {call[5] for call, _ in rig.runner.calls[last_stop + 1:] if call[4] == "show"}
+        assert set(module._SERVICE_UNITS.values()) <= final_shows
+    else:
+        with pytest.raises(WP8ContractError):
+            getattr(rig.backend, action)(KEYS[0])
+        assert not rig.runner.mutations()
+
+
+def test_r3_untrusted_dependency_never_appears_in_public_safe_error(rig):
+    rig.runner.services[KEYS[0]]["Wants"] += " " + CANARY + ".service"
+    with pytest.raises(WP8ContractError) as error:
+        rig.backend.start_service(KEYS[0])
+    assert CANARY not in str(error.value) and error.value.__suppress_context__
+    assert not rig.runner.mutations()
