@@ -82,6 +82,13 @@ _SERVICE_PROPERTIES = (*_IDENTITY_PROPERTIES, "Names", "Following",
     "Job", "Result", "ExecMainCode", "ExecMainStatus", "ExecMainStartTimestampMonotonic",
     "ExecMainExitTimestampMonotonic", "InvocationID",
 )
+# Activity/freshness is proved separately at the immediate prerequisite gate.
+# Do not make a stable authority seal depend on an invocation's changing state.
+_SERVICE_RUNTIME_PROPERTIES = frozenset({
+    "ConditionResult", "AssertResult", "ActiveState", "SubState", "Job", "Result",
+    "ExecMainCode", "ExecMainStatus", "ExecMainStartTimestampMonotonic",
+    "ExecMainExitTimestampMonotonic", "InvocationID",
+})
 _TIMER_PROPERTIES = (*_IDENTITY_PROPERTIES, "ActiveState", "SubState", "Unit", "Job")
 _MANAGER_PROPERTIES = ("Version", "Virtualization", "SystemState", "UnitPath")
 # Package identity is authority, not a major-version compatibility heuristic.
@@ -416,9 +423,7 @@ def _observe_manager() -> _ManagerIdentity:
     after = _manager_os_facts()
     roots = values["UnitPath"].split()
     if (before != after or values["Version"] != _VERSION or
-            not roots or len(roots) != len(set(roots)) or
-            not set(roots) <= set(_UNIT_LOAD_ROOTS) or "/etc/systemd/system" not in roots or
-            roots != [root for root in _UNIT_LOAD_ROOTS if root in roots] or
+            tuple(roots) != _UNIT_LOAD_ROOTS or
             values["SystemState"] not in {"running", "degraded"} or
             values["Virtualization"] not in {"", *_FULL_VM}):
         _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
@@ -718,7 +723,41 @@ def _check_service(values, key: str, assets: _Assets) -> str:
         "private_tmp": values["PrivateTmp"], "private_tmp_ex": values["PrivateTmpEx"],
         "mount_paths": {name: sorted(values[name].split()) for name in _PATH_PROPERTIES},
         "typed_empty": {name: values[name] for name in (*_EXEC_EMPTY_PROPERTIES, *_UNIT_EMPTY_PROPERTIES)},
+        "loaded_authority": _service_authority_text(values),
         "no_job_representation": "EMPTY_V257"})
+
+
+def _service_authority_text(values):
+    authority = {name: values[name] for name in _SERVICE_PROPERTIES if name not in _SERVICE_RUNTIME_PROPERTIES}
+    # The ExecStart show structure also embeds per-invocation pid/timestamps/
+    # exit status. Preserve its validated executable/argv/ignore-errors contract
+    # without letting those volatile members alter the stable authority seal.
+    authority["ExecStart"] = _exec_argv(values["ExecStart"])
+    return authority
+
+
+def _collect_current_service_authority(key: str):
+    """Bounded two-pass observation, never old typed evidence + new text.
+
+    Rebind the loaded identity before accessing the sealed typed object. Re-read
+    all stable text AND all typed fields in this collection stage, rejecting
+    drift, and return only the newly collected typed proof. This is continuity,
+    not a claim of an atomic multi-interface systemd snapshot. No slow/static
+    validation or fallback is introduced after the final typed reads.
+    """
+    key = _key(key)
+    before = _properties(_systemctl(_Request.SERVICE_SHOW, key), _SERVICE_PROPERTIES)
+    _identity(before, key, allow_stale=True)
+    if _unit_names(before["Names"]) != {_SERVICE_UNITS[key]} or before["Following"]:
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    prior_typed = _typed_empty(_TypedAuthority.CANONICAL_SERVICE, key)
+    current = _properties(_systemctl(_Request.SERVICE_SHOW, key), _SERVICE_PROPERTIES)
+    if _service_authority_text(current) != _service_authority_text(before):
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    current_typed = _typed_empty(_TypedAuthority.CANONICAL_SERVICE, key)
+    if current_typed != prior_typed:
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    return {**current, **current_typed}
 
 
 class _JobAuthority(str, Enum):
@@ -736,11 +775,16 @@ def _default_show(unit: str):
                 values["FragmentPath"] != "/usr/lib/systemd/system/emergency.service" or
                 values["DropInPaths"] or values["NeedDaemonReload"] != "no"):
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-        typed = _typed_empty(_TypedAuthority.EMERGENCY_STOP)
+        prior_typed = _typed_empty(_TypedAuthority.EMERGENCY_STOP)
         after = _properties(_systemctl(_Request.DEFAULT_SHOW, unit), _DEFAULT_PROPERTIES)
         if after != values:
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-        values.update(typed)
+        # The current closure gate consumes a fresh stop-hook proof, not the
+        # earlier EMPTY result merged with a newer textual observation.
+        current_typed = _typed_empty(_TypedAuthority.EMERGENCY_STOP)
+        if current_typed != prior_typed:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        values = {**after, **current_typed}
     return values
 
 
@@ -1136,16 +1180,7 @@ class WP8ProductionSystemdBackend:
         return _TimerState("DISABLED_INACTIVE", contract_fingerprint({"timers": facts}))
 
     def _show(self, key):
-        key = _key(key)
-        values = _properties(_systemctl(_Request.SERVICE_SHOW, key), _SERVICE_PROPERTIES)
-        _identity(values, key, allow_stale=True)
-        if _unit_names(values["Names"]) != {_SERVICE_UNITS[key]} or values["Following"]:
-            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-        typed = _typed_empty(_TypedAuthority.CANONICAL_SERVICE, key)
-        after = _properties(_systemctl(_Request.SERVICE_SHOW, key), _SERVICE_PROPERTIES)
-        if any(after[name] != values[name] for name in (*_IDENTITY_PROPERTIES, "Names", "Following")):
-            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-        return {**after, **typed}
+        return _collect_current_service_authority(key)
 
     @_boundary(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     def verify_service_contract(self, pipeline_key: str) -> str:
@@ -1298,10 +1333,11 @@ class WP8ProductionSystemdBackend:
                     manager = self.manager_identity()
                     assets = _read_assets(self._evidence)
                     _dependency_directories(key)
-                    _check_service(self._show(key), key, assets)
+                    authority = _check_service(self._show(key), key, assets)
                     if manager != self.manager_identity():
                         _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
-                    _check_service(self._show(key), key, assets)
+                    if _check_service(self._show(key), key, assets) != authority:
+                        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
                     stop_requested = True
                     result = _systemctl(_Request.SERVICE_STOP, key)
                     outcome = _Outcome.SUCCESS if result.returncode == 0 else _Outcome.COMMAND_FAILED

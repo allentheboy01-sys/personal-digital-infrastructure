@@ -36,6 +36,14 @@ DEFAULT_DEPENDENCY_DIRECTORIES = module._default_dependency_directories
 DEFAULT_FRAGMENT = module._default_fragment
 PUBLIC = {"manager_identity", "daemon_reload", "snapshot_p3c", "verify_timers_quiet",
           "verify_service_contract", "start_service", "stop_all_services", "verify_all_services_inactive"}
+# Reviewed manager policy, independently enumerated rather than taken from the
+# backend allowlist. Missing members are NOT optional compatibility variants.
+REVIEWED_UNITPATH = (
+    "/etc/systemd/system.control", "/run/systemd/system.control", "/run/systemd/transient",
+    "/run/systemd/generator.early", "/etc/systemd/system", "/etc/systemd/system.attached",
+    "/run/systemd/system", "/run/systemd/system.attached", "/run/systemd/generator",
+    "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/run/systemd/generator.late",
+)
 
 
 def service_values(key):
@@ -133,7 +141,7 @@ class FakeRunner:
         self.enabled = {key: (1, "disabled\n") for key in KEYS}
         self.active = {key: (3, "inactive\n") for key in KEYS}
         self.manager = {"Version": "257.13-1~deb13u1", "Virtualization": "kvm", "SystemState": "running",
-                        "UnitPath": "/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system"}
+                        "UnitPath": " ".join(REVIEWED_UNITPATH)}
         self.failures = {}
         self.after_start = {}
         self.fresh = True
@@ -320,7 +328,7 @@ def test_no_arbitrary_verb_algebra(command_kind):
 def test_every_command_uses_fixed_transport(rig, monkeypatch, command_kind):
     for name, value in {"PATH": "/evil", "DATABASE__URL": CANARY, "NEXTCLOUD__PASSWORD": CANARY,
                         "IMMICH__API_KEY": CANARY, "SYSTEMD_BUS_ADDRESS": CANARY,
-                        "DBUS_SYSTEM_BUS_ADDRESS": CANARY}.items():
+                        "DBUS_SYSTEM_BUS_ADDRESS": CANARY, "SYSTEMD_UNIT_PATH": CANARY}.items():
         monkeypatch.setenv(name, value)
     key = (None if command_kind in {module._Request.MANAGER, module._Request.RELOAD} else
            "sysinit.target" if command_kind is module._Request.DEFAULT_SHOW else
@@ -1724,7 +1732,16 @@ def test_b1_complete_final_bundle_follows_every_slow_proof_and_fence_immediately
         timer = module._timer_units()[key]
         assert ("show", timer) in final
         assert ("is-enabled", timer) in final and ("is-active", timer) in final
-    assert final[-2:] == [("show", "pdi-scoped-pipeline@enrichment.nextcloud_text.service"), ("fence",)]
+    assert final[-4:] == [("show", "pdi-scoped-pipeline@enrichment.nextcloud_text.service"),
+                         ("get-property", "org.freedesktop.systemd1"),
+                         ("get-property", "org.freedesktop.systemd1"), ("fence",)]
+    calls = [argv for argv, _ in rig.runner.calls]
+    command = next(i for i, argv in enumerate(calls) if argv[4] == "start")
+    service, unit = calls[command - 2:command]
+    assert service[7:] == ("org.freedesktop.systemd1.Service", "ExecStartPre", "ExecStartPost",
+                           "ExecStop", "ExecStopPost", "ExecCondition")
+    assert unit[7:] == ("org.freedesktop.systemd1.Unit", "Conditions", "Asserts")
+    assert service[6] == unit[6] == "/org/freedesktop/systemd1/unit/pdi_2dscoped_2dpipeline_40enrichment_2enextcloud_5ftext_2eservice"
     assert len(rig.runner.mutations()) == 1
 
 
@@ -2065,11 +2082,16 @@ def test_v257_t1_unitpath_exact_order_and_membership(rig, roots):
     assert not rig.runner.mutations()
 
 
-def test_v257_t1_ordered_actual_unitpath_fingerprinted(rig):
-    original = rig.backend.manager_identity().fingerprint
-    rig.runner.manager["UnitPath"] = "/etc/systemd/system /run/systemd/system /usr/lib/systemd/system"
-    changed = module.WP8ProductionSystemdBackend(rig.evidence).manager_identity().fingerprint
-    assert original != changed
+def test_v257_t1_ordered_actual_unitpath_fingerprinted(rig, monkeypatch):
+    captured = []
+    original = module.contract_fingerprint
+    def capture(value):
+        if isinstance(value, dict) and "unit_path" in value:
+            captured.append(value["unit_path"])
+        return original(value)
+    monkeypatch.setattr(module, "contract_fingerprint", capture)
+    assert len(rig.backend.manager_identity().fingerprint) == 64
+    assert captured == [list(REVIEWED_UNITPATH)]
 
 
 @pytest.mark.parametrize("line", ('{"type":"a(sasbttttuii)","type":"a(sasbttttuii)","data":[]}',
@@ -2130,3 +2152,266 @@ def test_v257_typed_untrusted_transport_binary_refused(rig, monkeypatch):
         rig.backend.start_service("enrichment.nextcloud_text")
     assert not any(argv[0] == "/usr/bin/busctl" for argv, _ in rig.runner.calls)
     assert not rig.runner.mutations()
+
+
+# Final continuity attacks change LIVE authority AFTER the fake transport has
+# rendered an old valid response, reproducing the independent review's window.
+# Literal property names/signatures/paths are not taken from backend constants.
+def _nonempty_authority(name):
+    if name == "PrivateTmpEx":
+        return "disconnected"
+    signature = "a(sbbsi)" if name in {"Conditions", "Asserts"} else "a(sasbttttuii)"
+    return {"type": signature, "data": [["synthetic-unreviewed-authority"]]}
+
+
+@pytest.mark.parametrize("property", ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost",
+                                      "ExecCondition", "Conditions", "Asserts", "PrivateTmpEx"))
+def test_v257_continuity_start_rejects_drift_after_final_typed_response(rig, monkeypatch, property):
+    armed, injected = [], []
+    monkeypatch.setattr(module, "_current_candidate", lambda _: armed.append(True))
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if (armed and not injected and argv[0] == "/usr/bin/busctl" and
+                "enrichment_2enextcloud_5ftext" in argv[6] and
+                (property == "PrivateTmpEx" or property in argv[8:])):
+            rig.runner.services["enrichment.nextcloud_text"][property] = _nonempty_authority(property)
+            injected.append(property)
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    with pytest.raises(WP8ContractError) as error:
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert injected == [property]
+    assert not rig.runner.mutations(), "must reject BEFORE start, not in post-start verification"
+    assert CANARY not in str(error.value) and error.value.__suppress_context__
+
+
+@pytest.mark.parametrize("key", ("enrichment.nextcloud_text", "enrichment.nextcloud_documents",
+                                  "enrichment.file_metadata", "enrichment.immich_geo",
+                                  "enrichment.immich_metadata", "enrichment.immich_ocr"))
+@pytest.mark.parametrize("property", ("ExecStop", "ExecStopPost"))
+def test_v257_continuity_stop_rejects_drift_per_unit_after_final_typed_response(rig, monkeypatch, key, property):
+    shows, armed, injected = [], [], []
+    original = rig.backend._show
+    def observed(selected):
+        if selected == key:
+            shows.append(selected)
+            if len(shows) == 2:  # fresh per-unit observation after its full proof
+                armed.append(True)
+        return original(selected)
+    monkeypatch.setattr(rig.backend, "_show", observed)
+    # Use independent literal unit identity, not the production unit map.
+    object_label = "".join(c if c.isascii() and c.isalnum() else f"_{ord(c):02x}"
+                           for c in f"pdi-scoped-pipeline@{key}.service")
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if (armed and not injected and argv[0] == "/usr/bin/busctl" and
+                argv[6].endswith("/" + object_label) and property in argv[8:]):
+            rig.runner.services[key][property] = _nonempty_authority(property)
+            injected.append(property)
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    cleanup = rig.backend.stop_all_services()
+    assert injected == [property]
+    stops = rig.runner.mutations()
+    assert len(stops) == 5 and all(argv[4] == "stop" for argv in stops)
+    assert {argv[5] for argv in stops} == {f"pdi-scoped-pipeline@{other}.service" for other in KEYS if other != key}
+    assert cleanup.stop_failure_count == 1 and cleanup.service_state == "NOT_CONFIRMED"
+    unsafe = next(attempt for attempt in cleanup.attempts if attempt.pipeline_key == key)
+    assert unsafe.outcome is module._Outcome.EVIDENCE_REJECTED and unsafe.final_state == "NOT_CONFIRMED"
+    assert cleanup.timer_state == "DISABLED_INACTIVE" and cleanup.p3c_state == "UNCHANGED_HEALTHY"
+
+
+@pytest.mark.parametrize("property", ("ExecStop", "ExecStopPost"))
+def test_v257_continuity_emergency_drift_after_final_typed_response_blocks_start(rig, monkeypatch, property):
+    armed, injected = [], []
+    original = module._closure_continuity
+    def continuity(closure):
+        armed.append(True)
+        return original(closure)
+    monkeypatch.setattr(module, "_closure_continuity", continuity)
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if (armed and not injected and argv[0] == "/usr/bin/busctl" and
+                argv[6].endswith("/emergency_2eservice")):
+            rig.runner.defaults["emergency.service"][property] = _nonempty_authority(property)
+            injected.append(property)
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert injected == [property] and not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("stage,interface", (
+    ("start", "Service"), ("start", "Unit"), ("stop", "Service"), ("stop", "Unit"), ("emergency", "Service"),
+))
+@pytest.mark.parametrize("failure", ("timeout", "command", "malformed", "signature", "missing"))
+def test_v257_continuity_final_typed_recollection_failure_never_uses_old_proof(rig, monkeypatch, stage, interface, failure):
+    armed, reads, injected = [], [], []
+    if stage == "start":
+        monkeypatch.setattr(module, "_current_candidate", lambda _: armed.append(True))
+    elif stage == "emergency":
+        original = module._closure_continuity
+        def continuity(closure):
+            armed.append(True)
+            return original(closure)
+        monkeypatch.setattr(module, "_closure_continuity", continuity)
+    else:
+        original = rig.backend._show
+        shows = []
+        def observed(key):
+            if key == "enrichment.nextcloud_text":
+                shows.append(key)
+                if len(shows) == 2:
+                    armed.append(True)
+            return original(key)
+        monkeypatch.setattr(rig.backend, "_show", observed)
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        target = "emergency_2eservice" if stage == "emergency" else "enrichment_2enextcloud_5ftext_2eservice"
+        if (armed and argv[0] == "/usr/bin/busctl" and argv[6].endswith(target) and
+                argv[7] == "org.freedesktop.systemd1." + interface):
+            reads.append(True)
+            if len(reads) == 2:  # first valid typed read cannot substitute for this one
+                injected.append(failure)
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(argv, 30, output=CANARY, stderr=CANARY)
+                if failure == "command":
+                    result.returncode = 1
+                elif failure == "malformed":
+                    result.stdout = "not-json " + CANARY
+                elif failure == "signature":
+                    result.stdout = result.stdout.replace("a(sasbttttuii)", "s").replace("a(sbbsi)", "s")
+                elif failure == "missing":
+                    result.stdout = "\n".join(result.stdout.splitlines()[1:]) + "\n"
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    if stage == "stop":
+        cleanup = rig.backend.stop_all_services()
+        assert cleanup.stop_failure_count == 1
+        assert not any(argv[5] == "pdi-scoped-pipeline@enrichment.nextcloud_text.service" for argv in rig.runner.mutations())
+        assert len(rig.runner.mutations()) == 5
+    else:
+        with pytest.raises(WP8ContractError) as error:
+            rig.backend.start_service("enrichment.nextcloud_text")
+        assert not rig.runner.mutations()
+        assert CANARY not in str(error.value)
+    assert injected == [failure]
+
+
+@pytest.mark.parametrize("missing", REVIEWED_UNITPATH)
+def test_v257_continuity_each_reviewed_unitpath_root_is_required(rig, missing):
+    rig.runner.manager["UnitPath"] = " ".join(root for root in REVIEWED_UNITPATH if root != missing)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("roots", (
+    ("/etc/systemd/system",), (),
+    (*REVIEWED_UNITPATH, "/synthetic/unreviewed"),
+    (*REVIEWED_UNITPATH, "/etc/systemd/system"),
+    (REVIEWED_UNITPATH[1], REVIEWED_UNITPATH[0], *REVIEWED_UNITPATH[2:]),
+    (*REVIEWED_UNITPATH[:-1], "/run/systemd/generator.late/"),
+))
+def test_v257_continuity_unitpath_subset_extra_duplicate_reordered_malformed_refused(rig, roots):
+    rig.runner.manager["UnitPath"] = " ".join(roots)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert not rig.runner.mutations()
+
+
+@pytest.mark.parametrize("stage", ("start", "stop"))
+def test_v257_continuity_stable_text_drift_must_match_full_authority_seal(rig, monkeypatch, stage):
+    injected = []
+    if stage == "start":
+        def current(_):
+            # Valid ordering-only text is NOT an extra activation authority,
+            # but changing it must invalidate the earlier full authority seal.
+            rig.runner.services["enrichment.nextcloud_text"]["After"] += " synthetic-order-only.target"
+            injected.append(True)
+        monkeypatch.setattr(module, "_current_candidate", current)
+        with pytest.raises(WP8ContractError):
+            rig.backend.start_service("enrichment.nextcloud_text")
+        assert not rig.runner.mutations()
+    else:
+        original = rig.backend._show
+        shows = []
+        def observed(key):
+            if key == "enrichment.nextcloud_text":
+                shows.append(key)
+                if len(shows) == 2:
+                    rig.runner.services[key]["After"] += " synthetic-order-only.target"
+                    injected.append(True)
+            return original(key)
+        monkeypatch.setattr(rig.backend, "_show", observed)
+        cleanup = rig.backend.stop_all_services()
+        assert cleanup.stop_failure_count == 1
+        assert len(rig.runner.mutations()) == 5
+        assert not any(argv[5] == "pdi-scoped-pipeline@enrichment.nextcloud_text.service" for argv in rig.runner.mutations())
+    assert injected == [True]
+
+
+@pytest.mark.parametrize("property", ("PrivateTmpEx", "After", "RequiresMountsFor"))
+def test_v257_continuity_no_stable_text_drift_hidden_inside_collection(rig, monkeypatch, property):
+    armed, injected = [], []
+    monkeypatch.setattr(module, "_current_candidate", lambda _: armed.append(True))
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if (armed and not injected and argv[0] == "/usr/bin/busctl" and
+                "enrichment_2enextcloud_5ftext" in argv[6]):
+            rig.runner.services["enrichment.nextcloud_text"][property] += " synthetic-drift"
+            injected.append(True)
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    with pytest.raises(WP8ContractError):
+        rig.backend.start_service("enrichment.nextcloud_text")
+    assert injected == [True] and not rig.runner.mutations()
+
+
+def test_v257_continuity_authority_seal_excludes_separate_volatile_prerequisite_facts(rig, monkeypatch):
+    values = rig.backend._show("enrichment.nextcloud_text")
+    expected = module._check_service(values, "enrichment.nextcloud_text", rig.assets)
+    changed = dict(values, ActiveState="active", SubState="running", Job="123", Result="exit-code",
+                   ExecMainCode="2", ExecMainStatus="1", ExecMainStartTimestampMonotonic="1100",
+                   ExecMainExitTimestampMonotonic="1200", InvocationID="2" * 32,
+                   ConditionResult="no", AssertResult="no")
+    changed["ExecStart"] = values["ExecStart"].replace("start_time=[n/a]", "start_time=[synthetic-start]").replace(
+        "stop_time=[n/a]", "stop_time=[synthetic-exit]").replace("pid=0", "pid=123").replace(
+        "code=(null) ; status=0/0", "code=exited ; status=0/SUCCESS")
+    assert module._check_service(changed, "enrichment.nextcloud_text", rig.assets) == expected
+    with pytest.raises(WP8ContractError):
+        module._require_inactive(changed)
+
+
+def test_v257_continuity_completed_invocation_execstart_runtime_is_not_contract_drift(rig, monkeypatch):
+    def transport(argv, **kwargs):
+        result = rig.runner(argv, **kwargs)
+        if argv[4] == "start":
+            values = rig.runner.services["enrichment.nextcloud_text"]
+            values["ExecStart"] = values["ExecStart"].replace("start_time=[n/a]", "start_time=[synthetic-start]").replace(
+                "stop_time=[n/a]", "stop_time=[synthetic-exit]").replace("pid=0", "pid=123").replace(
+                "code=(null) ; status=0/0", "code=exited ; status=0/SUCCESS")
+        return result
+    monkeypatch.setattr(module.subprocess, "run", transport)
+    assert rig.backend.start_service("enrichment.nextcloud_text").outcome is module._Outcome.SUCCESS
+    assert len(rig.runner.mutations()) == 1
+
+
+def test_v257_continuity_every_service_mutation_follows_fresh_sealed_typed_observation(rig):
+    rig.backend.start_service("enrichment.nextcloud_text")
+    assert rig.backend.stop_all_services().stop_failure_count == 0
+    calls = [argv for argv, _ in rig.runner.calls]
+    commands = [i for i, argv in enumerate(calls) if argv[4] in {"start", "stop"}]
+    assert len(commands) == 7
+    for i in commands:
+        unit_name = calls[i][5]
+        expected_object = "/org/freedesktop/systemd1/unit/" + "".join(
+            c if c.isascii() and c.isalnum() else f"_{ord(c):02x}" for c in unit_name)
+        service, unit = calls[i - 2:i]
+        assert service[:6] == unit[:6] == ("/usr/bin/busctl", "--system", "--no-pager", "--json=short",
+                                           "get-property", "org.freedesktop.systemd1")
+        assert service[6] == unit[6] == expected_object
+        assert service[7:] == ("org.freedesktop.systemd1.Service", "ExecStartPre", "ExecStartPost",
+                               "ExecStop", "ExecStopPost", "ExecCondition")
+        assert unit[7:] == ("org.freedesktop.systemd1.Unit", "Conditions", "Asserts")
