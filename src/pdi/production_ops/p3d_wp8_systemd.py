@@ -37,6 +37,8 @@ from .p3d_wp8_contracts import (
 __all__ = ["WP8ProductionSystemdBackend"]
 
 _SYSTEMCTL = "/usr/bin/systemctl"
+_BUSCTL = "/usr/bin/busctl"
+_BUS_FLAGS = ("--system", "--no-pager", "--json=short")
 _FLAGS = ("--system", "--no-pager", "--no-ask-password")
 _ENV = MappingProxyType({"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
 _SERVICE_UNITS = MappingProxyType({
@@ -49,7 +51,7 @@ _STABLE_PROPERTIES = (
 _IDENTITY_PROPERTIES = (
     "Id", "LoadState", "FragmentPath", "DropInPaths", "Transient", "NeedDaemonReload",
 )
-# systemd v255: Before/After order jobs, whereas the other relations can pull
+# Reviewed systemd v257: Before/After order jobs, whereas other relations can pull
 # jobs in, propagate stops/restarts, trigger handlers, or expose foreign graph
 # authority. Include inverse relations: RequiredBy/BoundBy/ConsistsOf can stop
 # other units even when the outbound Requires/BindsTo/PartOf sets are empty.
@@ -60,8 +62,9 @@ _GRAPH_PROPERTIES = (
     "ConflictedBy", "OnFailure", "OnSuccess", "OnFailureOf", "OnSuccessOf",
     "Triggers", "TriggeredBy", "PropagatesStopTo", "StopPropagatedFrom",
     "PropagatesReloadTo", "ReloadPropagatedFrom", "JoinsNamespaceOf", "SliceOf",
-    "RequiresMountsFor",
+    "RequiresMountsFor", "WantsMountsFor",
 )
+_PATH_PROPERTIES = ("RequiresMountsFor", "WantsMountsFor")
 _UNIT_LOAD_ROOTS = (
     "/etc/systemd/system.control", "/run/systemd/system.control", "/run/systemd/transient",
     "/run/systemd/generator.early", "/etc/systemd/system", "/etc/systemd/system.attached",
@@ -71,20 +74,18 @@ _UNIT_LOAD_ROOTS = (
 _DEFAULT_SLICE = r"system-pdi\x2dscoped\x2dpipeline.slice"
 _SERVICE_PROPERTIES = (*_IDENTITY_PROPERTIES, "Names", "Following",
     "User", "Group", "Type", "WorkingDirectory", "EnvironmentFiles", "ExecStart",
-    "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecCondition",
-    "NoNewPrivileges", "PrivateTmp", "ProtectSystem", "ProtectHome", "ReadWritePaths",
+    "NoNewPrivileges", "PrivateTmp", "PrivateTmpEx", "ProtectSystem", "ProtectHome", "ReadWritePaths",
     "TimeoutStartUSec", "TimeoutStopUSec", "KillMode", "StandardOutput", "StandardError",
     "RemainAfterExit", "Restart", "FailureAction", "SuccessAction", "StartLimitAction",
     "JobTimeoutAction", "DefaultDependencies", "Slice", *_GRAPH_PROPERTIES, *_ORDERING_PROPERTIES,
-    "Conditions", "Asserts", "ConditionResult", "AssertResult", "ActiveState", "SubState",
+    "ConditionResult", "AssertResult", "ActiveState", "SubState",
     "Job", "Result", "ExecMainCode", "ExecMainStatus", "ExecMainStartTimestampMonotonic",
     "ExecMainExitTimestampMonotonic", "InvocationID",
 )
 _TIMER_PROPERTIES = (*_IDENTITY_PROPERTIES, "ActiveState", "SubState", "Unit", "Job")
 _MANAGER_PROPERTIES = ("Version", "Virtualization", "SystemState", "UnitPath")
-# One explicit v255 representation policy: upstream 255, or Ubuntu Noble's
-# 255.4-1ubuntu8[.N] package grammar. No free text, other major, or distro suffix.
-_VERSION_PATTERN = r"(?:255|255\.4-1ubuntu8(?:\.[1-9][0-9]*)?)"
+# Package identity is authority, not a major-version compatibility heuristic.
+_VERSION = "257.13-1~deb13u1"
 # Read authority is finite and is NOT an execution API for these units. Unknown
 # host boot/mount/service dependencies require a separate authority review;
 # being root-owned, already active or named systemd-* does not grant authority.
@@ -99,7 +100,7 @@ _DEFAULT_PROPERTIES = (*_IDENTITY_PROPERTIES, "Names", "Following",
     *_GRAPH_PROPERTIES, *_ORDERING_PROPERTIES, "ActiveState", "SubState", "Job",
     "FailureAction", "SuccessAction", "StartLimitAction", "JobTimeoutAction", "StopWhenUnneeded")
 _MAX_CLOSURE_NODES, _MAX_CLOSURE_EDGES, _MAX_CLOSURE_DEPTH = 32, 128, 16
-# v255 unit-dependency-atom.c / transaction.c: these are directed job edges,
+# Reviewed v257 unit-dependency-atom.c / transaction.c: directed job edges,
 # not undirected dependencies. Requisite verifies activity; its deps are not
 # started. PartOf and StopPropagatedFrom do NOT propagate a stop from this unit.
 _START_RELATIONS = ("Wants", "Requires", "BindsTo", "Upholds")
@@ -153,6 +154,86 @@ class _Request(Enum):
     DEFAULT_SHOW = "default_show"
 
 
+class _TypedAuthority(Enum):
+    CANONICAL_SERVICE = "canonical_service"
+    EMERGENCY_STOP = "emergency_stop"
+
+
+_EXEC_EMPTY_PROPERTIES = ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecCondition")
+_UNIT_EMPTY_PROPERTIES = ("Conditions", "Asserts")
+_EMERGENCY_EMPTY_PROPERTIES = ("ExecStop", "ExecStopPost")
+_EXEC_SIGNATURE = "a(sasbttttuii)"
+_UNIT_SIGNATURE = "a(sbbsi)"
+
+
+def _typed_commands(authority: _TypedAuthority, key: str | None = None):
+    """Two sealed authorities, no caller-selectable unit/property/object path.
+
+    busctl get-property calls Properties.Get (never LoadUnit/StartUnit). v257
+    prints one JSON variant per requested property, in fixed argv order.
+    """
+    if authority is _TypedAuthority.CANONICAL_SERVICE:
+        unit = _SERVICE_UNITS[_key(key)]
+        groups = (("Service", _EXEC_EMPTY_PROPERTIES, _EXEC_SIGNATURE),
+                  ("Unit", _UNIT_EMPTY_PROPERTIES, _UNIT_SIGNATURE))
+    elif authority is _TypedAuthority.EMERGENCY_STOP and key is None:
+        unit = "emergency.service"
+        groups = (("Service", _EMERGENCY_EMPTY_PROPERTIES, _EXEC_SIGNATURE),)
+    else:
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    label = "".join(c if c.isascii() and c.isalnum() else f"_{ord(c):02x}" for c in unit)
+    path = "/org/freedesktop/systemd1/unit/" + label
+    return tuple(((_BUSCTL, *_BUS_FLAGS, "get-property", "org.freedesktop.systemd1", path,
+                   "org.freedesktop.systemd1." + interface, *names), names, signature)
+                 for interface, names, signature in groups)
+
+
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        result[key] = value
+    return result
+
+
+def _empty_typed(values, names, signature):
+    for name in names:
+        value = values.get(name)
+        if (type(value) is not dict or set(value) != {"type", "data"} or
+                value["type"] != signature or type(value["data"]) is not list or value["data"] != []):
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+
+
+def _typed_empty(authority: _TypedAuthority, key: str | None = None):
+    commands = _typed_commands(authority, key)
+    code = WP8FailureCode.SERVICE_CONTRACT_INVALID
+    try:
+        if not _trusted(Path(_BUSCTL), kind="file"):
+            _fail(code)
+        values = {}
+        for argv, names, signature in commands:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                                    env=dict(_ENV), shell=False, stdin=subprocess.DEVNULL)
+            if (type(result.returncode) is not int or result.returncode != 0 or
+                    not isinstance(result.stdout, str) or not isinstance(result.stderr, str) or
+                    len(result.stdout) > 65536):
+                _fail(code, _Outcome.COMMAND_FAILED)
+            lines = result.stdout.splitlines()
+            if len(lines) != len(names):
+                _fail(code)
+            for name, line in zip(names, lines, strict=True):
+                values[name] = json.loads(line, object_pairs_hook=_json_object)
+            _empty_typed(values, names, signature)
+        return values  # private typed EMPTY proof only, never raw bus output
+    except _BackendError:
+        raise
+    except subprocess.TimeoutExpired:
+        _fail(code, _Outcome.TIMEOUT)
+    except BaseException:
+        _fail(code, _Outcome.COMMAND_FAILED)
+
+
 def _timer_units():
     # Reuse the frozen mapping, never infer an additional scheduling authority.
     from .enrichment_cutover import P3D_TIMER_UNITS
@@ -191,8 +272,6 @@ def _command(request: _Request, key: str | None = None) -> tuple[tuple[str, ...]
         if key not in _DEFAULT_UNITS:
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
         unit, properties = key, _DEFAULT_PROPERTIES
-        if unit.endswith(".service"):
-            properties = (*properties, "ExecStop", "ExecStopPost")
     else:
         if key not in _p3c_units():
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
@@ -201,7 +280,7 @@ def _command(request: _Request, key: str | None = None) -> tuple[tuple[str, ...]
         return (_SYSTEMCTL, *_FLAGS, "is-enabled", unit), 30
     if request in {_Request.TIMER_ACTIVE, _Request.P3C_ACTIVE}:
         return (_SYSTEMCTL, *_FLAGS, "is-active", unit), 30
-    # --all makes empty hooks/drop-ins explicit. P3C keeps the frozen projection.
+    # Text omission is NOT empty structured-array evidence. P3C is unchanged.
     flags = () if request is _Request.P3C_SHOW else ("--all",)
     return (_SYSTEMCTL, *_FLAGS, "show", unit, *flags,
             "--property=" + ",".join(properties)), 30
@@ -239,6 +318,8 @@ def _systemctl(request: _Request, key: str | None = None) -> subprocess.Complete
 def _properties(result, names: tuple[str, ...], code=WP8FailureCode.SERVICE_CONTRACT_INVALID):
     if result.returncode != 0:
         _fail(code, _Outcome.COMMAND_FAILED)
+    if any((ord(c) < 32 and c != "\n") or ord(c) == 127 for c in result.stdout):
+        _fail(code)
     values = {}
     for line in result.stdout.splitlines():
         name, separator, value = line.partition("=")
@@ -248,6 +329,11 @@ def _properties(result, names: tuple[str, ...], code=WP8FailureCode.SERVICE_CONT
     if set(values) != set(names):
         _fail(code)
     return values
+
+
+def _no_job(values) -> bool:
+    # v257 show renders a no-job (uo) value as Job=, NOT Job=0.
+    return "Job" in values and type(values["Job"]) is str and values["Job"] == ""
 
 
 @dataclass(frozen=True)
@@ -329,9 +415,10 @@ def _observe_manager() -> _ManagerIdentity:
                          WP8FailureCode.SYSTEMD_MANAGER_INVALID)
     after = _manager_os_facts()
     roots = values["UnitPath"].split()
-    if (before != after or not re.fullmatch(_VERSION_PATTERN, values["Version"]) or
+    if (before != after or values["Version"] != _VERSION or
             not roots or len(roots) != len(set(roots)) or
             not set(roots) <= set(_UNIT_LOAD_ROOTS) or "/etc/systemd/system" not in roots or
+            roots != [root for root in _UNIT_LOAD_ROOTS if root in roots] or
             values["SystemState"] not in {"running", "degraded"} or
             values["Virtualization"] not in {"", *_FULL_VM}):
         _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
@@ -544,12 +631,12 @@ def _unit_names(value: str) -> frozenset[str]:
 
 
 def _check_graph(values, key: str, assets: _Assets) -> dict[str, list[str]]:
-    """Exact v255/frozen-template graph policy; never authorize arbitrary units.
+    """Exact v257/frozen-template graph policy; never authorize arbitrary units.
 
     service_add_default_dependencies() adds sysinit + shutdown; template
     instances get a per-template slice. unit_add_exec_dependencies() adds
-    PrivateTmp's tmp.mount and mount-prefix dependencies for WorkingDirectory
-    and /var/tmp. Only these finite OS defaults are allowed; no user workload
+    connected PrivateTmp's wanted paths and required WorkingDirectory prefixes.
+    Only these finite OS defaults are allowed; no user workload
     dependency or stop/failure/success propagation is granted by Gate C.
     """
     source = {name: value for section, name, value in assets.template if section == "Service"}
@@ -560,20 +647,15 @@ def _check_graph(values, key: str, assets: _Assets) -> dict[str, list[str]]:
             values["DefaultDependencies"] != "yes" or values["Slice"] != _DEFAULT_SLICE or
             _unit_names(values["Names"]) != {_SERVICE_UNITS[key]} or values["Following"]):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-    graph = {name: _unit_names(values[name]) for name in _GRAPH_PROPERTIES if name != "RequiresMountsFor"}
-    paths = (source["WorkingDirectory"], "/var/tmp")
-    required_paths = values["RequiresMountsFor"].split()
-    if len(required_paths) != len(set(required_paths)) or set(required_paths) != set(paths):
-        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-    # Derive only finite mount prefixes of the frozen paths above. v255 adds
-    # Requires only when the corresponding mount's fragment is loaded.
-    mounts = {"-.mount"}
-    for path in paths:
-        parts = Path(path).parts[1:]
-        mounts.update("-".join(parts[:index]) + ".mount" for index in range(1, len(parts) + 1))
+    graph = {name: _unit_names(values[name]) for name in _GRAPH_PROPERTIES if name not in _PATH_PROPERTIES}
+    required = _paths(values["RequiresMountsFor"], {source["WorkingDirectory"]}, exact=True)
+    wanted = _paths(values["WantsMountsFor"], {"/tmp", "/var/tmp"}, exact=True)
+    # v257 adds prefix Requires/Wants + After for loaded mount fragments.
+    # Bound each relation to its own finite paths; do not authorize all mounts.
+    required_mounts, wanted_mounts = _mount_prefixes(required), _mount_prefixes(wanted)
     mandatory = {"sysinit.target", _DEFAULT_SLICE}
-    if (graph["Wants"] != {"tmp.mount"} or not mandatory <= graph["Requires"] or
-            not graph["Requires"] <= mandatory | mounts or graph["Conflicts"] != {"shutdown.target"} or
+    if (not graph["Wants"] <= wanted_mounts or not mandatory <= graph["Requires"] or
+            not graph["Requires"] <= mandatory | required_mounts or graph["Conflicts"] != {"shutdown.target"} or
             not graph["ConflictedBy"] <= {"shutdown.target"} or
             not graph["TriggeredBy"] <= {_timer_units()[key]}):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
@@ -583,10 +665,27 @@ def _check_graph(values, key: str, assets: _Assets) -> dict[str, list[str]]:
     # Ordering is not activation authority. Preserve frozen/default ordering,
     # allow other ordering-only edges, but never treat them as dependencies.
     after, before = (_unit_names(values[name]) for name in ("After", "Before"))
-    if (not (mandatory | {unit["After"], "basic.target", "tmp.mount", "systemd-tmpfiles-setup.service"}) <= after or
+    if (not (mandatory | graph["Wants"] | graph["Requires"] |
+             {unit["After"], "basic.target", "systemd-tmpfiles-setup.service"}) <= after or
             "shutdown.target" not in before):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     return {name: sorted(names) for name, names in graph.items()}
+
+
+def _paths(value: str, allowed: set[str], *, exact: bool = False) -> frozenset[str]:
+    paths = value.split()
+    if (len(paths) != len(set(paths)) or not set(paths) <= allowed or
+            (exact and set(paths) != allowed)):
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    return frozenset(paths)
+
+
+def _mount_prefixes(paths):
+    mounts = {"-.mount"}
+    for path in paths:
+        parts = Path(path).parts[1:]
+        mounts.update("-".join(parts[:i]) + ".mount" for i in range(1, len(parts) + 1))
+    return mounts
 
 
 def _check_service(values, key: str, assets: _Assets) -> str:
@@ -599,6 +698,8 @@ def _check_service(values, key: str, assets: _Assets) -> str:
     for name in ("NoNewPrivileges", "PrivateTmp", "ProtectHome"):
         if source[name] != "true" or values[name] != "yes":
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    if values["PrivateTmpEx"] != "connected":
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     expected_environment = source["EnvironmentFile"].replace("%i", key)
     if (values["EnvironmentFiles"] != f"{expected_environment} (ignore_errors=no)" or
             _exec_argv(values["ExecStart"]) != tuple(shlex.split(source["ExecStart"])) or
@@ -606,16 +707,18 @@ def _check_service(values, key: str, assets: _Assets) -> str:
             source["TimeoutStopSec"] != "60" or values["TimeoutStopUSec"] != "1min" or
             values["RemainAfterExit"] != "no" or values["Restart"] != "no"):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-    for name in ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "ExecCondition",
-                 "Conditions", "Asserts"):
-        if values[name]:
-            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    _empty_typed(values, _EXEC_EMPTY_PROPERTIES, _EXEC_SIGNATURE)
+    _empty_typed(values, _UNIT_EMPTY_PROPERTIES, _UNIT_SIGNATURE)
     if any(values[name] != "none" for name in
            ("FailureAction", "SuccessAction", "StartLimitAction", "JobTimeoutAction")):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     graph = _check_graph(values, key, assets)
     return contract_fingerprint({"pipeline": key, "assets": assets.fingerprint,
-                                 "template_sha256": contract_fingerprint(assets.template), "graph": graph})
+        "template_sha256": contract_fingerprint(assets.template), "graph": graph,
+        "private_tmp": values["PrivateTmp"], "private_tmp_ex": values["PrivateTmpEx"],
+        "mount_paths": {name: sorted(values[name].split()) for name in _PATH_PROPERTIES},
+        "typed_empty": {name: values[name] for name in (*_EXEC_EMPTY_PROPERTIES, *_UNIT_EMPTY_PROPERTIES)},
+        "no_job_representation": "EMPTY_V257"})
 
 
 class _JobAuthority(str, Enum):
@@ -625,8 +728,20 @@ class _JobAuthority(str, Enum):
 
 
 def _default_show(unit: str):
-    names = (*_DEFAULT_PROPERTIES, "ExecStop", "ExecStopPost") if unit.endswith(".service") else _DEFAULT_PROPERTIES
-    return _properties(_systemctl(_Request.DEFAULT_SHOW, unit), names)
+    values = _properties(_systemctl(_Request.DEFAULT_SHOW, unit), _DEFAULT_PROPERTIES)
+    if unit == "emergency.service":
+        # Sole default typed exception, bound BEFORE reading the fixed object.
+        if (values["Id"] != unit or _unit_names(values["Names"]) != {unit} or values["Following"] or
+                values["LoadState"] != "loaded" or values["Transient"] != "no" or
+                values["FragmentPath"] != "/usr/lib/systemd/system/emergency.service" or
+                values["DropInPaths"] or values["NeedDaemonReload"] != "no"):
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        typed = _typed_empty(_TypedAuthority.EMERGENCY_STOP)
+        after = _properties(_systemctl(_Request.DEFAULT_SHOW, unit), _DEFAULT_PROPERTIES)
+        if after != values:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        values.update(typed)
+    return values
 
 
 def _default_fragment(values) -> str:
@@ -634,7 +749,7 @@ def _default_fragment(values) -> str:
     if not fragment:
         if unit not in {_DEFAULT_SLICE, "system.slice", "-.slice", "-.mount"}:
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-        return "IMPLICIT_V255_UNIT"
+        return "IMPLICIT_V257_UNIT"
     expected = {str(Path(root) / unit) for root in _UNIT_LOAD_ROOTS}
     if fragment not in expected or not _trusted(Path(fragment), kind="file"):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
@@ -691,27 +806,27 @@ def _default_authority(values, unit: str, job: _JobAuthority) -> dict[str, froze
     permitted = _DEFAULT_STOP_UNITS if job is _JobAuthority.STOP else _DEFAULT_START_UNITS
     if (unit not in permitted or values["Id"] != unit or _unit_names(values["Names"]) != {unit} or
             values["Following"] or values["LoadState"] != "loaded" or values["Transient"] != "no" or
-            values["NeedDaemonReload"] != "no" or values["DropInPaths"] or values["Job"] != "0" or
+            values["NeedDaemonReload"] != "no" or values["DropInPaths"] or not _no_job(values) or
             values["StopWhenUnneeded"] != "no" or any(values[name] != "none" for name in
                 ("FailureAction", "SuccessAction", "StartLimitAction", "JobTimeoutAction"))):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     if job is _JobAuthority.STOP:
         if values["ActiveState"] != "inactive" or values["SubState"] != "dead":
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-        if unit.endswith(".service") and (values["ExecStop"] or values["ExecStopPost"]):
-            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        if unit.endswith(".service"):
+            if unit != "emergency.service":
+                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+            _empty_typed(values, _EMERGENCY_EMPTY_PROPERTIES, _EXEC_SIGNATURE)
     elif unit == _DEFAULT_SLICE and job is _JobAuthority.START:
         if (values["ActiveState"], values["SubState"]) not in {("inactive", "dead"), ("active", "active")}:
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     elif values["ActiveState"] != "active" or values["SubState"] != ("mounted" if unit.endswith(".mount") else "active"):
         _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-    graph = {name: _unit_names(values[name]) for name in _GRAPH_PROPERTIES if name != "RequiresMountsFor"}
+    graph = {name: _unit_names(values[name]) for name in _GRAPH_PROPERTIES if name not in _PATH_PROPERTIES}
     for name in _ORDERING_PROPERTIES:
         _unit_names(values[name])  # validate representation; do NOT pull jobs in
-    paths = values["RequiresMountsFor"].split()
-    if len(paths) != len(set(paths)) or not set(paths) <= {
-            "/", "/tmp", "/opt", "/opt/pdi", "/opt/pdi/current", "/var", "/var/tmp"}:
-        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    for name in _PATH_PROPERTIES:
+        _paths(values[name], {"/", "/tmp", "/opt", "/opt/pdi", "/opt/pdi/current", "/var", "/var/tmp"})
     # No execution handlers, independent triggers, namespace sharing, or reload
     # side channel is granted for a default prerequisite, in ANY job direction.
     if any(graph[name] for name in ("OnFailure", "OnSuccess", "Triggers", "JoinsNamespaceOf", "PropagatesReloadTo")):
@@ -719,7 +834,7 @@ def _default_authority(values, unit: str, job: _JobAuthority) -> dict[str, froze
     if job is _JobAuthority.START and values["ActiveState"] == "inactive":
         # Only our per-template slice may newly activate. Failure of that start
         # must not propagate to a foreign dependent (especially a P3C writer).
-        # The six canonical dependents are independently proved inactive/Job=0
+        # The six canonical dependents are independently proved inactive/Job=
         # by the complete final bundle; no other consumer is authorized here.
         if any(not graph[name] <= set(_SERVICE_UNITS.values()) for name in
                ("RequiredBy", "RequisiteOf", "BoundBy", "ConsistsOf")):
@@ -765,7 +880,7 @@ def _start_closure(key: str, source, assets: _Assets) -> _StartClosure:
         visited.add((unit, job))
         if unit == root and job is _JobAuthority.START:
             _check_service(source, key, assets)
-            graph = {name: _unit_names(source[name]) for name in _GRAPH_PROPERTIES if name != "RequiresMountsFor"}
+            graph = {name: _unit_names(source[name]) for name in _GRAPH_PROPERTIES if name not in _PATH_PROPERTIES}
         else:
             permitted = _DEFAULT_STOP_UNITS if job is _JobAuthority.STOP else _DEFAULT_START_UNITS
             if unit not in permitted:
@@ -782,6 +897,10 @@ def _start_closure(key: str, source, assets: _Assets) -> _StartClosure:
             authorities.append((unit, job, contract_fingerprint({k: v for k, v in values.items()
                 if k not in {"ActiveState", "SubState", "Job"}})))
         successors = tuple(_job_edges(graph, job))
+        if any(target == "emergency.service" and
+               (unit != "sysinit.target" or job is not _JobAuthority.START or relation != "Conflicts")
+               for relation, target, _ in successors):
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
         if len(edges) + len(successors) > _MAX_CLOSURE_EDGES:
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
         for relation, target, target_job in successors:
@@ -821,7 +940,7 @@ def _current_candidate(evidence: WP8PhaseAEvidenceV1) -> None:
 
 
 def _require_inactive(values) -> None:
-    if values["ActiveState"] != "inactive" or values["SubState"] != "dead" or values["Job"] != "0":
+    if values["ActiveState"] != "inactive" or values["SubState"] != "dead" or not _no_job(values):
         _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
 
 
@@ -963,7 +1082,7 @@ class WP8ProductionSystemdBackend:
             for key in WP8_CANONICAL_PIPELINE_KEYS:
                 values = self._show(key)
                 _identity(values, key, allow_stale=True)
-                if values["ActiveState"] != "inactive" or values["Job"] != "0":
+                if values["ActiveState"] != "inactive" or not _no_job(values):
                     _fail(WP8FailureCode.DAEMON_RELOAD_FAILED)
             result = _systemctl(_Request.RELOAD)
             if result.returncode != 0:
@@ -1010,14 +1129,23 @@ class WP8ProductionSystemdBackend:
             if (enabled.returncode != 1 or enabled.stdout.strip() != "disabled" or
                     active.returncode != 3 or active.stdout.strip() != "inactive" or
                     values["ActiveState"] != "inactive" or values["SubState"] != "dead" or
-                    values["Job"] != "0" or values["Unit"] != _SERVICE_UNITS[key]):
+                    not _no_job(values) or values["Unit"] != _SERVICE_UNITS[key]):
                 _fail(WP8FailureCode.PREREQUISITE_DRIFT)
             facts.append({"pipeline": key, "enabled": "disabled", "active": "inactive"})
         self.manager_identity() if manager is None else _manager_token(manager)
         return _TimerState("DISABLED_INACTIVE", contract_fingerprint({"timers": facts}))
 
     def _show(self, key):
-        return _properties(_systemctl(_Request.SERVICE_SHOW, _key(key)), _SERVICE_PROPERTIES)
+        key = _key(key)
+        values = _properties(_systemctl(_Request.SERVICE_SHOW, key), _SERVICE_PROPERTIES)
+        _identity(values, key, allow_stale=True)
+        if _unit_names(values["Names"]) != {_SERVICE_UNITS[key]} or values["Following"]:
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        typed = _typed_empty(_TypedAuthority.CANONICAL_SERVICE, key)
+        after = _properties(_systemctl(_Request.SERVICE_SHOW, key), _SERVICE_PROPERTIES)
+        if any(after[name] != values[name] for name in (*_IDENTITY_PROPERTIES, "Names", "Following")):
+            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        return {**after, **typed}
 
     @_boundary(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     def verify_service_contract(self, pipeline_key: str) -> str:
@@ -1094,7 +1222,7 @@ class WP8ProductionSystemdBackend:
             if (after["ConditionResult"] != "yes" or after["AssertResult"] != "yes" or
                     after["Result"] != "success" or after["ExecMainCode"] != "1" or
                     after["ExecMainStatus"] != "0" or after["ActiveState"] != "inactive" or
-                    after["SubState"] != "dead" or after["Job"] != "0" or
+                    after["SubState"] != "dead" or not _no_job(after) or
                     not (prior_start < start and boundary <= start <= end <= finished)):
                 _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
             invocation = _invocation_id(after["InvocationID"])
@@ -1136,7 +1264,7 @@ class WP8ProductionSystemdBackend:
                 values = self._show(key)  # every final state independently queried
                 if assets is not None and directories_trusted:
                     _check_service(values, key, assets)
-                    if values["ActiveState"] == "inactive" and values["SubState"] == "dead" and values["Job"] == "0":
+                    if values["ActiveState"] == "inactive" and values["SubState"] == "dead" and _no_job(values):
                         state = "INACTIVE"
             except BaseException:
                 pass
