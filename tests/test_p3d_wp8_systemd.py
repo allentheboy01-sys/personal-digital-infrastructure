@@ -1323,7 +1323,13 @@ def test_b1_final_bundle_has_no_full_manager_or_slow_validation_after_current(ri
     def current(_):
         current_seen[0] = True
         events.append("current")
-    monkeypatch.setattr(module, "_current_candidate", current)
+    # Only the final runtime gate has the no-slow-IO fence. Each complete A/B
+    # snapshot independently verifies current too, before this final gate.
+    original_final = rig.backend._final_runtime_prerequisites
+    def final(*args, **kwargs):
+        monkeypatch.setattr(module, "_current_candidate", current)
+        return original_final(*args, **kwargs)
+    monkeypatch.setattr(rig.backend, "_final_runtime_prerequisites", final)
     for name in ("_manager_os_facts", "_verify_candidate", "_read_assets", "_dependency_directories",
                  "_default_dependency_directories", "_default_fragment"):
         original = getattr(module, name)
@@ -1456,12 +1462,10 @@ def test_b2_missing_raw_default_property_is_not_filled_by_the_fake(rig):
 
 def test_b2_final_loaded_closure_drift_refused_without_new_graph_traversal(rig, monkeypatch):
     calls = []
-    original = module._closure_continuity
-    def changed(closure):
-        calls.append(closure)
+    def changed():
+        calls.append(True)
         rig.runner.defaults["system.slice"]["Requires"] = "synthetic-second-hop.service"
-        return original(closure)
-    monkeypatch.setattr(module, "_closure_continuity", changed)
+    _attack_after_snapshot_a(rig, monkeypatch, changed)
     with pytest.raises(WP8ContractError):
         rig.backend.start_service("enrichment.nextcloud_text")
     assert len(calls) == 1 and not rig.runner.mutations()
@@ -1733,11 +1737,13 @@ def test_b1_complete_final_bundle_follows_every_slow_proof_and_fence_immediately
         assert ("show", timer) in final
         assert ("is-enabled", timer) in final and ("is-active", timer) in final
     assert final[-4:] == [("show", "pdi-scoped-pipeline@enrichment.nextcloud_text.service"),
-                         ("get-property", "org.freedesktop.systemd1"),
-                         ("get-property", "org.freedesktop.systemd1"), ("fence",)]
+                         ("current",), ("token",), ("fence",)]
     calls = [argv for argv, _ in rig.runner.calls]
     command = next(i for i, argv in enumerate(calls) if argv[4] == "start")
-    service, unit = calls[command - 2:command]
+    # Typed authority belongs to COMPLETE B, not a detached last-property seal.
+    typed = [argv for argv in calls[:command] if argv[0] == "/usr/bin/busctl" and
+             "enrichment_2enextcloud_5ftext" in argv[6]]
+    service, unit = typed[-2:]
     assert service[7:] == ("org.freedesktop.systemd1.Service", "ExecStartPre", "ExecStartPost",
                            "ExecStop", "ExecStopPost", "ExecCondition")
     assert unit[7:] == ("org.freedesktop.systemd1.Unit", "Conditions", "Asserts")
@@ -1767,11 +1773,15 @@ def test_b2_authorized_slice_activation_is_not_a_post_start_authority_drift(rig,
 
 
 def test_b2_activity_is_still_sealed_before_start_even_when_slice_transition_is_authorized(rig, monkeypatch):
-    original = module._closure_continuity
-    def changed(closure):
+    def changed():
         rig.runner.defaults[r"system-pdi\x2dscoped\x2dpipeline.slice"].update(ActiveState="active", SubState="active")
-        return original(closure)
-    monkeypatch.setattr(module, "_closure_continuity", changed)
+    # Volatile activity is not stable authority. Inject after B, before its
+    # bounded activity check, preserving the original pre-start rejection.
+    original = rig.backend._final_runtime_prerequisites
+    def final(*args, **kwargs):
+        changed()
+        return original(*args, **kwargs)
+    monkeypatch.setattr(rig.backend, "_final_runtime_prerequisites", final)
     with pytest.raises(WP8ContractError):
         rig.backend.start_service("enrichment.nextcloud_text")
     assert not rig.runner.mutations()
@@ -1851,22 +1861,18 @@ def test_v257_t3_mount_authority_is_not_trust_terminal(rig, relation, target):
     ("RequiresMountsFor", "/opt/pdi/current /run/lock"), ("PrivateTmpEx", "disconnected"),
     ("Wants", "tmp.mount var.mount")))
 def test_v257_t4_final_path_mode_or_derived_authority_drift_refused(rig, monkeypatch, property, value):
-    original = module._closure_continuity
-    def drift(closure):
+    def drift():
         rig.runner.services["enrichment.nextcloud_text"][property] = value
-        return original(closure)
-    monkeypatch.setattr(module, "_closure_continuity", drift)
+    _attack_after_snapshot_a(rig, monkeypatch, drift)
     with pytest.raises(WP8ContractError):
         rig.backend.start_service("enrichment.nextcloud_text")
     assert not rig.runner.mutations()
 
 
 def test_v257_t4_post_full_proof_mount_edge_drift_refused(rig, monkeypatch):
-    original = module._closure_continuity
-    def drift(closure):
+    def drift():
         rig.runner.defaults["tmp.mount"]["Conflicts"] += " pdi-p3c-nextcloud-incremental.timer"
-        return original(closure)
-    monkeypatch.setattr(module, "_closure_continuity", drift)
+    _attack_after_snapshot_a(rig, monkeypatch, drift)
     with pytest.raises(WP8ContractError):
         rig.backend.start_service("enrichment.nextcloud_text")
     assert not rig.runner.mutations()
@@ -2063,11 +2069,9 @@ def test_v257_emergency_only_reached_through_reviewed_sysinit_conflict(rig):
 
 
 def test_v257_emergency_typed_authority_drift_after_full_closure_refused(rig, monkeypatch):
-    original = module._closure_continuity
-    def drift(closure):
+    def drift():
         rig.runner.defaults["emergency.service"]["ExecStopPost"] = {"type": "a(sasbttttuii)", "data": [["foreign"]]}
-        return original(closure)
-    monkeypatch.setattr(module, "_closure_continuity", drift)
+    _attack_after_snapshot_a(rig, monkeypatch, drift)
     with pytest.raises(WP8ContractError):
         rig.backend.start_service("enrichment.nextcloud_text")
     assert not rig.runner.mutations()
@@ -2120,7 +2124,8 @@ def test_v257_emergency_exact_empty_stop_proof_is_bound_in_closure_seal(rig, mon
         return original(value)
     monkeypatch.setattr(module, "contract_fingerprint", capture)
     assert len(rig.backend.verify_service_contract("enrichment.nextcloud_text")) == 64
-    sealed = [value for value in captured if isinstance(value, dict) and value.get("Id") == "emergency.service"]
+    sealed = [value["defaults"]["emergency.service:STOP"]["properties"] for value in captured
+              if isinstance(value, dict) and "emergency.service:STOP" in value.get("defaults", {})]
     assert sealed
     for value in sealed:
         assert value["ExecStop"] == {"type": "a(sasbttttuii)", "data": []}
@@ -2162,6 +2167,22 @@ def _nonempty_authority(name):
         return "disconnected"
     signature = "a(sbbsi)" if name in {"Conditions", "Asserts"} else "a(sasbttttuii)"
     return {"type": signature, "data": [["synthetic-unreviewed-authority"]]}
+
+
+def _attack_after_snapshot_a(rig, monkeypatch, attack):
+    """CATEGORY_A: old full-proof attacks now sit between complete A and B.
+
+    They still require zero mutations; none are reclassified as residual races.
+    """
+    original = rig.backend._collect_complete_start_authority_snapshot
+    observed = []
+    def collect(key):
+        snapshot = original(key)
+        if not observed:
+            observed.append(snapshot)
+            attack()
+        return snapshot
+    monkeypatch.setattr(rig.backend, "_collect_complete_start_authority_snapshot", collect)
 
 
 @pytest.mark.parametrize("property", ("ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost",
@@ -2224,11 +2245,8 @@ def test_v257_continuity_stop_rejects_drift_per_unit_after_final_typed_response(
 @pytest.mark.parametrize("property", ("ExecStop", "ExecStopPost"))
 def test_v257_continuity_emergency_drift_after_final_typed_response_blocks_start(rig, monkeypatch, property):
     armed, injected = [], []
-    original = module._closure_continuity
-    def continuity(closure):
-        armed.append(True)
-        return original(closure)
-    monkeypatch.setattr(module, "_closure_continuity", continuity)
+    # A completes before B's independently recollected emergency authority.
+    monkeypatch.setattr(module, "_current_candidate", lambda _: armed.append(True))
     def transport(argv, **kwargs):
         result = rig.runner(argv, **kwargs)
         if (armed and not injected and argv[0] == "/usr/bin/busctl" and
@@ -2251,11 +2269,7 @@ def test_v257_continuity_final_typed_recollection_failure_never_uses_old_proof(r
     if stage == "start":
         monkeypatch.setattr(module, "_current_candidate", lambda _: armed.append(True))
     elif stage == "emergency":
-        original = module._closure_continuity
-        def continuity(closure):
-            armed.append(True)
-            return original(closure)
-        monkeypatch.setattr(module, "_closure_continuity", continuity)
+        monkeypatch.setattr(module, "_current_candidate", lambda _: armed.append(True))
     else:
         original = rig.backend._show
         shows = []
@@ -2328,8 +2342,9 @@ def test_v257_continuity_stable_text_drift_must_match_full_authority_seal(rig, m
         def current(_):
             # Valid ordering-only text is NOT an extra activation authority,
             # but changing it must invalidate the earlier full authority seal.
-            rig.runner.services["enrichment.nextcloud_text"]["After"] += " synthetic-order-only.target"
-            injected.append(True)
+            if not injected:
+                rig.runner.services["enrichment.nextcloud_text"]["After"] += " synthetic-order-only.target"
+                injected.append(True)
         monkeypatch.setattr(module, "_current_candidate", current)
         with pytest.raises(WP8ContractError):
             rig.backend.start_service("enrichment.nextcloud_text")
@@ -2404,14 +2419,22 @@ def test_v257_continuity_every_service_mutation_follows_fresh_sealed_typed_obser
     calls = [argv for argv, _ in rig.runner.calls]
     commands = [i for i, argv in enumerate(calls) if argv[4] in {"start", "stop"}]
     assert len(commands) == 7
+    previous = 0
     for i in commands:
         unit_name = calls[i][5]
         expected_object = "/org/freedesktop/systemd1/unit/" + "".join(
             c if c.isascii() and c.isalnum() else f"_{ord(c):02x}" for c in unit_name)
-        service, unit = calls[i - 2:i]
+        typed = [argv for argv in calls[previous:i] if argv[0] == "/usr/bin/busctl" and
+                 argv[6] == expected_object]
+        # Each target has fresh Service + Unit typed reads in both complete
+        # snapshots, before bounded runtime projections (not after them).
+        assert len(typed) >= 8
+        service, unit = typed[-2:]
         assert service[:6] == unit[:6] == ("/usr/bin/busctl", "--system", "--no-pager", "--json=short",
                                            "get-property", "org.freedesktop.systemd1")
         assert service[6] == unit[6] == expected_object
         assert service[7:] == ("org.freedesktop.systemd1.Service", "ExecStartPre", "ExecStartPost",
                                "ExecStop", "ExecStopPost", "ExecCondition")
         assert unit[7:] == ("org.freedesktop.systemd1.Unit", "Conditions", "Asserts")
+        assert calls[i - 1][4:6] == ("show", unit_name)
+        previous = i + 1

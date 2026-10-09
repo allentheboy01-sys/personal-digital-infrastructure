@@ -150,6 +150,7 @@ class _Request(Enum):
     MANAGER = "manager"
     RELOAD = "reload"
     SERVICE_SHOW = "service_show"
+    SERVICE_RUNTIME_SHOW = "service_runtime_show"
     SERVICE_START = "service_start"
     SERVICE_STOP = "service_stop"
     TIMER_SHOW = "timer_show"
@@ -265,13 +266,14 @@ def _command(request: _Request, key: str | None = None) -> tuple[tuple[str, ...]
             return (_SYSTEMCTL, *_FLAGS, "daemon-reload"), 30
         return (_SYSTEMCTL, *_FLAGS, "show", "--all",
                 "--property=" + ",".join(_MANAGER_PROPERTIES)), 30
-    if request in {_Request.SERVICE_SHOW, _Request.SERVICE_START, _Request.SERVICE_STOP}:
+    if request in {_Request.SERVICE_SHOW, _Request.SERVICE_RUNTIME_SHOW, _Request.SERVICE_START, _Request.SERVICE_STOP}:
         unit = _SERVICE_UNITS[_key(key)]
         if request is _Request.SERVICE_START:
             return (_SYSTEMCTL, *_FLAGS, "start", unit), 1800
         if request is _Request.SERVICE_STOP:
             return (_SYSTEMCTL, *_FLAGS, "stop", unit), 90
-        properties = _SERVICE_PROPERTIES
+        properties = (tuple(name for name in _SERVICE_PROPERTIES if name in _SERVICE_RUNTIME_PROPERTIES)
+                      if request is _Request.SERVICE_RUNTIME_SHOW else _SERVICE_PROPERTIES)
     elif request in {_Request.TIMER_SHOW, _Request.TIMER_ENABLED, _Request.TIMER_ACTIVE}:
         unit = _timer_units()[_key(key)]
         properties = _TIMER_PROPERTIES
@@ -349,6 +351,7 @@ class _ManagerIdentity:
     boot_fingerprint: str
     host_class: str
     continuity_token: str
+    authority_domain: tuple[str, ...] = ()
 
 
 def _manager_continuity_facts():
@@ -432,7 +435,9 @@ def _observe_manager() -> _ManagerIdentity:
                             "unit_path": roots}),
                             _digest(before["boot"].encode()),
                             "FULL_VM" if values["Virtualization"] else "BARE_METAL",
-                            contract_fingerprint({k: v for k, v in before.items() if k != "executable_sha256"}))
+                            contract_fingerprint({k: v for k, v in before.items() if k != "executable_sha256"}),
+                            _schema_domain({"manager": before, "version": values["Version"],
+                                            "virtualization": values["Virtualization"], "unit_path": roots}))
 
 
 @dataclass(frozen=True)
@@ -733,6 +738,8 @@ def _service_authority_text(values):
     # exit status. Preserve its validated executable/argv/ignore-errors contract
     # without letting those volatile members alter the stable authority seal.
     authority["ExecStart"] = _exec_argv(values["ExecStart"])
+    for name in (*_GRAPH_PROPERTIES, *_ORDERING_PROPERTIES):
+        authority[name] = tuple(sorted(values[name].split()))
     return authority
 
 
@@ -905,16 +912,21 @@ def _job_edges(graph, job: _JobAuthority):
 
 
 @dataclass(frozen=True)
-class _StartClosure:
+class _JobClosure:
     fingerprint: str
-    # Private bounded current-state seals, not runtime/DB proof or persistence.
-    observations: tuple[tuple[str, _JobAuthority, str], ...]
+    authority: dict
+    runtime: tuple[tuple[str, _JobAuthority, tuple[str, str, str]], ...]
 
 
-def _start_closure(key: str, source, assets: _Assets) -> _StartClosure:
+def _start_closure(key: str, source, assets: _Assets) -> _JobClosure:
+    return _job_closure(key, source, assets, _JobAuthority.START)
+
+
+def _job_closure(key: str, source, assets: _Assets, direction: _JobAuthority) -> _JobClosure:
     root = _SERVICE_UNITS[_key(key)]
-    stack = [(root, _JobAuthority.START, 0)]
-    visited, observations, authorities, fragments, edges = set(), [], [], [], []
+    stack = [(root, direction, 0)]
+    visited, fragments, edges = set(), [], []
+    members, runtime = {}, []
     while stack:
         unit, job, depth = stack.pop()
         if (unit, job) in visited:
@@ -922,7 +934,7 @@ def _start_closure(key: str, source, assets: _Assets) -> _StartClosure:
         if depth > _MAX_CLOSURE_DEPTH or len(visited) >= _MAX_CLOSURE_NODES:
             _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
         visited.add((unit, job))
-        if unit == root and job is _JobAuthority.START:
+        if unit == root and job is direction:
             _check_service(source, key, assets)
             graph = {name: _unit_names(source[name]) for name in _GRAPH_PROPERTIES if name not in _PATH_PROPERTIES}
         else:
@@ -933,13 +945,12 @@ def _start_closure(key: str, source, assets: _Assets) -> _StartClosure:
             graph = _default_authority(values, unit, job)
             _default_dependency_directories(unit, values)
             fragments.append((unit, _default_fragment(values)))
-            observations.append((unit, job, contract_fingerprint(values)))
             # Activity is independently checked and sealed in the final bundle,
             # not stable authority. The reviewed per-template slice can legally
             # become active due to the one authorized start. Keep that expected
             # change distinct from a changed fragment/graph/action authority.
-            authorities.append((unit, job, contract_fingerprint({k: v for k, v in values.items()
-                if k not in {"ActiveState", "SubState", "Job"}})))
+            members[f"{unit}:{job.value}"] = _stable_default(values)
+            runtime.append((unit, job, tuple(values[name] for name in ("ActiveState", "SubState", "Job"))))
         successors = tuple(_job_edges(graph, job))
         if any(target == "emergency.service" and
                (unit != "sysinit.target" or job is not _JobAuthority.START or relation != "Conflicts")
@@ -950,18 +961,51 @@ def _start_closure(key: str, source, assets: _Assets) -> _StartClosure:
         for relation, target, target_job in successors:
             edges.append((unit, job.value, relation, target, target_job.value))
         stack.extend((target, target_job, depth + 1) for _, target, target_job in reversed(successors))
-    return _StartClosure(contract_fingerprint({"root": root, "edges": sorted(edges),
-        "authorities": sorted(authorities), "fragments": sorted(fragments)}), tuple(observations))
+    authority = {"root": root, "direction": direction.value,
+                 "edges": {"|".join(edge): edge for edge in sorted(edges)},
+                 "defaults": members, "fragments": dict(sorted(fragments)),
+                 "root_members": _relationship_members(source)}
+    return _JobClosure(contract_fingerprint(authority), authority, tuple(runtime))
 
 
-def _closure_continuity(closure: _StartClosure) -> None:
-    # Only bounded immediate loaded reads. No directory scan, file hash, graph
-    # traversal or new target is introduced after the last full manager proof.
-    for unit, job, fingerprint in closure.observations:
-        values = _default_show(unit)
-        _default_authority(values, unit, job)
-        if contract_fingerprint(values) != fingerprint:
-            _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+def _relationship_members(values):
+    # Explicit member identity is part of the domain, not just the digest.
+    return {name: {member: None for member in sorted(values[name].split())}
+            for name in (*_GRAPH_PROPERTIES, *_ORDERING_PROPERTIES)}
+
+
+def _stable_default(values):
+    return {"properties": {name: tuple(sorted(value.split())) if name in
+                           (*_GRAPH_PROPERTIES, *_ORDERING_PROPERTIES) else value
+                           for name, value in values.items() if name not in {"ActiveState", "SubState", "Job"}},
+            "members": _relationship_members(values)}
+
+
+def _schema_domain(value, prefix="") -> tuple[str, ...]:
+    """Exact recursive fields/members; separate comparison precedes hashing."""
+    paths = [prefix]
+    if isinstance(value, dict):
+        for name in sorted(value):
+            paths.extend(_schema_domain(value[name], prefix + "/" + name))
+    elif isinstance(value, (tuple, list)):
+        for index, member in enumerate(value):
+            paths.extend(_schema_domain(member, prefix + f"/{index}"))
+    return tuple(paths)
+
+
+@dataclass(frozen=True, repr=False)
+class _MutationSnapshot:
+    domain: tuple[str, ...]
+    fingerprint: str
+    manager: _ManagerIdentity
+    closure: _JobClosure
+
+
+def _same_snapshot(before: _MutationSnapshot, after: _MutationSnapshot) -> None:
+    if before.domain != after.domain:
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    if before.fingerprint != after.fingerprint:
+        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
 
 
 def _invocation_id(value, *, prior: bool = False) -> str | None:
@@ -1090,6 +1134,11 @@ class WP8ProductionSystemdBackend:
     Phase A evidence is a binding, not execution authorization. A protected
     orchestrator must establish B authority before using any mutation method.
     In-process single-flight is not cross-process cutover serialization.
+    The caller must hold the future protected operation lock and exclude P3D,
+    P3C, Gate B/C, package/config maintenance and manual systemd/current changes.
+    Two complete observations detect observable drift, not atomic CAS or ABA.
+    Privileged external mutation after the final observation is an unavoidable
+    API race, outside the cooperative serialization/root-trust guarantee.
     """
 
     def __init__(self, phase_a_evidence: WP8PhaseAEvidenceV1) -> None:
@@ -1182,6 +1231,99 @@ class WP8ProductionSystemdBackend:
     def _show(self, key):
         return _collect_current_service_authority(key)
 
+    def _p3c_authority(self):
+        from .p3d_inert_asset_install import ProductionReadOnlySystemdStateProvider
+        observed = ProductionReadOnlySystemdStateProvider(runner=_p3c_read_adapter).snapshot(post_install=True)
+        if not observed.p3d_quiet or observed.p3c_fingerprint != self._evidence.p3c_systemd_fingerprint:
+            _fail(WP8FailureCode.PREREQUISITE_DRIFT)
+        return {unit: _properties(_p3c_read_adapter((_SYSTEMCTL, "show", unit,
+                "--property=" + ",".join(_STABLE_PROPERTIES))), _STABLE_PROPERTIES)
+                for unit in _p3c_units()}
+
+    def _collect_complete_start_authority_snapshot(self, key):
+        return self._collect_complete_authority_snapshot(key, _JobAuthority.START)
+
+    def _collect_complete_stop_authority_snapshot(self, key):
+        return self._collect_complete_authority_snapshot(key, _JobAuthority.STOP)
+
+    @_boundary(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+    def _collect_complete_authority_snapshot(self, key, direction):
+        """Self-contained collection; never takes another snapshot as input.
+
+        Every loaded text/typed/default/emergency/manager/asset observation is
+        read anew. Completion does not assert an atomic multi-interface view.
+        """
+        key = _key(key)
+        manager = self.manager_identity()
+        runtime = _verify_candidate(self._evidence)
+        assets = _read_assets(self._evidence)
+        timers = {}
+        for other in WP8_CANONICAL_PIPELINE_KEYS:
+            values = _properties(_systemctl(_Request.TIMER_SHOW, other), _TIMER_PROPERTIES)
+            _identity(values, other, timer=True)
+            if values["Unit"] != _SERVICE_UNITS[other]:
+                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+            timers[other] = {name: value for name, value in values.items()
+                             if name not in {"ActiveState", "SubState", "Job"}}
+        p3c = self._p3c_authority()
+        services, loaded = {}, {}
+        selected = WP8_CANONICAL_PIPELINE_KEYS if direction is _JobAuthority.START else (key,)
+        for other in selected:
+            _dependency_directories(other)
+            values = self._show(other)
+            _check_service(values, other, assets)
+            loaded[other] = values
+            services[other] = {"text": _service_authority_text(values),
+                              "typed": {name: values[name] for name in
+                                        (*_EXEC_EMPTY_PROPERTIES, *_UNIT_EMPTY_PROPERTIES)},
+                              "members": _relationship_members(values)}
+        closure = _job_closure(key, loaded[key], assets, direction)
+        # Actual current, not a Phase A cached loaded state. Full runtime proof
+        # above independently binds Gate B; assets bind Gate C/profiles.
+        _current_candidate(self._evidence)
+        _manager_token(manager)
+        payload = {"direction": direction.value, "pipeline": key,
+            "manager": {"fingerprint": manager.fingerprint, "boot": manager.boot_fingerprint,
+                        "host_class": manager.host_class,
+                        "domain": {field: None for field in manager.authority_domain},
+                        "continuity": manager.continuity_token},
+            "context": {"candidate": self._evidence.candidate_sha,
+                        "phase_a": self._evidence.phase_a_context_fingerprint,
+                        "current_candidate": self._evidence.candidate_sha,
+                        "gate_b": self._evidence.gate_b_authority_binding_fingerprint,
+                        "gate_c": self._evidence.gate_c_authority_binding_fingerprint},
+            "runtime": runtime, "assets": assets.fingerprint, "services": services,
+            "timers": timers, "p3c": {unit: {name: value for name, value in values.items()
+                if name not in {"ActiveState", "SubState"}} for unit, values in p3c.items()},
+            "closure": closure.authority}
+        return _MutationSnapshot(_schema_domain(payload), contract_fingerprint(payload), manager, closure)
+
+    def _final_runtime_prerequisites(self, key, snapshot, *, starting):
+        """Bounded reads after A/B equality; no tree hash or graph traversal.
+
+        Current observations cannot prevent an external privileged mutation
+        between their completion and systemd accepting the fixed command.
+        """
+        _manager_token(snapshot.manager)
+        self._observe_timers(manager=snapshot.manager)
+        self._p3c_authority()
+        for unit, job, expected in snapshot.closure.runtime:
+            values = _properties(_systemctl(_Request.DEFAULT_SHOW, unit), _DEFAULT_PROPERTIES)
+            if tuple(values[name] for name in ("ActiveState", "SubState", "Job")) != expected:
+                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+        target = None
+        selected = tuple(other for other in WP8_CANONICAL_PIPELINE_KEYS if other != key) + (key,) if starting else (key,)
+        for other in selected:
+            values = _properties(_systemctl(_Request.SERVICE_RUNTIME_SHOW, other),
+                                 tuple(name for name in _SERVICE_PROPERTIES if name in _SERVICE_RUNTIME_PROPERTIES))
+            if starting:
+                _require_inactive(values)
+            if other == key:
+                target = values
+        _current_candidate(self._evidence)
+        _manager_token(snapshot.manager)
+        return target
+
     @_boundary(WP8FailureCode.SERVICE_CONTRACT_INVALID)
     def verify_service_contract(self, pipeline_key: str) -> str:
         key = _key(pipeline_key)
@@ -1203,46 +1345,11 @@ class WP8ProductionSystemdBackend:
         if not self._flight.acquire(blocking=False):
             _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED, _Outcome.BUSY)
         try:
-            manager = self.manager_identity()
-            # Observe all installed timers before taking the contract baseline:
-            # loading a timer can expose its benign inverse TriggeredBy edge.
-            self.verify_timers_quiet()
-            # Preserve the precise contract-rejection boundary before the
-            # aggregate activity check, which otherwise reports CLEANUP_FAILED.
-            _check_service(self._show(key), key, _read_assets(self._evidence))
-            self.verify_all_services_inactive()
-            self.snapshot_p3c()
-            contract = self.verify_service_contract(key)
-            # The LAST full manager proof is before both fresh static authority
-            # validation and the COMPLETE final mutable-prerequisite bundle.
-            # Drift during this proof cannot be detected only AFTER start.
-            if manager != self.manager_identity():
-                _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
-            runtime = _verify_candidate(self._evidence)
-            assets = _read_assets(self._evidence)
-            for other in WP8_CANONICAL_PIPELINE_KEYS:
-                _dependency_directories(other)
-            source = self._show(key)
-            direct = _check_service(source, key, assets)
-            closure = _start_closure(key, source, assets)
-            if contract != contract_fingerprint({"service_contract": direct, "runtime": runtime,
-                    "context": self._evidence.phase_a_context_fingerprint, "closure": closure.fingerprint}):
-                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-            # From here: bounded current reads only, no full manager proof,
-            # release/profile hashes, directory scan, or recursive graph walk.
-            _manager_token(manager)
-            _closure_continuity(closure)
-            self._observe_timers(manager=manager)
-            for other in WP8_CANONICAL_PIPELINE_KEYS:
-                values = self._show(other)
-                _check_service(values, other, assets)
-                _require_inactive(values)
-            _current_candidate(self._evidence)
-            _manager_token(manager)
-            before = self._show(key)
-            if _check_service(before, key, assets) != direct:
-                _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
-            _require_inactive(before)
+            first = self._collect_complete_start_authority_snapshot(key)
+            second = self._collect_complete_start_authority_snapshot(key)
+            _same_snapshot(first, second)
+            manager, contract = second.manager, second.fingerprint
+            before = self._final_runtime_prerequisites(key, second, starting=True)
             prior_start = int(before["ExecMainStartTimestampMonotonic"])
             prior_invocation = _invocation_id(before["InvocationID"], prior=True)
             # The last observation before fixed start. No candidate tree walk,
@@ -1263,8 +1370,8 @@ class WP8ProductionSystemdBackend:
             invocation = _invocation_id(after["InvocationID"])
             if invocation == prior_invocation:
                 _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
-            if manager != self.manager_identity() or contract != self.verify_service_contract(key):
-                _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
+            post = self._collect_complete_start_authority_snapshot(key)
+            _same_snapshot(second, post)
             self.verify_all_services_inactive()
             self.verify_timers_quiet()
             self.snapshot_p3c()
@@ -1330,19 +1437,16 @@ class WP8ProductionSystemdBackend:
                     # Stop can propagate through the loaded graph. Prove each
                     # target BEFORE mutating; an unsafe target is skipped while
                     # remaining targets are independently evaluated.
-                    manager = self.manager_identity()
-                    assets = _read_assets(self._evidence)
-                    _dependency_directories(key)
-                    authority = _check_service(self._show(key), key, assets)
-                    if manager != self.manager_identity():
-                        _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
-                    if _check_service(self._show(key), key, assets) != authority:
-                        _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
+                    first = self._collect_complete_stop_authority_snapshot(key)
+                    second = self._collect_complete_stop_authority_snapshot(key)
+                    _same_snapshot(first, second)
+                    self._final_runtime_prerequisites(key, second, starting=False)
                     stop_requested = True
                     result = _systemctl(_Request.SERVICE_STOP, key)
                     outcome = _Outcome.SUCCESS if result.returncode == 0 else _Outcome.COMMAND_FAILED
-                    if manager != self.manager_identity():
-                        _fail(WP8FailureCode.SYSTEMD_MANAGER_INVALID)
+                    post = self._collect_complete_stop_authority_snapshot(key)
+                    _same_snapshot(second, post)
+                    _require_inactive(self._show(key))
                 except _BackendError as exc:
                     # Failed evidence reads are not issued stop commands.
                     outcome = exc.outcome if stop_requested else _Outcome.EVIDENCE_REJECTED
@@ -1350,6 +1454,13 @@ class WP8ProductionSystemdBackend:
                     outcome = _Outcome.EVIDENCE_REJECTED
                 outcomes.append((key, outcome))  # no short circuit, including timeouts
             final = self._inactive_facts()
+            # A failed authority/post-continuity proof cannot be upgraded to a
+            # confirmed cleanup just because a later activity read is inactive.
+            final = _ServiceStates(tuple(_ServiceState(state.pipeline_key,
+                "NOT_CONFIRMED" if outcome is _Outcome.EVIDENCE_REJECTED else state.state)
+                for (_, outcome), state in zip(outcomes, final.services, strict=True)), final.service_state)
+            final = _ServiceStates(final.services, "INACTIVE" if all(
+                state.state == "INACTIVE" for state in final.services) else "NOT_CONFIRMED")
             try:
                 timers = self.verify_timers_quiet().timer_state
             except BaseException:
