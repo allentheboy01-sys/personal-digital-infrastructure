@@ -1233,12 +1233,33 @@ class WP8ProductionSystemdBackend:
 
     def _p3c_authority(self):
         from .p3d_inert_asset_install import ProductionReadOnlySystemdStateProvider
-        observed = ProductionReadOnlySystemdStateProvider(runner=_p3c_read_adapter).snapshot(post_install=True)
+        # Bind fresh shows to the actual observations consumed by the frozen
+        # fingerprint/health algorithm in THIS collection, not a cached PASS.
+        reads, shown = {}, {}
+        def read(argv, **kwargs):
+            result = _p3c_read_adapter(argv, **kwargs)
+            if argv[2] in _p3c_units():
+                if argv[1] == "show":
+                    values = _properties(result, _STABLE_PROPERTIES, WP8FailureCode.PREREQUISITE_DRIFT)
+                    if (values["UnitFileState"] != reads.get((argv[2], "is-enabled")) or
+                            values["ActiveState"] != reads.get((argv[2], "is-active"))):
+                        _fail(WP8FailureCode.PREREQUISITE_DRIFT)
+                    shown[argv[2]] = values
+                else:
+                    reads[(argv[2], argv[1])] = result.stdout.strip()
+            return result
+        observed = ProductionReadOnlySystemdStateProvider(runner=read).snapshot(post_install=True)
         if not observed.p3d_quiet or observed.p3c_fingerprint != self._evidence.p3c_systemd_fingerprint:
             _fail(WP8FailureCode.PREREQUISITE_DRIFT)
-        return {unit: _properties(_p3c_read_adapter((_SYSTEMCTL, "show", unit,
-                "--property=" + ",".join(_STABLE_PROPERTIES))), _STABLE_PROPERTIES)
-                for unit in _p3c_units()}
+        fresh = {}
+        for unit in _p3c_units():
+            values = _properties(_p3c_read_adapter((_SYSTEMCTL, "show", unit,
+                "--property=" + ",".join(_STABLE_PROPERTIES))), _STABLE_PROPERTIES,
+                WP8FailureCode.PREREQUISITE_DRIFT)
+            if values != shown.get(unit):
+                _fail(WP8FailureCode.PREREQUISITE_DRIFT)
+            fresh[unit] = values
+        return fresh
 
     def _collect_complete_start_authority_snapshot(self, key):
         return self._collect_complete_authority_snapshot(key, _JobAuthority.START)
@@ -1308,8 +1329,13 @@ class WP8ProductionSystemdBackend:
         self._observe_timers(manager=snapshot.manager)
         self._p3c_authority()
         for unit, job, expected in snapshot.closure.runtime:
-            values = _properties(_systemctl(_Request.DEFAULT_SHOW, unit), _DEFAULT_PROPERTIES)
-            if tuple(values[name] for name in ("ActiveState", "SubState", "Job")) != expected:
+            # Reuse the collector's strict loaded/typed validation and stable
+            # projection. Returned graph authority is evidence, not ignorable
+            # runtime-query surplus. No graph walk or fragment hash is needed.
+            values = _default_show(unit)
+            _default_authority(values, unit, job)
+            if (_stable_default(values) != snapshot.closure.authority["defaults"].get(f"{unit}:{job.value}") or
+                    tuple(values[name] for name in ("ActiveState", "SubState", "Job")) != expected):
                 _fail(WP8FailureCode.SERVICE_CONTRACT_INVALID)
         target = None
         selected = tuple(other for other in WP8_CANONICAL_PIPELINE_KEYS if other != key) + (key,) if starting else (key,)
