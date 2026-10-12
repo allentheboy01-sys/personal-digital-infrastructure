@@ -1032,6 +1032,84 @@ def _require_inactive(values) -> None:
         _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
 
 
+@dataclass(frozen=True, slots=True)
+class _ExecutionAttestationV1:
+    """Same-call verified preimage, NOT a signature or operation authority.
+
+    Only start_service's successful return produces this handoff. Parsing or
+    recomputing a caller-created instance cannot prove execution, authorization
+    consumption, DB attribution, or replay resistance.
+    """
+
+    version: int
+    pipeline_key: str
+    unit: str
+    candidate_sha: str
+    phase_a_context_fingerprint: str
+    manager_fingerprint: str
+    unit_contract_fingerprint: str
+    start_monotonic_usec: int
+    exit_monotonic_usec: int
+    invocation_fingerprint: str
+    result: str
+    exit_status: int
+    service_result_fingerprint: str
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        if (type(self.version) is not int or self.version != 1 or
+                type(self.pipeline_key) is not str or self.pipeline_key not in _SERVICE_UNITS or
+                type(self.unit) is not str or self.unit != _SERVICE_UNITS[self.pipeline_key] or
+                type(self.candidate_sha) is not str or not re.fullmatch(r"[0-9a-f]{40}", self.candidate_sha) or
+                any(type(value) is not str or not re.fullmatch(r"[0-9a-f]{64}", value) for value in (
+                    self.phase_a_context_fingerprint, self.manager_fingerprint,
+                    self.unit_contract_fingerprint, self.invocation_fingerprint,
+                    self.service_result_fingerprint)) or
+                type(self.start_monotonic_usec) is not int or self.start_monotonic_usec <= 0 or
+                type(self.exit_monotonic_usec) is not int or self.exit_monotonic_usec < self.start_monotonic_usec or
+                type(self.result) is not str or self.result != "success" or
+                type(self.exit_status) is not int or self.exit_status != 0):
+            _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
+        if self.recompute_service_result_fingerprint() != self.service_result_fingerprint:
+            _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
+
+    def recompute_service_result_fingerprint(self) -> str:
+        """The unchanged ten-key service-result commitment, not a new hash."""
+        return contract_fingerprint({
+            "candidate": self.candidate_sha, "context": self.phase_a_context_fingerprint,
+            "pipeline": self.pipeline_key, "manager": self.manager_fingerprint,
+            "contract": self.unit_contract_fingerprint, "start": self.start_monotonic_usec,
+            "exit": self.exit_monotonic_usec, "invocation_hash": self.invocation_fingerprint,
+            "result": self.result, "exit_status": self.exit_status,
+        })
+
+    def validate_binding(self, evidence: WP8PhaseAEvidenceV1, *, pipeline_key: str) -> None:
+        """Pure comparison to already-validated bindings; does not authorize B."""
+        self._validate()
+        if (type(evidence) is not WP8PhaseAEvidenceV1 or
+                self.candidate_sha != evidence.candidate_sha or
+                self.phase_a_context_fingerprint != evidence.phase_a_context_fingerprint or
+                self.pipeline_key != _key(pipeline_key)):
+            _fail(WP8FailureCode.SERVICE_EXECUTION_FAILED)
+
+    def to_mapping(self) -> dict[str, str | int]:
+        self._validate()
+        return {
+            "version": self.version, "pipeline_key": self.pipeline_key, "unit": self.unit,
+            "candidate_sha": self.candidate_sha,
+            "phase_a_context_fingerprint": self.phase_a_context_fingerprint,
+            "manager_fingerprint": self.manager_fingerprint,
+            "unit_contract_fingerprint": self.unit_contract_fingerprint,
+            "start_monotonic_usec": self.start_monotonic_usec,
+            "exit_monotonic_usec": self.exit_monotonic_usec,
+            "invocation_fingerprint": self.invocation_fingerprint,
+            "result": self.result, "exit_status": self.exit_status,
+            "service_result_fingerprint": self.service_result_fingerprint,
+        }
+
+
 @dataclass(frozen=True)
 class _ServiceResult:
     pipeline_key: str
@@ -1041,6 +1119,7 @@ class _ServiceResult:
     unit_contract_fingerprint: str
     service_result_fingerprint: str
     final_state: str
+    execution_attestation: _ExecutionAttestationV1
 
 
 @dataclass(frozen=True)
@@ -1408,8 +1487,20 @@ class WP8ProductionSystemdBackend:
                 "start": start, "exit": end, "invocation_hash": _digest(invocation.encode()),
                 "result": "success", "exit_status": 0,
             })
+            # Use the same verified locals, after every existing success check.
+            # No post-hoc systemd query, mutable cache, or persistence is added.
+            attestation = _ExecutionAttestationV1(
+                version=1, pipeline_key=key, unit=_SERVICE_UNITS[key],
+                candidate_sha=self._evidence.candidate_sha,
+                phase_a_context_fingerprint=self._evidence.phase_a_context_fingerprint,
+                manager_fingerprint=manager.fingerprint, unit_contract_fingerprint=contract,
+                start_monotonic_usec=start, exit_monotonic_usec=end,
+                invocation_fingerprint=_digest(invocation.encode()), result="success", exit_status=0,
+                service_result_fingerprint=fingerprint,
+            )
+            attestation.validate_binding(self._evidence, pipeline_key=key)
             return _ServiceResult(key, _SERVICE_UNITS[key], _Outcome.SUCCESS,
-                                  manager.fingerprint, contract, fingerprint, "INACTIVE")
+                                  manager.fingerprint, contract, fingerprint, "INACTIVE", attestation)
         finally:
             self._flight.release()
 

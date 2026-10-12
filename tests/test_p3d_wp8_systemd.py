@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import replace
+from dataclasses import fields, FrozenInstanceError, replace
 import hashlib
 import inspect
 import json
@@ -19,7 +19,7 @@ import pytest
 
 from pdi.production_ops import p3d_wp8_systemd as module
 from pdi.production_ops.p3d_inert_asset_install import ProductionReadOnlySystemdStateProvider
-from pdi.production_ops.p3d_preparation_contracts import contract_fingerprint
+from pdi.production_ops.p3d_preparation_contracts import canonical_json_bytes, contract_fingerprint
 from pdi.production_ops.p3d_wp8_contracts import (
     WP8_CANONICAL_PIPELINE_KEYS, WP8CleanupProofV1, WP8CleanupResult,
     WP8ContractError, WP8FailureCode, WP8PipelineRunProofV1,
@@ -507,6 +507,180 @@ def test_valid_fresh_oneshot_service_result_is_frozen_proof_compatible(rig):
     assert proof.service_result_fingerprint == result.service_result_fingerprint
     assert rig.evidence.runtime_pipeline_coverage == "0/6"  # no runtime DB proof manufactured
     assert [argv[4] for argv in rig.runner.mutations()] == ["start"]
+
+
+def _legacy_service_result_payload(attestation):
+    # Independently enumerate the EXISTING ten-key commitment. Do not use the
+    # production attestation's own recompute method to manufacture expectations.
+    return {
+        "candidate": attestation.candidate_sha,
+        "context": attestation.phase_a_context_fingerprint,
+        "pipeline": attestation.pipeline_key,
+        "manager": attestation.manager_fingerprint,
+        "contract": attestation.unit_contract_fingerprint,
+        "start": attestation.start_monotonic_usec,
+        "exit": attestation.exit_monotonic_usec,
+        "invocation_hash": attestation.invocation_fingerprint,
+        "result": attestation.result,
+        "exit_status": attestation.exit_status,
+    }
+
+
+@pytest.mark.parametrize("pipeline", KEYS)
+def test_attestation_exact_fields_immutable_and_legacy_hash_compatible(rig, pipeline):
+    result = rig.backend.start_service(pipeline)
+    attestation = result.execution_attestation
+    expected = {
+        "version", "pipeline_key", "unit", "candidate_sha", "phase_a_context_fingerprint",
+        "manager_fingerprint", "unit_contract_fingerprint", "start_monotonic_usec",
+        "exit_monotonic_usec", "invocation_fingerprint", "result", "exit_status",
+        "service_result_fingerprint",
+    }
+    assert {field.name for field in fields(attestation)} == expected
+    assert set(attestation.to_mapping()) == expected
+    assert not hasattr(attestation, "__dict__")
+    assert attestation.version == 1 and type(attestation.version) is int
+    assert attestation.pipeline_key == result.pipeline_key == pipeline
+    assert attestation.unit == result.unit == f"pdi-scoped-pipeline@{pipeline}.service"
+    assert attestation.candidate_sha == rig.evidence.candidate_sha != rig.evidence.rollback_source_sha
+    assert attestation.phase_a_context_fingerprint == rig.evidence.phase_a_context_fingerprint
+    assert attestation.manager_fingerprint == result.manager_fingerprint
+    assert attestation.unit_contract_fingerprint == result.unit_contract_fingerprint
+    assert (attestation.start_monotonic_usec, attestation.exit_monotonic_usec) == (1100, 1200)
+    assert attestation.invocation_fingerprint == hashlib.sha256(("2" * 32).encode()).hexdigest()
+    assert attestation.result == "success" and type(attestation.exit_status) is int and attestation.exit_status == 0
+    assert all(type(value) in {int, str} for value in attestation.to_mapping().values())
+    legacy = _legacy_service_result_payload(attestation)
+    legacy_bytes = json.dumps(legacy, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+    assert canonical_json_bytes(legacy) == legacy_bytes
+    assert attestation.recompute_service_result_fingerprint() == contract_fingerprint(legacy)
+    assert result.service_result_fingerprint == attestation.service_result_fingerprint == hashlib.sha256(legacy_bytes).hexdigest()
+    attestation.validate_binding(rig.evidence, pipeline_key=pipeline)
+    with pytest.raises(FrozenInstanceError):
+        attestation.result = "failed"
+    with pytest.raises(FrozenInstanceError):
+        result.execution_attestation = None
+    mapping = attestation.to_mapping()
+    mapping["candidate_sha"] = rig.evidence.rollback_source_sha
+    assert attestation.to_mapping()["candidate_sha"] == rig.evidence.candidate_sha
+
+
+@pytest.mark.parametrize("field,value", (
+    ("version", 2), ("version", True), ("pipeline_key", "foreign.pipeline"),
+    ("unit", "foreign.service"), ("unit", f"pdi-scoped-pipeline@{KEYS[1]}.service"),
+    ("candidate_sha", "c" * 40), ("candidate_sha", "x" * 40),
+    ("phase_a_context_fingerprint", "2" * 64), ("manager_fingerprint", "3" * 64),
+    ("unit_contract_fingerprint", "4" * 64), ("invocation_fingerprint", "5" * 64),
+    ("service_result_fingerprint", "6" * 64), ("manager_fingerprint", "A" * 64),
+    ("start_monotonic_usec", 1101), ("start_monotonic_usec", 0), ("start_monotonic_usec", True),
+    ("exit_monotonic_usec", 1201), ("exit_monotonic_usec", 1099), ("exit_monotonic_usec", "1200"),
+    ("result", "failed"), ("result", CANARY), ("exit_status", 1), ("exit_status", False),
+))
+def test_attestation_rejects_tampering_schema_or_non_success(rig, field, value):
+    attestation = rig.backend.start_service(KEYS[0]).execution_attestation
+    with pytest.raises(WP8ContractError) as caught:
+        replace(attestation, **{field: value})
+    assert caught.value.code is WP8FailureCode.SERVICE_EXECUTION_FAILED
+    assert CANARY not in str(caught.value)
+
+
+@pytest.mark.parametrize("foreign", ("candidate", "rollback_source", "context", "pipeline"))
+def test_self_consistent_foreign_attestation_is_not_current_context_authority(rig, foreign):
+    attestation = rig.backend.start_service(KEYS[0]).execution_attestation
+    values = attestation.to_mapping()
+    if foreign == "candidate":
+        values["candidate_sha"] = "c" * 40
+    elif foreign == "rollback_source":
+        values["candidate_sha"] = rig.evidence.rollback_source_sha
+    elif foreign == "context":
+        values["phase_a_context_fingerprint"] = "2" * 64
+    else:
+        values.update(pipeline_key=KEYS[1], unit=f"pdi-scoped-pipeline@{KEYS[1]}.service")
+    # A hash-consistent caller object can be constructed: hashing is NOT proof
+    # of origin, authorization or freshness. Still reject the expected binding.
+    reference = SimpleNamespace(**values)
+    values["service_result_fingerprint"] = contract_fingerprint(_legacy_service_result_payload(reference))
+    foreign_attestation = module._ExecutionAttestationV1(**values)
+    with pytest.raises(WP8ContractError):
+        foreign_attestation.validate_binding(rig.evidence, pipeline_key=KEYS[0])
+
+
+def test_attestation_canonical_serialization_is_safe_pure_and_rechecks_tampering(rig, monkeypatch):
+    attestation = rig.backend.start_service(KEYS[0]).execution_attestation
+    before = list(rig.runner.calls)
+    def forbidden(*_, **__):
+        pytest.fail("pure attestation evaluation performed IO")
+    monkeypatch.setattr(module.subprocess, "run", forbidden)
+    monkeypatch.setattr(Path, "read_bytes", forbidden)
+    monkeypatch.setattr(Path, "write_bytes", forbidden)
+    monkeypatch.setattr(module.os, "open", forbidden)
+    attestation.validate_binding(rig.evidence, pipeline_key=KEYS[0])
+    encoded = canonical_json_bytes(attestation)
+    assert encoded == canonical_json_bytes(attestation.to_mapping())
+    assert contract_fingerprint(attestation) == hashlib.sha256(encoded).hexdigest()
+    text = encoded.decode() + repr(attestation)
+    for forbidden_text in (CANARY, "2" * 32, "InvocationID", "ExecStart", "EnvironmentFiles",
+                           "stderr", "DATABASE__URL", "authorization", "operation_id", "/opt/", "/etc/"):
+        assert forbidden_text not in text
+    assert rig.runner.calls == before and rig.evidence.runtime_pipeline_coverage == "0/6"
+    # Python frozen dataclasses are not a cryptographic seal; re-validation must
+    # catch deliberate low-level mutation instead of trusting the frozen flag.
+    object.__setattr__(attestation, "invocation_fingerprint", "5" * 64)
+    with pytest.raises(WP8ContractError):
+        attestation.to_mapping()
+    with pytest.raises(WP8ContractError):
+        attestation.validate_binding(rig.evidence, pipeline_key=KEYS[0])
+
+
+@pytest.mark.parametrize("failure", ("command", "timeout", "stale", "outcome", "post_authority",
+                                    "final_inactive", "final_timers", "final_p3c"))
+def test_failed_start_never_constructs_success_attestation(rig, monkeypatch, failure):
+    constructed = []
+    def forbidden_attestation(**values):
+        constructed.append(values)
+        pytest.fail("failed call constructed a success attestation")
+    monkeypatch.setattr(module, "_ExecutionAttestationV1", forbidden_attestation)
+    if failure in {"command", "timeout"}:
+        rig.runner.failures[("start", module._SERVICE_UNITS[KEYS[0]])] = (
+            1 if failure == "command" else subprocess.TimeoutExpired("fixed", 1800, output=CANARY))
+    elif failure == "stale":
+        rig.runner.fresh = False
+    elif failure == "outcome":
+        rig.runner.after_start = {"ExecMainStatus": "7"}
+    elif failure == "post_authority":
+        def runtime(_):
+            return "2" * 64 if rig.runner.mutations() else H
+        monkeypatch.setattr(module, "_verify_candidate", runtime)
+    else:
+        helper = {"final_inactive": "verify_all_services_inactive", "final_timers": "verify_timers_quiet",
+                  "final_p3c": "snapshot_p3c"}[failure]
+        original = getattr(rig.backend, helper)
+        def reject_after_start():
+            if rig.runner.mutations():
+                module._fail(WP8FailureCode.PREREQUISITE_DRIFT)
+            return original()
+        monkeypatch.setattr(rig.backend, helper, reject_after_start)
+    with pytest.raises(WP8ContractError) as caught:
+        rig.backend.start_service(KEYS[0])
+    assert not constructed and CANARY not in str(caught.value)
+    assert [argv[4] for argv in rig.runner.mutations()] == ["start"]
+
+
+def test_two_success_calls_keep_distinct_same_invocation_attestations(rig, monkeypatch):
+    first = rig.backend.start_service(KEYS[0]).execution_attestation
+    first_mapping = first.to_mapping()
+    rig.runner.after_start = dict(ExecMainStartTimestampMonotonic="3100",
+        ExecMainExitTimestampMonotonic="3200", InvocationID="3" * 32)
+    monkeypatch.setattr(module.time, "monotonic_ns", lambda: 3_000_000 if len(rig.runner.mutations()) == 1 else 4_000_000)
+    second = rig.backend.start_service(KEYS[0]).execution_attestation
+    assert first is not second and first.to_mapping() == first_mapping
+    assert (second.start_monotonic_usec, second.exit_monotonic_usec) == (3100, 3200)
+    assert second.invocation_fingerprint == hashlib.sha256(("3" * 32).encode()).hexdigest()
+    assert first.invocation_fingerprint != second.invocation_fingerprint
+    assert first.service_result_fingerprint != second.service_result_fingerprint
+    assert first.unit_contract_fingerprint == second.unit_contract_fingerprint
+    assert [argv[4] for argv in rig.runner.mutations()] == ["start", "start"]
 
 
 def test_single_flight_refuses_concurrent_start_without_second_command(rig):

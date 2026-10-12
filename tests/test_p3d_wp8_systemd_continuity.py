@@ -1,6 +1,7 @@
 """Independent complete-snapshot and residual-race protocol tests (no real IO)."""
 
 from dataclasses import replace
+import hashlib
 import json
 import subprocess
 
@@ -287,6 +288,54 @@ def test_complete_protocol_no_persistent_lock_or_extra_public_api(rig, monkeypat
     assert {name for name in dir(type(rig.backend)) if not name.startswith("_")} == {
         "manager_identity", "daemon_reload", "snapshot_p3c", "verify_timers_quiet", "verify_service_contract",
         "start_service", "stop_all_services", "verify_all_services_inactive"}
+
+
+def test_attestation_emitted_after_all_checks_from_second_full_snapshot_and_original_execution(rig, monkeypatch):
+    snapshots, verified, emitted = [], [], []
+    collector = rig.backend._collect_complete_start_authority_snapshot
+    constructor = module._ExecutionAttestationV1
+    transport = rig.runner
+    def collect(key):
+        value = collector(key)
+        snapshots.append(value)
+        if len(snapshots) == 3:
+            # Volatile systemd values can be replaced AFTER the original exit
+            # observation. Handoff must use that observation, not reread them.
+            rig.runner.services[key].update(InvocationID="3" * 32,
+                ExecMainStartTimestampMonotonic="3100", ExecMainExitTimestampMonotonic="3200")
+        return value
+    for name in ("verify_all_services_inactive", "verify_timers_quiet", "snapshot_p3c"):
+        original = getattr(rig.backend, name)
+        def check(original=original, name=name):
+            value = original()
+            if len(snapshots) == 3:
+                verified.append(name)
+            return value
+        monkeypatch.setattr(rig.backend, name, check)
+    def produce(**values):
+        assert len(snapshots) == 3
+        assert verified == ["verify_all_services_inactive", "verify_timers_quiet", "snapshot_p3c"]
+        assert values["unit_contract_fingerprint"] == snapshots[1].fingerprint
+        assert values["manager_fingerprint"] == snapshots[1].manager.fingerprint
+        emitted.append(dict(values))
+        return constructor(**values)
+    def runner(argv, **kwargs):
+        assert not emitted, "attestation must not perform post-hoc systemd IO"
+        return transport(argv, **kwargs)
+    monkeypatch.setattr(rig.backend, "_collect_complete_start_authority_snapshot", collect)
+    monkeypatch.setattr(module, "_ExecutionAttestationV1", produce)
+    monkeypatch.setattr(module.subprocess, "run", runner)
+    def not_the_full_snapshot(*_, **__):
+        pytest.fail("standalone service-contract hash substituted for full authority snapshot")
+    monkeypatch.setattr(rig.backend, "verify_service_contract", not_the_full_snapshot)
+    result = rig.backend.start_service(PIPELINES[0])
+    assert len(emitted) == 1 and result.execution_attestation.to_mapping() == emitted[0]
+    assert result.execution_attestation.start_monotonic_usec == 1100
+    assert result.execution_attestation.exit_monotonic_usec == 1200
+    assert result.execution_attestation.invocation_fingerprint == hashlib.sha256(("2" * 32).encode()).hexdigest()
+    assert [argv[4] for argv in rig.runner.mutations()] == ["start"]
+    assert all(argv[0] == "/usr/bin/busctl" or argv[4] in {"start", "show", "is-active", "is-enabled"}
+               for argv, _ in rig.runner.calls)
 
 
 @pytest.mark.parametrize("pipeline", PIPELINES)
