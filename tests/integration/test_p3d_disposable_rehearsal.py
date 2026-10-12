@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from base64 import b64encode
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 from uuid import UUID, uuid4
+from unittest.mock import Mock
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from alembic import command
@@ -27,6 +28,7 @@ from alembic.config import Config
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError
 
 from pdi.database import create_postgres_engine
 from pdi.production_ops.contracts import QUALIFICATION, parse_env
@@ -52,9 +54,11 @@ from pdi.production_ops.p3d_release_bootstrap import (
 )
 from pdi.provider_identity import PostgreSQLProviderIdentityRepository
 from pdi.scope_sync_state import PostgreSQLScopeSyncStateRepository
-from tests.integration.database_guard import require_safe_test_database_url
+from tests.integration.database_guard import (
+    parse_safe_test_database_url,
+    require_safe_test_database_url,
+)
 from tests.integration.test_p3d_inert_asset_install import (
-    _clean,
     _create_complete_gate_a,
     _write,
 )
@@ -3442,13 +3446,67 @@ def _interpreter_probe_required(diagnostic: _ServiceFailureDiagnostic) -> bool:
     )
 
 
-def _seed_database(url: str):
-    engine = create_postgres_engine(url)
+@dataclass(frozen=True)
+class _RehearsalDatabase:
+    control_url: str = field(repr=False)
+    url: str = field(repr=False)
+    oid: int
+    owner: int
+
+
+@contextmanager
+def _database_control_connection(control_url: str):
+    parsed = parse_safe_test_database_url(control_url)
+    assert parsed.host in {"127.0.0.1", "::1", "localhost"}
+    assert not parsed.query, "test database target overrides are not allowed"
+    engine = create_postgres_engine(control_url)
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+            assert connection.scalar(text("SELECT current_database()")) == parsed.database
+            yield connection
+    finally:
+        engine.dispose()
+
+
+def _create_rehearsal_database(control_url: str) -> _RehearsalDatabase:
+    # Own the entire fixture lifetime, not rows protected by immutable receipts.
+    name = f"pdi_wp7_{uuid4().hex}_test"
+    with _database_control_connection(control_url) as connection:
+        connection.execute(text(f'CREATE DATABASE "{name}" TEMPLATE template0'))
+        identity = connection.execute(text(
+            "SELECT oid, datdba FROM pg_database WHERE datname=:name"
+        ), {"name": name}).one()
+    return _RehearsalDatabase(
+        control_url,
+        make_url(control_url).set(database=name).render_as_string(hide_password=False),
+        identity[0],
+        identity[1],
+    )
+
+
+def _drop_rehearsal_database(database: _RehearsalDatabase) -> None:
+    control = make_url(database.control_url)
+    target = make_url(database.url)
+    name = target.database or ""
+    assert re.fullmatch(r"pdi_wp7_[0-9a-f]{32}_test", name)
+    assert name != control.database and target == control.set(database=name)
+    with _database_control_connection(database.control_url) as connection:
+        identity = connection.execute(text(
+            "SELECT oid, datdba FROM pg_database WHERE datname=:name"
+        ), {"name": name}).one()
+        assert tuple(identity) == (database.oid, database.owner), "test DB identity changed"
+        # Never FORCE/terminate clients: consumers must already have stopped.
+        connection.execute(text(f'DROP DATABASE "{name}"'))
+        assert connection.scalar(text(
+            "SELECT count(*) FROM pg_database WHERE datname=:name"
+        ), {"name": name}) == 0
+
+
+def _seed_database(engine):
     with engine.connect() as connection:
         config = Config(str(ROOT / "alembic.ini"))
         config.attributes["connection"] = connection
         command.upgrade(config, "head")
-    _clean(engine)
     identities = PostgreSQLProviderIdentityRepository(engine)
     scopes = {}
     for provider, enabled in (
@@ -3569,13 +3627,6 @@ def _seed_database(url: str):
             checkpoint=f"synthetic-{provider}",
         ) is not None
     return engine, scopes
-
-
-def _clean_rehearsal_database(engine) -> None:
-    with engine.begin() as connection:
-        connection.execute(text("DELETE FROM resource_statements"))
-        connection.execute(text("DELETE FROM resource_enrichments"))
-    _clean(engine)
 
 
 def _tree_snapshot(paths: tuple[Path, ...]) -> str:
@@ -6300,6 +6351,125 @@ def _terminate_machine(machine: str, process: subprocess.Popen) -> bool:
     return process.poll() is not None
 
 
+@pytest.mark.parametrize("url", (
+    "postgresql+psycopg://synthetic@remote.invalid/pdi_wp7_control_test",
+    "postgresql+psycopg://synthetic@127.0.0.1/production",
+    "postgresql+psycopg://synthetic@127.0.0.1/pdi_wp7_control_test?host=remote.invalid",
+))
+def test_rehearsal_database_rejects_untrusted_control_before_connect(monkeypatch, url):
+    create = Mock()
+    monkeypatch.setattr(f"{__name__}.create_postgres_engine", create)
+    with pytest.raises((AssertionError, ValueError)):
+        _create_rehearsal_database(url)
+    create.assert_not_called()
+
+
+def _fake_database_control(monkeypatch, *, identity=(1234, 5678)):
+    connection = Mock()
+    connection.execute.return_value.one.return_value = identity
+    connection.scalar.return_value = 0
+
+    @contextmanager
+    def control(_url):
+        yield connection
+
+    monkeypatch.setattr(f"{__name__}._database_control_connection", control)
+    return connection
+
+
+def test_rehearsal_database_drop_only_matches_created_identity(monkeypatch):
+    connection = _fake_database_control(monkeypatch)
+    control = "postgresql+psycopg://synthetic@127.0.0.1/pdi_wp7_control_test"
+    database = _create_rehearsal_database(control)
+    assert re.fullmatch(r"pdi_wp7_[0-9a-f]{32}_test", make_url(database.url).database)
+    assert "synthetic" not in repr(database)
+    _drop_rehearsal_database(database)
+    statements = [str(call.args[0]) for call in connection.execute.call_args_list]
+    assert sum(statement.startswith("CREATE DATABASE") for statement in statements) == 1
+    assert sum(statement.startswith("DROP DATABASE") for statement in statements) == 1
+    assert not any("FORCE" in statement or "DELETE" in statement or "TRIGGER" in statement
+                   for statement in statements)
+
+
+@pytest.mark.parametrize("change", (
+    {"oid": 9999}, {"owner": 9999},
+    {"url": "postgresql+psycopg://synthetic@127.0.0.1/pdi_wp7_control_test"},
+    {"url": "postgresql+psycopg://synthetic@remote.invalid/pdi_wp7_" + "a" * 32 + "_test"},
+))
+def test_rehearsal_database_drop_rejects_identity_or_target_drift(monkeypatch, change):
+    connection = _fake_database_control(monkeypatch)
+    database = _create_rehearsal_database(
+        "postgresql+psycopg://synthetic@127.0.0.1/pdi_wp7_control_test"
+    )
+    connection.reset_mock()
+    with pytest.raises(AssertionError):
+        _drop_rehearsal_database(replace(database, **change))
+    assert not any(str(call.args[0]).startswith("DROP DATABASE")
+                   for call in connection.execute.call_args_list)
+
+
+def test_rehearsal_database_cleanup_preserves_receipt_protection():
+    control_url = require_safe_test_database_url()
+    database = _create_rehearsal_database(control_url)
+    engine = create_postgres_engine(database.url)
+    try:
+        _seed_database(engine)
+        run_id, receipt_id = uuid4(), uuid4()
+        with engine.begin() as connection:
+            assert int(connection.scalar(text("SHOW server_version_num"))) // 10000 == 16
+            connection.execute(text(
+                "INSERT INTO pipeline_runs "
+                "(id,pipeline_key,kind,status,started_at,invocation_fingerprint) "
+                "VALUES (:id,'enrichment.file_metadata','enrichment','running',now(),:hash)"
+            ), {"id": run_id, "hash": H1})
+            # A synthetic constraint fixture, not claimed as runtime/effect proof.
+            connection.execute(text(
+                "INSERT INTO pipeline_run_effect_receipts "
+                "(id,pipeline_run_id,pipeline_key,subject_asset_id,generator_type,"
+                "generator_name,generator_version,input_fingerprint,completed_at,"
+                "created_statement_ids,deactivated_statement_ids,current_statement_ids,"
+                "source_ids,statement_write_count,deactivated_statement_count,"
+                "current_statement_count,enrichment_state_fingerprint,"
+                "statement_effect_fingerprint,source_binding_fingerprint,fragment_fingerprint) "
+                "SELECT :id,:run,'enrichment.file_metadata',asset.id,'synthetic',"
+                "'cleanup','1',:hash,now(),'{}'::uuid[],'{}'::uuid[],'{}'::uuid[],"
+                "ARRAY[source.id],0,0,0,:hash,:hash,:hash,:hash "
+                "FROM assets asset JOIN blobs blob ON blob.asset_id=asset.id "
+                "JOIN asset_sources source ON source.blob_id=blob.id LIMIT 1"
+            ), {"id": receipt_id, "run": run_id, "hash": H1})
+        for statement, code in (
+            ("DELETE FROM pipeline_runs", "23503"),
+            ("DELETE FROM pipeline_run_effect_receipts", "55000"),
+            ("UPDATE pipeline_run_effect_receipts SET generator_name='changed'", "55000"),
+        ):
+            with pytest.raises(DBAPIError) as error, engine.begin() as connection:
+                connection.execute(text(statement))
+            assert error.value.orig.sqlstate == code
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM pipeline_runs")) == 1
+            assert connection.scalar(text("SELECT count(*) FROM pipeline_run_effect_receipts")) == 1
+    finally:
+        engine.dispose()
+        _drop_rehearsal_database(database)
+    with _database_control_connection(control_url) as connection:
+        assert connection.scalar(text(
+            "SELECT count(*) FROM pg_database WHERE datname=:name"
+        ), {"name": make_url(database.url).database}) == 0
+        assert connection.scalar(text("SELECT current_database()")) == make_url(control_url).database
+
+
+def test_rehearsal_database_cleanup_after_partial_seed_failure(monkeypatch):
+    database = _create_rehearsal_database(require_safe_test_database_url())
+    engine = create_postgres_engine(database.url)
+    monkeypatch.setattr(command, "upgrade", Mock(side_effect=RuntimeError("synthetic seed failure")))
+    try:
+        with pytest.raises(RuntimeError, match="synthetic seed failure"):
+            _seed_database(engine)
+    finally:
+        engine.dispose()
+        _drop_rehearsal_database(database)
+
+
 @pytest.mark.skipif(os.geteuid() != 0, reason="WP7 requires disposable root authority")
 def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     bundle, digest_path, root, system_python, candidate = _environment()
@@ -6333,6 +6503,7 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     )
     host_before = _tree_snapshot(host_paths)
     host_systemd_before = _host_systemd_snapshot()
+    database = None
     engine = None
     machine_process = None
     diagnostic_streams = []
@@ -6342,8 +6513,11 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
     db_cleaned = False
     filesystem_cleaned = False
     try:
+        database = _create_rehearsal_database(url)
+        url = database.url
+        engine = create_postgres_engine(url)
         with _provider_fixture() as (provider_port, fixture):
-            engine, scopes = _seed_database(url)
+            engine, scopes = _seed_database(engine)
             releases_root = root / "opt/pdi/releases"
             preparation_root = root / "var/lib/pdi-p3d/preparation"
             bootstrap_lock = root / "run/lock/pdi/p3d-release-bootstrap.lock"
@@ -6698,13 +6872,17 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
         for stream in diagnostic_streams:
             stream.close()
         if engine is not None:
-            _clean_rehearsal_database(engine)
-            with engine.connect() as connection:
-                db_cleaned = connection.scalar(text("SELECT count(*) FROM pipeline_runs")) == 0
             engine.dispose()
-        if root.exists():
-            shutil.rmtree(root)
-        filesystem_cleaned = not root.exists()
+        # Preserve disposable resources if manager termination is unconfirmed.
+        assert machine_process is None or manager_cleaned, "disposable manager still running"
+        try:
+            if database is not None:
+                _drop_rehearsal_database(database)
+                db_cleaned = True
+        finally:
+            if root.exists():
+                shutil.rmtree(root)
+            filesystem_cleaned = not root.exists()
 
     assert complete_fingerprint is not None
     assert manager_cleaned
