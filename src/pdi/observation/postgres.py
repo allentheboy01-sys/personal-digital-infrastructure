@@ -1,4 +1,8 @@
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+import hashlib
+import json
+import re
 from uuid import UUID, uuid4
 
 from sqlalchemy import Engine, func, select, update
@@ -9,6 +13,14 @@ from pdi.repository.orm.asset import AssetORM
 from pdi.repository.orm.asset_source import AssetSourceORM
 from pdi.repository.orm.blob import BlobORM
 from pdi.repository.orm.observation import ResourceEnrichmentORM, ResourceStatementORM
+from pdi.repository.orm.pipeline_run_effect_receipt import (
+    PipelineRunEffectReceiptORM,
+)
+from pdi.repository.orm.provider_identity import (
+    ObservationScopeORM,
+    ProviderAccountORM,
+    ProviderInstanceORM,
+)
 
 from .errors import (
     ObservationLifecycleError,
@@ -31,9 +43,347 @@ from .models import (
 )
 
 
+_PIPELINE_KEY = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+_EFFECT_PIPELINE_PROVIDERS = {
+    "enrichment.nextcloud_text": frozenset({"nextcloud"}),
+    "enrichment.nextcloud_documents": frozenset({"nextcloud"}),
+    "enrichment.file_metadata": frozenset({"nextcloud", "immich"}),
+    "enrichment.immich_geo": frozenset({"immich"}),
+    "enrichment.immich_metadata": frozenset({"immich"}),
+    "enrichment.immich_ocr": frozenset({"immich"}),
+}
+
+
+def _utc_text(value: datetime) -> str:
+    normalized = value.astimezone(UTC)
+    return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _receipt_fingerprint(value: dict[str, object]) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _enrichment_state_fingerprint(
+    *,
+    asset_id: UUID,
+    generator: GeneratorIdentity,
+    input_fingerprint: str,
+    completed_at: datetime,
+) -> str:
+    return _receipt_fingerprint({
+        "subject_asset_id": str(asset_id),
+        "generator_type": generator.generator_type,
+        "generator_name": generator.generator_name,
+        "generator_version": generator.generator_version,
+        "input_fingerprint": input_fingerprint,
+        "status": EnrichmentStatus.COMPLETED.value,
+        "completed_at": _utc_text(completed_at),
+    })
+
+
+def _statement_effect_fingerprint(
+    rows: Sequence[ResourceStatementORM | Mapping[str, object]],
+) -> str:
+    """Commit to the exact semantic statement rows without persisting plaintext."""
+
+    def field(row, name: str):
+        return row[name] if isinstance(row, Mapping) else getattr(row, name)
+
+    def normalized(value):
+        if isinstance(value, UUID):
+            return str(value)
+        if isinstance(value, datetime):
+            return _utc_text(value)
+        return value
+
+    statements = []
+    for row in sorted(rows, key=lambda item: str(field(item, "id"))):
+        statements.append({
+            name: normalized(field(row, name))
+            for name in (
+                "id",
+                "subject_asset_id",
+                "predicate",
+                "value_type",
+                "string_value",
+                "integer_value",
+                "float_value",
+                "boolean_value",
+                "datetime_value",
+                "resource_value_asset_id",
+                "generator_type",
+                "generator_name",
+                "generator_version",
+                "source_kind",
+                "source_locator",
+                "confidence",
+                "created_at",
+                "is_current",
+            )
+        })
+    return _receipt_fingerprint({"statements": statements})
+
+
+def _source_binding_fingerprint(rows: Sequence[Mapping[str, object]]) -> str:
+    """Commit to the exact enabled Source/Scope identity supplied to extraction."""
+
+    sources = []
+    for row in sorted(rows, key=lambda item: str(item["source_id"])):
+        sources.append({
+            "source_id": str(row["source_id"]),
+            "provider": row["provider"],
+            "observation_scope_id": str(row["observation_scope_id"]),
+            "provider_instance_id": str(row["provider_instance_id"]),
+            "provider_account_id": (
+                None
+                if row["provider_account_id"] is None
+                else str(row["provider_account_id"])
+            ),
+        })
+    return _receipt_fingerprint({"sources": sources})
+
+
+def _receipt_fragment_payload(
+    *,
+    receipt_id: UUID,
+    pipeline_run_id: UUID,
+    pipeline_key: str,
+    asset_id: UUID,
+    generator: GeneratorIdentity,
+    input_fingerprint: str,
+    completed_at: datetime,
+    created_statement_ids: tuple[UUID, ...],
+    deactivated_statement_ids: tuple[UUID, ...],
+    current_statement_ids: tuple[UUID, ...],
+    source_ids: tuple[UUID, ...],
+    source_binding_fingerprint: str,
+    enrichment_state_fingerprint: str,
+    statement_effect_fingerprint: str,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "receipt_id": str(receipt_id),
+        "pipeline_run_id": str(pipeline_run_id),
+        "pipeline_key": pipeline_key,
+        "subject_asset_id": str(asset_id),
+        "generator_type": generator.generator_type,
+        "generator_name": generator.generator_name,
+        "generator_version": generator.generator_version,
+        "input_fingerprint": input_fingerprint,
+        "completed_at": _utc_text(completed_at),
+        "created_statement_ids": [str(item) for item in created_statement_ids],
+        "deactivated_statement_ids": [
+            str(item) for item in deactivated_statement_ids
+        ],
+        "current_statement_ids": [str(item) for item in current_statement_ids],
+        "source_ids": [str(item) for item in source_ids],
+        "statement_write_count": len(created_statement_ids),
+        "deactivated_statement_count": len(deactivated_statement_ids),
+        "current_statement_count": len(current_statement_ids),
+        "source_binding_fingerprint": source_binding_fingerprint,
+        "enrichment_state_fingerprint": enrichment_state_fingerprint,
+        "statement_effect_fingerprint": statement_effect_fingerprint,
+    }
+
+
 class PostgreSQLObservationRepository:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        effect_run_id: UUID | None = None,
+        effect_pipeline_key: str | None = None,
+    ) -> None:
+        if (effect_run_id is None) != (effect_pipeline_key is None):
+            raise ValueError("effect receipt context must be complete")
+        if effect_pipeline_key is not None and (
+            not isinstance(effect_pipeline_key, str)
+            or _PIPELINE_KEY.fullmatch(effect_pipeline_key) is None
+        ):
+            raise ValueError("effect pipeline key is invalid")
         self._session_factory = sessionmaker(bind=engine, class_=Session, expire_on_commit=False)
+        self._effect_run_id = effect_run_id
+        self._effect_pipeline_key = effect_pipeline_key
+
+    def _add_effect_receipt(
+        self,
+        session: Session,
+        *,
+        asset_id: UUID,
+        batch: ObservationBatch,
+        completed_at: datetime,
+        created_statement_ids: tuple[UUID, ...],
+        deactivated_statement_ids: tuple[UUID, ...],
+        current_statement_ids: tuple[UUID, ...],
+        effect_statements: tuple[ResourceStatementORM, ...],
+        effect_sources: tuple[EnrichmentSource, ...],
+    ) -> None:
+        if self._effect_run_id is None or self._effect_pipeline_key is None:
+            return
+        created = tuple(sorted(created_statement_ids, key=str))
+        deactivated = tuple(sorted(deactivated_statement_ids, key=str))
+        current = tuple(sorted(current_statement_ids, key=str))
+        if (
+            len(set(created)) != len(created)
+            or len(set(deactivated)) != len(deactivated)
+            or len(set(current)) != len(current)
+        ):
+            raise ObservationLifecycleError("Effect receipt contains duplicate IDs")
+        expected_ids = set((*created, *deactivated, *current))
+        effect_by_id = {row.id: row for row in effect_statements}
+        if set(effect_by_id) != expected_ids or len(effect_by_id) != len(effect_statements):
+            raise ObservationLifecycleError("Effect receipt statement binding is incomplete")
+        source_ids, source_fingerprint = self._verified_effect_sources(
+            session,
+            asset_id=asset_id,
+            effect_sources=effect_sources,
+        )
+        receipt_id = uuid4()
+        enrichment_fingerprint = _enrichment_state_fingerprint(
+            asset_id=asset_id,
+            generator=batch.generator,
+            input_fingerprint=batch.input_fingerprint,
+            completed_at=completed_at,
+        )
+        statement_fingerprint = _statement_effect_fingerprint(
+            tuple(effect_by_id.values())
+        )
+        payload = _receipt_fragment_payload(
+            receipt_id=receipt_id,
+            pipeline_run_id=self._effect_run_id,
+            pipeline_key=self._effect_pipeline_key,
+            asset_id=asset_id,
+            generator=batch.generator,
+            input_fingerprint=batch.input_fingerprint,
+            completed_at=completed_at,
+            created_statement_ids=created,
+            deactivated_statement_ids=deactivated,
+            current_statement_ids=current,
+            source_ids=source_ids,
+            source_binding_fingerprint=source_fingerprint,
+            enrichment_state_fingerprint=enrichment_fingerprint,
+            statement_effect_fingerprint=statement_fingerprint,
+        )
+        session.add(PipelineRunEffectReceiptORM(
+            id=receipt_id,
+            version=1,
+            pipeline_run_id=self._effect_run_id,
+            pipeline_key=self._effect_pipeline_key,
+            subject_asset_id=asset_id,
+            generator_type=batch.generator.generator_type,
+            generator_name=batch.generator.generator_name,
+            generator_version=batch.generator.generator_version,
+            input_fingerprint=batch.input_fingerprint,
+            completed_at=completed_at,
+            created_statement_ids=list(created),
+            deactivated_statement_ids=list(deactivated),
+            current_statement_ids=list(current),
+            source_ids=list(source_ids),
+            statement_write_count=len(created),
+            deactivated_statement_count=len(deactivated),
+            current_statement_count=len(current),
+            source_binding_fingerprint=source_fingerprint,
+            enrichment_state_fingerprint=enrichment_fingerprint,
+            statement_effect_fingerprint=statement_fingerprint,
+            fragment_fingerprint=_receipt_fingerprint(payload),
+        ))
+
+    def _verified_effect_sources(
+        self,
+        session: Session,
+        *,
+        asset_id: UUID,
+        effect_sources: tuple[EnrichmentSource, ...],
+    ) -> tuple[tuple[UUID, ...], str]:
+        if self._effect_pipeline_key is None:
+            raise ObservationLifecycleError("Effect source binding lacks pipeline")
+        expected_providers = _EFFECT_PIPELINE_PROVIDERS.get(
+            self._effect_pipeline_key
+        )
+        if expected_providers is None or not effect_sources:
+            raise ObservationLifecycleError("Effect source binding is incomplete")
+        supplied: dict[UUID, EnrichmentSource] = {}
+        try:
+            for source in effect_sources:
+                source_id = UUID(source.source_id)
+                scope_id = UUID(source.observation_scope_id or "")
+                if (
+                    source_id in supplied
+                    or not source.is_active
+                    or source.provider not in expected_providers
+                    or str(scope_id) != source.observation_scope_id
+                ):
+                    raise ValueError
+                supplied[source_id] = source
+        except (TypeError, ValueError, AttributeError):
+            raise ObservationLifecycleError(
+                "Effect source binding is invalid"
+            ) from None
+        rows = list(session.execute(
+            select(
+                AssetSourceORM.id.label("source_id"),
+                AssetSourceORM.provider,
+                AssetSourceORM.observation_scope_id,
+                ObservationScopeORM.provider_instance_id,
+                ObservationScopeORM.provider_account_id,
+                BlobORM.asset_id,
+                AssetSourceORM.is_active,
+                AssetSourceORM.deleted_at,
+                ObservationScopeORM.enabled.label("scope_enabled"),
+                ProviderInstanceORM.provider_type.label("instance_provider"),
+                ProviderInstanceORM.enabled.label("instance_enabled"),
+                ProviderAccountORM.enabled.label("account_enabled"),
+            )
+            .join(BlobORM, BlobORM.id == AssetSourceORM.blob_id)
+            .join(
+                ObservationScopeORM,
+                ObservationScopeORM.id == AssetSourceORM.observation_scope_id,
+            )
+            .join(
+                ProviderInstanceORM,
+                ProviderInstanceORM.id == ObservationScopeORM.provider_instance_id,
+            )
+            .outerjoin(
+                ProviderAccountORM,
+                ProviderAccountORM.id == ObservationScopeORM.provider_account_id,
+            )
+            .where(AssetSourceORM.id.in_(tuple(supplied)))
+            .with_for_update(of=AssetSourceORM)
+        ).mappings())
+        if {row["source_id"] for row in rows} != set(supplied):
+            raise ObservationLifecycleError("Effect source binding is incomplete")
+        fingerprint_rows = []
+        for row in rows:
+            source = supplied[row["source_id"]]
+            if (
+                row["asset_id"] != asset_id
+                or row["provider"] != source.provider
+                or str(row["observation_scope_id"])
+                != source.observation_scope_id
+                or row["provider"] not in expected_providers
+                or row["instance_provider"] != row["provider"]
+                or row["is_active"] is not True
+                or row["deleted_at"] is not None
+                or row["scope_enabled"] is not True
+                or row["instance_enabled"] is not True
+                or (
+                    row["provider_account_id"] is not None
+                    and row["account_enabled"] is not True
+                )
+            ):
+                raise ObservationLifecycleError(
+                    "Effect source authority is invalid"
+                )
+            fingerprint_rows.append(row)
+        source_ids = tuple(sorted(supplied, key=str))
+        return source_ids, _source_binding_fingerprint(fingerprint_rows)
 
     @staticmethod
     def _identity_filters(asset_id: UUID, generator: GeneratorIdentity):
@@ -131,6 +481,7 @@ class PostgreSQLObservationRepository:
         *,
         completed_at: datetime,
         exclusive_generator_family: tuple[str, ...] = (),
+        effect_sources: tuple[EnrichmentSource, ...] = (),
     ) -> PublishResult:
         asset_id = UUID(parse_resource_ref(batch.subject_resource_ref))
         now = completed_at.astimezone(UTC)
@@ -206,13 +557,40 @@ class PostgreSQLObservationRepository:
                 new = sorted(self._statement_key(draft) for draft in batch.statements)
                 if old == new:
                     self._complete_state(state, batch.input_fingerprint, now)
+                    self._add_effect_receipt(
+                        session,
+                        asset_id=asset_id,
+                        batch=batch,
+                        completed_at=now,
+                        created_statement_ids=(),
+                        deactivated_statement_ids=(),
+                        current_statement_ids=tuple(row.id for row in current),
+                        effect_statements=tuple(current),
+                        effect_sources=effect_sources,
+                    )
                     session.commit()
                     return PublishResult(0, 0)
                 for row in current:
                     row.is_current = False
+                created = []
                 for draft in sorted(batch.statements, key=self._statement_key):
-                    session.add(self._draft_to_orm(asset_id, batch.generator, draft, now))
+                    created_row = self._draft_to_orm(
+                        asset_id, batch.generator, draft, now
+                    )
+                    created.append(created_row)
+                    session.add(created_row)
                 self._complete_state(state, batch.input_fingerprint, now)
+                self._add_effect_receipt(
+                    session,
+                    asset_id=asset_id,
+                    batch=batch,
+                    completed_at=now,
+                    created_statement_ids=tuple(row.id for row in created),
+                    deactivated_statement_ids=tuple(row.id for row in current),
+                    current_statement_ids=tuple(row.id for row in created),
+                    effect_statements=tuple((*current, *created)),
+                    effect_sources=effect_sources,
+                )
                 session.commit()
                 return PublishResult(len(batch.statements), len(current))
             except Exception:

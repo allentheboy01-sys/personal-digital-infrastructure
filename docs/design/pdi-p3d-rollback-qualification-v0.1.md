@@ -45,6 +45,11 @@ additionally binds Python version/ABI, the migration tree and discovered head,
 and a canonical installed-distribution inventory whose names are normalized and
 whose RECORD files are hashed.
 
+The frozen rollback source expectation remains `e5a7b9d1f324`. A newer live
+candidate head (including the additive WP8 runtime-effect migration) does not
+mechanically rewrite or upgrade that already-qualified rollback source. The
+source's own runtime and restored database remain checked against its own head.
+
 The system-runtime fingerprint is a separate deterministic authority. It binds
 the OS ID/version, Debian architecture, resolved system Python, and the shared
 library closure reported by fixed-path `ldd` for Python and every native

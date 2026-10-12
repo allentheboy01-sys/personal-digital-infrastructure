@@ -16,7 +16,7 @@ def require(condition, code):
         raise Refused(code)
 
 
-HEAD = "e5a7b9d1f324"
+HEAD = "f6b8d0e2a435"
 PROVIDERS = ("nextcloud", "immich", "gmail", "integration-test")
 SOURCE_MAPPING = {
     "nextcloud": "nextcloud", "immich": "immich",

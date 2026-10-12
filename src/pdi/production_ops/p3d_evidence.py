@@ -13,6 +13,7 @@ from sqlalchemy.engine import make_url
 from pdi.provider_identity import PostgreSQLProviderIdentityRepository
 from pdi.scoped_enrichment_activation import CANONICAL_SCOPED_ENRICHMENTS
 from pdi.scoped_enrichment_profiles import derive_enabled_scope_ids
+from .contracts import HEAD as CANDIDATE_ALEMBIC_HEAD
 from .enrichment_cutover import P3DControlRefused, context_fingerprint
 
 
@@ -82,7 +83,7 @@ class RoutedPersonalDatabaseEvidenceReader:
                 raise P3DControlRefused("ROUTE_TARGET_MISMATCH")
             with postgresql_read_only_transaction(self.engine) as connection:
                 revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
-                if revision != "e5a7b9d1f324":
+                if revision != CANDIDATE_ALEMBIC_HEAD:
                     raise P3DControlRefused("ALEMBIC_MISMATCH")
                 null_scope = connection.scalar(text(
                     "SELECT count(*) FROM asset_sources WHERE observation_scope_id IS NULL"))

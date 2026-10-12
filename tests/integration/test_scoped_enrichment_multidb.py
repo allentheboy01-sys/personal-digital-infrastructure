@@ -100,9 +100,14 @@ def test_scoped_local_enrichment_isolated_between_two_personal_databases(tmp_pat
         ), environment)
         router = PrincipalDatabaseRouter(principals, bindings)
 
-        def local_executor(engine, _target):
+        def local_executor(engine, _target, run_context):
+            assert run_context.invocation_fingerprint is not None
             result = EnrichmentWorker(
-                PostgreSQLObservationRepository(engine),
+                PostgreSQLObservationRepository(
+                    engine,
+                    effect_run_id=run_context.run_id,
+                    effect_pipeline_key=run_context.pipeline_key,
+                ),
                 FileMetadataExtractor(),
                 provider=FileMetadataExtractor.discovery_providers,
             ).run_once(batch_size=20000)
@@ -118,25 +123,41 @@ def test_scoped_local_enrichment_isolated_between_two_personal_databases(tmp_pat
             with engine.connect() as connection:
                 before.append(connection.scalar(text("SELECT count(*) FROM resource_statements")))
 
-        assert runner.run("a", "enrichment.file_metadata", lock_timeout=1) == 0
+        assert runner.run(
+            "a",
+            "enrichment.file_metadata",
+            lock_timeout=1,
+            invocation_fingerprint="a" * 64,
+        ) == 0
         with engines[0].connect() as connection:
             after_a = connection.scalar(text("SELECT count(*) FROM resource_statements"))
             ledger_a = connection.scalar(text("SELECT count(*) FROM pipeline_runs WHERE status='completed'"))
+            receipts_a = connection.scalar(text(
+                "SELECT count(*) FROM pipeline_run_effect_receipts"
+            ))
         with engines[1].connect() as connection:
             after_b = connection.scalar(text("SELECT count(*) FROM resource_statements"))
             ledger_b = connection.scalar(text("SELECT count(*) FROM pipeline_runs WHERE status='completed'"))
         assert after_a > before[0] and after_b == before[1]
-        assert ledger_a == 1 and ledger_b == 0
+        assert ledger_a == 1 and ledger_b == 0 and receipts_a == 1
 
-        assert runner.run("b", "enrichment.file_metadata", lock_timeout=1) == 0
+        assert runner.run(
+            "b",
+            "enrichment.file_metadata",
+            lock_timeout=1,
+            invocation_fingerprint="b" * 64,
+        ) == 0
         with engines[0].connect() as connection:
             final_a = connection.scalar(text("SELECT count(*) FROM resource_statements"))
             ledger_a = connection.scalar(text("SELECT count(*) FROM pipeline_runs WHERE status='completed'"))
         with engines[1].connect() as connection:
             final_b = connection.scalar(text("SELECT count(*) FROM resource_statements"))
             ledger_b = connection.scalar(text("SELECT count(*) FROM pipeline_runs WHERE status='completed'"))
+            receipts_b = connection.scalar(text(
+                "SELECT count(*) FROM pipeline_run_effect_receipts"
+            ))
         assert final_a == after_a and final_b > after_b
-        assert ledger_a == 1 and ledger_b == 1
+        assert ledger_a == 1 and ledger_b == 1 and receipts_b == 1
     finally:
         for engine in engines:
             engine.dispose()

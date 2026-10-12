@@ -31,6 +31,7 @@ from .p3d_wp8_contracts import (
 _PDI_RELATIONS = (
     "alembic_version", "assets", "asset_sources", "blobs", "persons",
     "person_sources", "observation_scope_person_sources", "pipeline_runs",
+    "pipeline_run_effect_receipts",
     "provider_instances", "provider_accounts", "observation_scopes",
     "provider_sync_state", "observation_scope_sync_state",
     "resource_statements", "resource_enrichments", "resource_person_relations",

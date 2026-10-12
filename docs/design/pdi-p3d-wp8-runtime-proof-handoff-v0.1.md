@@ -1,10 +1,12 @@
 # WP8 same-invocation runtime-proof handoff V0.1
 
-Status: local backend implementation candidate; independent review and real
-systemd qualification remain separate gates. This document implements only
-Resolution A's private backend handoff. It does not implement Runtime Proof,
-an orchestrator, operation persistence, or authorization consumption, and
-authorizes no production access or workload.
+Status: reviewed backend handoff plus local Runtime Proof implementation
+candidate; independent review and production authorization remain separate
+gates. This document defines Resolution A's private backend handoff. Runtime
+effect causality is implemented separately by the invocation/run/receipt chain
+in [the attribution design](pdi-p3d-wp8-runtime-effect-attribution-v0.1.md).
+Neither component implements an orchestrator, operation persistence, or
+authorization consumption, and neither authorizes production access or work.
 
 The supplied Runtime Proof Handoff Resolution is proposed design evidence
 `[R]`, not current execution evidence. The backend implementation here is a
@@ -95,12 +97,13 @@ orchestrator's verified execution/persistence chain. No bare mapping or hash
 may reconstruct lost execution authority.
 
 Operation identity, reviewed A/B authorization, single-use consumption,
-journal sequence, protected pre/post read-only DB boundaries, unique fresh
-PipelineRun/effect attribution and replay rejection remain the future
-orchestrator/Runtime Proof responsibilities. No such module or database query
-is added here. Phase A runtime coverage remains `0/6`; these synthetic backend
-tests cannot create runtime ledger proof. Manager/boot continuity and clock
-domain separation remain required by the existing design.
+journal sequence, protected pre/post boundaries and replay rejection remain
+future orchestrator responsibilities. The separate read-only Runtime Proof
+reader binds this handoff to a unique invocation-tagged PipelineRun and
+same-transaction effect receipts; it does not retrofit those authorities into
+this backend object. Phase A runtime coverage remains `0/6`; backend synthetic
+tests alone cannot create runtime ledger proof. Manager/boot continuity and
+clock-domain separation remain required by the existing design.
 
 The existing non-atomic systemd observation/race limitations in
 [the continuity design](pdi-p3d-wp8-systemd-continuity-v0.1.md) remain unchanged.

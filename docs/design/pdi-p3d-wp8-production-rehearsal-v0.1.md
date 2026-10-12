@@ -216,9 +216,13 @@ rewrite the original cause.
 
 The runtime proof contains exactly six unique completed run UUIDs in canonical
 pipeline order, six safe service/business-effect fingerprints and counts, and
-zero failed, running, or unknown fresh runs. Candidate/context binding is
-provided by the protected WP8 operation and journal; it does not assume those
-columns exist in `pipeline_runs`.
+zero failed, running, or unknown bound runs. Candidate/context binding remains
+provided by the protected WP8 operation and journal. Causal effect attribution
+additionally requires each backend attestation's invocation digest to resolve
+to one unique completed `pipeline_runs` row and its append-only,
+same-transaction effect receipts. Receipt UUIDs and fingerprints are checked
+against the actual statement and enrichment state in one routed read-only
+snapshot. Time proximity and count equality are not evidence.
 
 The invariant proof requires exact equality of separately collected `before`
 and `after` snapshots. The before snapshot must equal the snapshot already

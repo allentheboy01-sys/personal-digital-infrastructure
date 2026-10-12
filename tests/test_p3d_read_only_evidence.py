@@ -4,6 +4,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.engine import make_url
 
+from pdi.production_ops.contracts import HEAD as CANDIDATE_ALEMBIC_HEAD
 from pdi.production_ops.enrichment_cutover import P3DControlRefused
 from pdi.production_ops.p3d_evidence import RoutedPersonalDatabaseEvidenceReader
 
@@ -59,7 +60,7 @@ class _ReadOnlyConnection:
         if sql == "SHOW transaction_read_only":
             return self.read_only
         if "alembic_version" in sql:
-            return "e5a7b9d1f324"
+            return CANDIDATE_ALEMBIC_HEAD
         if "count(*)" in sql:
             return 0
         raise AssertionError(f"unexpected scalar: {sql}")

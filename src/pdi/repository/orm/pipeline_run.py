@@ -34,6 +34,11 @@ class PipelineRunORM(Base):
             "('execution_failed', 'interrupted_previous_run')",
             name="ck_pipeline_runs_error_code",
         ),
+        CheckConstraint(
+            "invocation_fingerprint IS NULL OR "
+            "invocation_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_pipeline_runs_invocation_fingerprint",
+        ),
         Index(
             "ix_pipeline_runs_key_started_at",
             "pipeline_key",
@@ -44,6 +49,12 @@ class PipelineRunORM(Base):
             "pipeline_key",
             unique=True,
             postgresql_where=text("status = 'running'"),
+        ),
+        Index(
+            "uq_pipeline_runs_invocation_fingerprint",
+            "invocation_fingerprint",
+            unique=True,
+            postgresql_where=text("invocation_fingerprint IS NOT NULL"),
         ),
     )
 
@@ -56,3 +67,4 @@ class PipelineRunORM(Base):
     )
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    invocation_fingerprint: Mapped[str | None] = mapped_column(String(64))

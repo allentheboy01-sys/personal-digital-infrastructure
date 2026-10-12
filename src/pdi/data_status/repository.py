@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime
+import re
 from uuid import UUID, uuid4
 
 from sqlalchemy import Engine, func, select, update
@@ -17,6 +18,9 @@ from .models import (
 
 class PipelineRunLifecycleError(RuntimeError):
     pass
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _utc_instant(value: datetime) -> datetime:
@@ -55,7 +59,18 @@ class PipelineRunRepository:
         kind: PipelineKind,
         *,
         started_at: datetime | None = None,
+        invocation_fingerprint: str | None = None,
     ) -> PipelineRun:
+        if (
+            invocation_fingerprint is not None
+            and (
+                not isinstance(invocation_fingerprint, str)
+                or _SHA256.fullmatch(invocation_fingerprint) is None
+            )
+        ):
+            raise PipelineRunLifecycleError(
+                "invocation fingerprint must be a SHA-256 digest"
+            )
         row = PipelineRunORM(
             id=uuid4(),
             pipeline_key=pipeline_key,
@@ -64,6 +79,7 @@ class PipelineRunRepository:
             started_at=_utc_instant(started_at or datetime.now(UTC)),
             finished_at=None,
             error_code=None,
+            invocation_fingerprint=invocation_fingerprint,
         )
         with self._session_factory() as session:
             session.add(row)

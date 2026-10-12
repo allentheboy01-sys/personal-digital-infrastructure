@@ -180,7 +180,11 @@ def test_formal_runner_routes_all_enabled_scopes_and_ledger_to_personal_db(datab
     )
     seen = []
     executors = {
-        key: (lambda db, target, key=key: seen.append((key, target)))
+        key: (
+            lambda db, target, run_context, key=key: seen.append(
+                (key, target)
+            )
+        )
         for key in SCOPED_FORMAL_PIPELINES
     }
     runner = PrincipalFormalPipelineRunner(
@@ -209,7 +213,7 @@ def test_multi_scope_failure_is_visible_after_all_scopes_are_attempted(database,
     scopes = (_scope(engine, "immich"), _scope(engine, "immich"))
     engine.dispose()
     attempted = []
-    def fail_one(db, target):
+    def fail_one(db, target, run_context):
         attempted.append(target.observation_scope_id)
         if target.observation_scope_id == scopes[0].id:
             raise RuntimeError("synthetic failure")

@@ -79,8 +79,20 @@ class FormalScopeTarget:
     provider_type: str
 
 
+@dataclass(frozen=True, slots=True)
+class FormalRunContext:
+    run_id: UUID
+    pipeline_key: str
+    invocation_fingerprint: str | None
+
+
 class FormalOperationExecutor(Protocol):
-    def __call__(self, engine: Engine, target: FormalScopeTarget | None) -> None: ...
+    def __call__(
+        self,
+        engine: Engine,
+        target: FormalScopeTarget | None,
+        run_context: FormalRunContext,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +177,7 @@ class PrincipalFormalPipelineRunner:
         pipeline_key: str,
         *,
         lock_timeout: float,
+        invocation_fingerprint: str | None = None,
     ) -> int:
         spec = SCOPED_FORMAL_PIPELINES.get(pipeline_key)
         executor = self._executors.get(pipeline_key)
@@ -179,7 +192,16 @@ class PrincipalFormalPipelineRunner:
             try:
                 ledger = PipelineRunRepository(engine)
                 ledger.fail_interrupted_run(pipeline_key)
-                run = ledger.begin_run(pipeline_key, spec.kind)
+                run = ledger.begin_run(
+                    pipeline_key,
+                    spec.kind,
+                    invocation_fingerprint=invocation_fingerprint,
+                )
+                run_context = FormalRunContext(
+                    run.id,
+                    pipeline_key,
+                    invocation_fingerprint,
+                )
                 try:
                     # Enrichment is one Principal-level ledger operation.  Its
                     # readers resolve each Source's exact Scope, so fan-out
@@ -202,7 +224,7 @@ class PrincipalFormalPipelineRunner:
                     failures: list[BaseException] = []
                     for target in targets:
                         try:
-                            executor(engine, target)
+                            executor(engine, target, run_context)
                         except BaseException as error:
                             failures.append(error)
                     if failures:
@@ -270,7 +292,12 @@ class ScopedIngestionFormalExecutor:
     def __init__(self, operation: Callable[[FormalScopeTarget], None]) -> None:
         self._operation = operation
 
-    def __call__(self, engine: Engine, target: FormalScopeTarget | None) -> None:
+    def __call__(
+        self,
+        engine: Engine,
+        target: FormalScopeTarget | None,
+        run_context: FormalRunContext,
+    ) -> None:
         if target is None or target.observation_scope_id is None:
             raise ScopedFormalPipelineError("Provider operation requires Scope")
         self._operation(target)
@@ -289,7 +316,12 @@ class MU7ScopedIngestionFormalExecutor:
         self._adapter_factory = adapter_factory
         self._operation = operation
 
-    def __call__(self, engine: Engine, target: FormalScopeTarget | None) -> None:
+    def __call__(
+        self,
+        engine: Engine,
+        target: FormalScopeTarget | None,
+        run_context: FormalRunContext,
+    ) -> None:
         if target is None or target.observation_scope_id is None:
             raise ScopedFormalPipelineError("Ingestion operation requires Scope")
         adapter = self._adapter_factory(target)
@@ -312,7 +344,12 @@ class ExecutableScopedProviderOperation:
         self._configuration = configuration
         self._operation = operation
 
-    def __call__(self, engine: Engine, target: FormalScopeTarget | None) -> None:
+    def __call__(
+        self,
+        engine: Engine,
+        target: FormalScopeTarget | None,
+        run_context: FormalRunContext,
+    ) -> None:
         if target is None or target.observation_scope_id is None:
             raise ScopedFormalPipelineError("Provider operation requires Scope")
         binding, secret = self._configuration.resolve(
@@ -394,7 +431,12 @@ class ExecutableScopedPersonOperation:
     def __init__(self, configuration: ScopedOperatorConfiguration) -> None:
         self._configuration = configuration
 
-    def __call__(self, engine: Engine, target: FormalScopeTarget | None) -> None:
+    def __call__(
+        self,
+        engine: Engine,
+        target: FormalScopeTarget | None,
+        run_context: FormalRunContext,
+    ) -> None:
         if target is None or target.observation_scope_id is None or target.provider_type != "immich":
             raise ScopedFormalPipelineError("Person operation requires Immich Scope")
         endpoint, secret, expected = _immich_access(
@@ -413,7 +455,12 @@ class ExecutableScopedRelationOperation:
     def __init__(self, configuration: ScopedOperatorConfiguration) -> None:
         self._configuration = configuration
 
-    def __call__(self, engine: Engine, target: FormalScopeTarget | None) -> None:
+    def __call__(
+        self,
+        engine: Engine,
+        target: FormalScopeTarget | None,
+        run_context: FormalRunContext,
+    ) -> None:
         if target is None or target.observation_scope_id is None or target.provider_type != "immich":
             raise ScopedFormalPipelineError("Relation operation requires Immich Scope")
         endpoint, secret, expected = _immich_access(
@@ -492,10 +539,27 @@ class ExecutableEnrichmentOperation:
         self._configuration = configuration
         self._pipeline_key = pipeline_key
 
-    def __call__(self, engine: Engine, target: FormalScopeTarget | None) -> None:
+    def __call__(
+        self,
+        engine: Engine,
+        target: FormalScopeTarget | None,
+        run_context: FormalRunContext,
+    ) -> None:
         if target is None:
             raise ScopedFormalPipelineError("Enrichment requires Principal")
-        repository = PostgreSQLObservationRepository(engine)
+        repository = PostgreSQLObservationRepository(
+            engine,
+            effect_run_id=(
+                run_context.run_id
+                if run_context.invocation_fingerprint is not None
+                else None
+            ),
+            effect_pipeline_key=(
+                run_context.pipeline_key
+                if run_context.invocation_fingerprint is not None
+                else None
+            ),
+        )
         if self._pipeline_key == "enrichment.file_metadata":
             extractors = (
                 (FileMetadataExtractor(), FileMetadataExtractor.discovery_providers),

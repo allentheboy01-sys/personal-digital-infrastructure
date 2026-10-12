@@ -21,11 +21,14 @@ kind, dependencies, and current enrichment generator identity. It validates
 unique keys, registered dependencies, no self dependency, and no cycles. It is
 not a scheduler or workflow engine.
 
-`pipeline_runs` retains history with only `id`, `pipeline_key`, `kind`,
-`status`, `started_at`, `finished_at`, and `error_code`. Kinds are
+`pipeline_runs` retains health history with `id`, `pipeline_key`, `kind`,
+`status`, `started_at`, `finished_at`, `error_code`, and a nullable
+`invocation_fingerprint`. The latter is a unique SHA-256 digest used only for
+new WP8-qualified systemd runs; historical/manual rows remain null and are not
+causal proof. Kinds are
 `provider_sync` and `enrichment`; states are `running`, `completed`, and
 `failed`; error codes are limited to `execution_failed` and
-`interrupted_previous_run`. Raw exceptions, messages, metrics, identifiers,
+`interrupted_previous_run`. Raw exceptions, messages, metrics, InvocationIDs,
 paths, URLs, and credentials are not persisted.
 
 Run creation and terminal updates use independent short transactions. They do
@@ -33,6 +36,12 @@ not span provider scan or enrichment work. A terminal timestamp earlier than
 the start timestamp is allowed because wall-clock correction must not prevent
 terminal persistence. History begins at rollout; journal history is not
 backfilled.
+
+The separate `pipeline_run_effect_receipts` table is not part of the ordinary
+Data Status API. For an invocation-bound enrichment run it records only
+append-only effect identities/fingerprints committed in the same transaction
+as each successful observation publish. It exists for WP8 Runtime Proof and
+does not change health freshness semantics.
 
 ## Formal operational runner
 
