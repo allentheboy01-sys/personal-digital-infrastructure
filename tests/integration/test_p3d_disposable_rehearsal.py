@@ -195,6 +195,58 @@ _LDCONFIG_JOURNAL_CLASSES = {
     "NOT_OBSERVED",
     "AMBIGUOUS",
 }
+_BOOT_CACHE_FAILURE_CATEGORIES = {
+    "PRE_BOOT_SNAPSHOT_INVALID",
+    "POST_BOOT_SNAPSHOT_INVALID",
+    "WRITER_QUERY_IO_FAILED",
+    "WRITER_QUERY_TIMEOUT",
+    "WRITER_QUERY_UNSAFE_OUTPUT",
+    "WRITER_QUERY_PROPERTY_SCHEMA_INVALID",
+    "WRITER_QUERY_COMMAND_FAILED",
+    "WRITER_QUERY_MISSING_PROPERTIES",
+    "WRITER_QUERY_INTEGER_INVALID",
+    "WRITER_QUERY_STATE_INVALID",
+    "ATTRIBUTION_VALIDATION_INVALID",
+}
+
+
+class _BootCacheAttributionError(AssertionError):
+    """Fixed metadata only; never serialize command output or exception text."""
+
+    def __init__(
+        self,
+        category: str,
+        *,
+        unit: str = "NONE",
+        returncode: int | None = None,
+        missing_properties: tuple[str, ...] = (),
+    ) -> None:
+        if (
+            category not in _BOOT_CACHE_FAILURE_CATEGORIES
+            or unit not in (*_CACHE_WRITER_UNITS, "NONE")
+            or (returncode is not None and (
+                type(returncode) is not int or not -255 <= returncode <= 255
+            ))
+            or any(name not in _CACHE_WRITER_PROPERTIES for name in missing_properties)
+            or len(set(missing_properties)) != len(missing_properties)
+        ):
+            raise AssertionError("BOOT_CACHE_FAILURE_METADATA_REJECTED")
+        self.category = category
+        self.unit = unit
+        self.returncode = returncode
+        self.missing_properties = missing_properties
+        super().__init__(self.safe_message())
+
+    def safe_message(self) -> str:
+        return "\n".join((
+            "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED",
+            f"BOOT_CACHE_ATTRIBUTION_FAILURE_CATEGORY={self.category}",
+            f"BOOT_CACHE_WRITER_UNIT={self.unit}",
+            "BOOT_CACHE_WRITER_QUERY_RC="
+            + ("NOT_AVAILABLE" if self.returncode is None else str(self.returncode)),
+            "BOOT_CACHE_WRITER_MISSING_PROPERTIES="
+            + (",".join(self.missing_properties) or "NONE"),
+        ))
 
 
 @dataclass(frozen=True)
@@ -2262,10 +2314,14 @@ def _cache_writer_service_state(
             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
             shell=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise AssertionError(
-            "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED"
-        ) from exc
+    except subprocess.TimeoutExpired:
+        raise _BootCacheAttributionError(
+            "WRITER_QUERY_TIMEOUT", unit=unit,
+        ) from None
+    except OSError:
+        raise _BootCacheAttributionError(
+            "WRITER_QUERY_IO_FAILED", unit=unit,
+        ) from None
     payload = result.stdout + "\n" + result.stderr
     if (
         len(payload.encode("utf-8")) > _DIAGNOSTIC_LIMIT
@@ -2274,7 +2330,9 @@ def _cache_writer_service_state(
         or _SECRET_ASSIGNMENT.search(payload)
         or any(marker in payload for marker in _PROTECTED_SECRET_MARKERS)
     ):
-        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+        raise _BootCacheAttributionError(
+            "WRITER_QUERY_UNSAFE_OUTPUT", unit=unit, returncode=result.returncode,
+        )
     values: dict[str, str] = {}
     for line in result.stdout.splitlines():
         name, separator, value = line.partition("=")
@@ -2283,38 +2341,63 @@ def _cache_writer_service_state(
             or name not in _CACHE_WRITER_PROPERTIES
             or name in values
         ):
-            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+            raise _BootCacheAttributionError(
+                "WRITER_QUERY_PROPERTY_SCHEMA_INVALID",
+                unit=unit, returncode=result.returncode,
+            )
         values[name] = value
     if values.get("LoadState") == "not-found":
         allowed_stderr = {"", f"Unit {unit} could not be found.\n"}
         if result.returncode not in {0, 4} or result.stderr not in allowed_stderr:
-            raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+            raise _BootCacheAttributionError(
+                "WRITER_QUERY_COMMAND_FAILED", unit=unit,
+                returncode=result.returncode,
+            )
         state = _CacheWriterServiceState(
             unit, "not-found", "inactive", "dead", "success",
             0, 0, 0, 0, 0, 0,
         )
         _validate_cache_writer_state(state)
         return state
-    if (
-        result.returncode != 0
-        or result.stderr
-        or set(values) != set(_CACHE_WRITER_PROPERTIES)
-    ):
-        raise AssertionError("BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_REJECTED")
+    if result.returncode != 0 or result.stderr:
+        raise _BootCacheAttributionError(
+            "WRITER_QUERY_COMMAND_FAILED", unit=unit, returncode=result.returncode,
+        )
+    if set(values) != set(_CACHE_WRITER_PROPERTIES):
+        raise _BootCacheAttributionError(
+            "WRITER_QUERY_MISSING_PROPERTIES", unit=unit,
+            returncode=result.returncode,
+            missing_properties=tuple(
+                name for name in _CACHE_WRITER_PROPERTIES if name not in values
+            ),
+        )
+    try:
+        integers = (
+            _parse_systemd_status(values["ExecMainCode"]),
+            _parse_systemd_status(values["ExecMainStatus"]),
+            *(_parse_systemd_monotonic(values[name]) for name in (
+                "InactiveExitTimestampMonotonic", "ActiveEnterTimestampMonotonic",
+                "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic",
+            )),
+        )
+    except AssertionError:
+        raise _BootCacheAttributionError(
+            "WRITER_QUERY_INTEGER_INVALID", unit=unit, returncode=result.returncode,
+        ) from None
     state = _CacheWriterServiceState(
         unit,
         values["LoadState"],
         values["ActiveState"],
         values["SubState"],
         values["Result"],
-        _parse_systemd_status(values["ExecMainCode"]),
-        _parse_systemd_status(values["ExecMainStatus"]),
-        _parse_systemd_monotonic(values["InactiveExitTimestampMonotonic"]),
-        _parse_systemd_monotonic(values["ActiveEnterTimestampMonotonic"]),
-        _parse_systemd_monotonic(values["ExecMainStartTimestampMonotonic"]),
-        _parse_systemd_monotonic(values["ExecMainExitTimestampMonotonic"]),
+        *integers,
     )
-    _validate_cache_writer_state(state)
+    try:
+        _validate_cache_writer_state(state)
+    except AssertionError:
+        raise _BootCacheAttributionError(
+            "WRITER_QUERY_STATE_INVALID", unit=unit, returncode=result.returncode,
+        ) from None
     return state
 
 
@@ -2933,13 +3016,19 @@ def _collect_boot_cache_attribution(
     systemd_runner=subprocess.run,
     monotonic_ns=time.monotonic_ns,
 ) -> _BootCacheAttributionDiagnostic:
-    _validate_loader_cache_snapshot(pre_boot)
-    post_boot = _namespace_loader_cache_snapshot(
-        leader,
-        runtime_uid,
-        runtime_gid,
-        capture=capture,
-    )
+    try:
+        _validate_loader_cache_snapshot(pre_boot)
+    except AssertionError:
+        raise _BootCacheAttributionError("PRE_BOOT_SNAPSHOT_INVALID") from None
+    try:
+        post_boot = _namespace_loader_cache_snapshot(
+            leader,
+            runtime_uid,
+            runtime_gid,
+            capture=capture,
+        )
+    except AssertionError:
+        raise _BootCacheAttributionError("POST_BOOT_SNAPSHOT_INVALID") from None
     post_observation_monotonic_us = monotonic_ns() // 1000
     writer_states = _allowlisted_cache_writer_states(
         machine,
@@ -2970,7 +3059,10 @@ def _collect_boot_cache_attribution(
         post_observation_monotonic_us,
         post_libpython_entry_count,
     )
-    _validate_boot_cache_attribution(diagnostic)
+    try:
+        _validate_boot_cache_attribution(diagnostic)
+    except AssertionError:
+        raise _BootCacheAttributionError("ATTRIBUTION_VALIDATION_INVALID") from None
     return diagnostic
 
 
@@ -6722,6 +6814,11 @@ def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal() -> None:
                         loader_cache_diagnostic.libpython_entry_count
                     ),
                 )
+            except _BootCacheAttributionError as exc:
+                raise AssertionError(
+                    "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_INVALID\n"
+                    + exc.safe_message()
+                ) from None
             except AssertionError:
                 raise AssertionError(
                     "BOOT_CACHE_ATTRIBUTION_DIAGNOSTIC_INVALID"

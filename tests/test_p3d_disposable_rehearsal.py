@@ -14,6 +14,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine
 
+from tests.integration import test_p3d_disposable_rehearsal as harness
+
 import pdi.production_ops.p3d_disposable_rehearsal as module
 from pdi.production_ops.p3d_disposable_rehearsal import (
     CANONICAL_PIPELINES,
@@ -41,6 +43,105 @@ H2 = "2" * 64
 H3 = "3" * 64
 H4 = "4" * 64
 NOW = datetime(2026, 9, 26, 1, tzinfo=UTC)
+
+
+def _writer_properties() -> dict[str, str]:
+    return {
+        "LoadState": "loaded", "ActiveState": "active", "SubState": "exited",
+        "Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0",
+        "InactiveExitTimestampMonotonic": "140",
+        "ActiveEnterTimestampMonotonic": "140",
+        "ExecMainStartTimestampMonotonic": "120",
+        "ExecMainExitTimestampMonotonic": "140",
+    }
+
+
+@pytest.mark.parametrize("mutation,category", (
+    ("missing", "WRITER_QUERY_MISSING_PROPERTIES"),
+    ("duplicate", "WRITER_QUERY_PROPERTY_SCHEMA_INVALID"),
+    ("unknown", "WRITER_QUERY_PROPERTY_SCHEMA_INVALID"),
+    ("unsafe", "WRITER_QUERY_UNSAFE_OUTPUT"),
+    ("status", "WRITER_QUERY_INTEGER_INVALID"),
+    ("state", "WRITER_QUERY_STATE_INVALID"),
+    ("returncode", "WRITER_QUERY_COMMAND_FAILED"),
+    ("stderr", "WRITER_QUERY_COMMAND_FAILED"),
+))
+def test_boot_cache_query_preserves_fixed_failure_without_raw_output(
+    mutation: str, category: str,
+) -> None:
+    values = _writer_properties()
+    if mutation == "missing":
+        del values["ExecMainStartTimestampMonotonic"]
+    elif mutation == "status":
+        values["ExecMainStatus"] = "999"
+    elif mutation == "state":
+        values["SubState"] = "/private/arbitrary-state"
+    payload = "".join(f"{key}={value}\n" for key, value in values.items())
+    if mutation == "duplicate":
+        payload += "Result=success\n"
+    elif mutation == "unknown":
+        payload += "Unrecognized=/private/unknown\n"
+    elif mutation == "unsafe":
+        payload += "PASSWORD=synthetic-private-value\n"
+    with pytest.raises(harness._BootCacheAttributionError) as caught:
+        harness._cache_writer_service_state(
+            "pdi-p3d-1234567812345678", "ldconfig.service",
+            runner=lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 1 if mutation == "returncode" else 0, payload,
+                "private-error-text" if mutation == "stderr" else "",
+            ),
+        )
+    error = caught.value
+    assert error.category == category
+    assert error.unit == "ldconfig.service"
+    assert error.returncode == (1 if mutation == "returncode" else 0)
+    output = error.safe_message()
+    assert category in output
+    assert "private" not in output
+    assert "PASSWORD" not in output
+    assert "/" not in output
+    assert "Unrecognized" not in output
+    assert error.missing_properties == (
+        ("ExecMainStartTimestampMonotonic",) if mutation == "missing" else ()
+    )
+
+
+@pytest.mark.parametrize("failure,category", (
+    (OSError("synthetic private exception"), "WRITER_QUERY_IO_FAILED"),
+    (subprocess.TimeoutExpired("private-command", 30), "WRITER_QUERY_TIMEOUT"),
+))
+def test_boot_cache_query_exception_text_is_not_emitted(failure, category) -> None:
+    def runner(*args, **kwargs):
+        raise failure
+    with pytest.raises(harness._BootCacheAttributionError) as caught:
+        harness._cache_writer_service_state(
+            "pdi-p3d-1234567812345678", "ldconfig.service", runner=runner,
+        )
+    assert caught.value.category == category
+    assert "private" not in caught.value.safe_message()
+    assert caught.value.__suppress_context__
+
+
+@pytest.mark.parametrize("changes", (
+    {"category": "private-value"}, {"unit": "/private/path"},
+    {"returncode": True}, {"returncode": 999},
+    {"missing_properties": ("PASSWORD",)},
+    {"missing_properties": ("Result", "Result")},
+))
+def test_boot_cache_failure_metadata_rejects_unvalidated_fields(changes) -> None:
+    kwargs = {"category": "WRITER_QUERY_MISSING_PROPERTIES", **changes}
+    with pytest.raises(AssertionError, match="BOOT_CACHE_FAILURE_METADATA_REJECTED"):
+        harness._BootCacheAttributionError(**kwargs)
+
+
+def test_boot_cache_diagnostic_failure_is_preserved_before_workload() -> None:
+    source = Path(harness.__file__).read_text(encoding="utf-8")
+    start = source.index("def test_cross_gate_disposable_real_systemd_six_pipeline_rehearsal()")
+    failure = source.index("except _BootCacheAttributionError as exc:", start)
+    authority = source.index("_verify_boot_loader_authority(", failure)
+    preflight = source.index("_verify_container_python_preflight(", authority)
+    assert failure < authority < preflight
+    assert "+ exc.safe_message()" in source[failure:authority]
 
 
 def _inputs() -> RehearsalInputs:
