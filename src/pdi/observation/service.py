@@ -96,11 +96,13 @@ class EnrichmentWorker:
                         batch,
                         completed_at=self._clock(),
                         exclusive_generator_family=generator_family,
+                        effect_sources=resource.sources,
                     )
                 else:
                     result = self._repository.publish(
                         batch,
                         completed_at=self._clock(),
+                        effect_sources=resource.sources,
                     )
                 writes += result.statement_writes; deactivated += result.deactivated_statements; processed += 1
             except Exception as error:

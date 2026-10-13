@@ -1,0 +1,10 @@
+[Unit]
+Description=Run scoped Immich OCR enrichment
+
+[Timer]
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+Unit=pdi-scoped-pipeline@enrichment.immich_ocr.service
+
+[Install]
+WantedBy=timers.target

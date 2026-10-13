@@ -1,0 +1,30 @@
+{
+  "APPROVED_PACKAGE_NAMES_AND_VERSIONS": [
+    {
+      "NAME": "libc6",
+      "VERSION": "2.39-0ubuntu8.6"
+    },
+    {
+      "NAME": "libpq5",
+      "VERSION": "16.10-0ubuntu0.24.04.1"
+    },
+    {
+      "NAME": "python313",
+      "VERSION": "3.13"
+    }
+  ],
+  "ARCH": "x86_64",
+  "MANIFEST_VERSION": "1",
+  "NATIVE_LIBRARY_PACKAGE_SET": [
+    "libc6",
+    "libpq5",
+    "python313"
+  ],
+  "OS_ID": "ubuntu",
+  "OS_VERSION_ID": "24.04",
+  "PYTHON_ABI": "cp313",
+  "PYTHON_IMPLEMENTATION": "CPython",
+  "PYTHON_VERSION": "3.13",
+  "SYSTEM_PYTHON_PATH": "/usr/bin/python3.13",
+  "SYSTEM_RUNTIME_FILE_SHA256": "559aead08264d5795d3909718cdd05abd49572e84fe55590eef31a88a08fdffd"
+}

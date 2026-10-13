@@ -1,0 +1,10 @@
+[Unit]
+Description=Run scoped Nextcloud text enrichment
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+Unit=pdi-scoped-pipeline@enrichment.nextcloud_text.service
+
+[Install]
+WantedBy=timers.target

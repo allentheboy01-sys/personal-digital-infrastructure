@@ -3,6 +3,7 @@ from typing import Protocol
 
 from .models import (
     EnrichmentResource,
+    EnrichmentSource,
     EnrichmentState,
     GeneratorIdentity,
     ObservationBatch,
@@ -18,6 +19,7 @@ class ObservationRepository(Protocol):
         *,
         completed_at: datetime,
         exclusive_generator_family: tuple[str, ...] = (),
+        effect_sources: tuple[EnrichmentSource, ...] = (),
     ) -> PublishResult: ...
 
     def get_enrichment_state(

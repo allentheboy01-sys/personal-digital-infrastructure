@@ -34,6 +34,7 @@ from pdi.scoped_operational import (
     ScopedFormalPipelineError,
     build_executable_scoped_runner,
 )
+from pdi.data_status.models import PipelineKind
 from pdi.scoped_operator_config import (
     ScopedOperatorConfiguration,
     ScopedProviderBinding,
@@ -179,7 +180,11 @@ def test_formal_runner_routes_all_enabled_scopes_and_ledger_to_personal_db(datab
     )
     seen = []
     executors = {
-        key: (lambda db, target, key=key: seen.append((key, target)))
+        key: (
+            lambda db, target, run_context, key=key: seen.append(
+                (key, target)
+            )
+        )
         for key in SCOPED_FORMAL_PIPELINES
     }
     runner = PrincipalFormalPipelineRunner(
@@ -188,7 +193,15 @@ def test_formal_runner_routes_all_enabled_scopes_and_ledger_to_personal_db(datab
     for key in SCOPED_FORMAL_PIPELINES:
         assert runner.run("synthetic-a", key, lock_timeout=1) == 0
     assert all(target is not None for _, target in seen)
-    assert len(seen) == 24
+    # Provider/person/relation operations fan out by enabled Scope; enrichment
+    # is one Principal-level run whose readers resolve each Source Scope.
+    enabled_scope_counts = {"immich": 2, "nextcloud": 2}
+    expected = sum(
+        1 if spec.kind is PipelineKind.ENRICHMENT
+        else enabled_scope_counts[spec.provider_type]
+        for spec in SCOPED_FORMAL_PIPELINES.values()
+    )
+    assert len(seen) == expected
     verify = create_postgres_engine(url)
     with verify.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM pipeline_runs WHERE status='completed'")) == len(SCOPED_FORMAL_PIPELINES)
@@ -200,7 +213,7 @@ def test_multi_scope_failure_is_visible_after_all_scopes_are_attempted(database,
     scopes = (_scope(engine, "immich"), _scope(engine, "immich"))
     engine.dispose()
     attempted = []
-    def fail_one(db, target):
+    def fail_one(db, target, run_context):
         attempted.append(target.observation_scope_id)
         if target.observation_scope_id == scopes[0].id:
             raise RuntimeError("synthetic failure")

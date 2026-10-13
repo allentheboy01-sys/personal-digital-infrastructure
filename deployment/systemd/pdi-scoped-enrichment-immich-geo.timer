@@ -1,0 +1,10 @@
+[Unit]
+Description=Run scoped Immich geo enrichment
+
+[Timer]
+OnCalendar=*-*-* 05:30:00
+Persistent=true
+Unit=pdi-scoped-pipeline@enrichment.immich_geo.service
+
+[Install]
+WantedBy=timers.target

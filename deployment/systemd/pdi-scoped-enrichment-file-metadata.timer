@@ -1,0 +1,10 @@
+[Unit]
+Description=Run scoped file metadata enrichment
+
+[Timer]
+OnCalendar=*-*-* 05:45:00
+Persistent=true
+Unit=pdi-scoped-pipeline@enrichment.file_metadata.service
+
+[Install]
+WantedBy=timers.target

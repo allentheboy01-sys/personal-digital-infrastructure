@@ -26,6 +26,7 @@ import pdi.repository.orm.blob
 import pdi.repository.orm.observation
 import pdi.repository.orm.person
 import pdi.repository.orm.pipeline_run
+import pdi.repository.orm.pipeline_run_effect_receipt
 import pdi.repository.orm.provider_identity
 import pdi.repository.orm.provider_sync_state
 import pdi.repository.orm.resource_person_relation
@@ -47,6 +48,7 @@ PROVIDER_IDENTITY_REVISION = "b8d4f2a6c901"
 SOURCE_PROVENANCE_REVISION = "c3e5a7b9d102"
 SCOPE_SYNC_STATE_REVISION = "d4f6a8c0e213"
 SCOPED_PERSON_RELATION_REVISION = "e5a7b9d1f324"
+RUNTIME_EFFECT_RECEIPT_REVISION = "f6b8d0e2a435"
 
 
 def _alembic_config(connection) -> Config:
@@ -69,6 +71,19 @@ def _run_alembic(
 
 def _drop_test_schema(engine: Engine) -> None:
     with engine.begin() as connection:
+        connection.execute(text(
+            "DROP FUNCTION IF EXISTS "
+            "pdi_reject_pipeline_run_effect_receipt_mutation() CASCADE"
+        ))
+        connection.execute(text(
+            "DROP FUNCTION IF EXISTS "
+            "pdi_validate_pipeline_run_effect_receipt_insert() CASCADE"
+        ))
+        connection.execute(text(
+            "DROP FUNCTION IF EXISTS "
+            "pdi_reject_pipeline_run_invocation_mutation() CASCADE"
+        ))
+        connection.execute(text("DROP TABLE IF EXISTS pipeline_run_effect_receipts"))
         connection.execute(text("DROP TABLE IF EXISTS observation_scope_resource_person_relations"))
         connection.execute(text("DROP TABLE IF EXISTS observation_scope_person_sources"))
         connection.execute(text("DROP TABLE IF EXISTS observation_scope_sync_state"))
@@ -165,6 +180,7 @@ def test_metadata_registration() -> None:
         "resource_statements",
         "resource_enrichments",
         "pipeline_runs",
+        "pipeline_run_effect_receipts",
         "provider_sync_state",
         "persons",
         "person_sources",
@@ -218,7 +234,7 @@ def test_empty_database_upgrade_and_schema(
                 "SELECT version_num "
                 "FROM alembic_version"
             )
-            ).scalar_one() == SCOPED_PERSON_RELATION_REVISION
+            ).scalar_one() == RUNTIME_EFFECT_RECEIPT_REVISION
 
 
 def test_mu5_source_provenance_upgrade_preserves_legacy_source(
@@ -419,6 +435,7 @@ def test_data_status_schema_constraints_indexes_and_downgrade(
             for check in inspector.get_check_constraints("pipeline_runs")
         } == {
             "ck_pipeline_runs_error_code",
+            "ck_pipeline_runs_invocation_fingerprint",
             "ck_pipeline_runs_key_nonempty",
             "ck_pipeline_runs_kind",
             "ck_pipeline_runs_lifecycle",
@@ -436,6 +453,7 @@ def test_data_status_schema_constraints_indexes_and_downgrade(
             "started_at",
             "finished_at",
             "error_code",
+            "invocation_fingerprint",
         }
         assert "error_message" not in columns
         indexes = {
@@ -444,10 +462,14 @@ def test_data_status_schema_constraints_indexes_and_downgrade(
         }
         assert set(indexes) == {
             "ix_pipeline_runs_key_started_at",
+            "uq_pipeline_runs_invocation_fingerprint",
             "uq_pipeline_runs_running_key",
         }
         assert indexes["uq_pipeline_runs_running_key"]["unique"] is True
         assert indexes["uq_pipeline_runs_running_key"][
+            "dialect_options"
+        ]["postgresql_where"] is not None
+        assert indexes["uq_pipeline_runs_invocation_fingerprint"][
             "dialect_options"
         ]["postgresql_where"] is not None
 
@@ -461,6 +483,164 @@ def test_data_status_schema_constraints_indexes_and_downgrade(
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
         ).scalar_one() == OBSERVATION_V0_1_REVISION
+
+
+def test_runtime_effect_upgrade_preserves_historical_runs_and_empty_downgrade(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(
+        migration_engine,
+        command.upgrade,
+        SCOPED_PERSON_RELATION_REVISION,
+    )
+    historical_run = uuid4()
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pipeline_runs "
+                "(id,pipeline_key,kind,status,started_at,finished_at,error_code) "
+                "VALUES (:id,'enrichment.file_metadata','enrichment',"
+                "'completed',now(),now(),NULL)"
+            ),
+            {"id": historical_run},
+        )
+
+    _run_alembic(migration_engine, command.upgrade, "head")
+    with migration_engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "pipeline_run_effect_receipts" in inspector.get_table_names()
+        assert connection.scalar(text(
+            "SELECT invocation_fingerprint FROM pipeline_runs WHERE id=:id"
+        ), {"id": historical_run}) is None
+        assert connection.scalar(text(
+            "SELECT count(*) FROM pipeline_run_effect_receipts"
+        )) == 0
+
+    _run_alembic(
+        migration_engine,
+        command.downgrade,
+        SCOPED_PERSON_RELATION_REVISION,
+    )
+    with migration_engine.connect() as connection:
+        inspector = inspect(connection)
+        assert "pipeline_run_effect_receipts" not in inspector.get_table_names()
+        assert "invocation_fingerprint" not in {
+            column["name"] for column in inspector.get_columns("pipeline_runs")
+        }
+        assert connection.scalar(text(
+            "SELECT count(*) FROM pipeline_runs WHERE id=:id"
+        ), {"id": historical_run}) == 1
+
+
+def test_runtime_effect_downgrade_refuses_invocation_evidence(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(migration_engine, command.upgrade, "head")
+    with migration_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pipeline_runs "
+                "(id,pipeline_key,kind,status,started_at,finished_at,error_code,"
+                "invocation_fingerprint) VALUES "
+                "(:id,'enrichment.file_metadata','enrichment','completed',"
+                "now(),now(),NULL,:invocation)"
+            ),
+            {"id": uuid4(), "invocation": "a" * 64},
+        )
+
+    with pytest.raises(Exception, match="runtime-effect downgrade blocked"):
+        _run_alembic(
+            migration_engine,
+            command.downgrade,
+            SCOPED_PERSON_RELATION_REVISION,
+        )
+    with migration_engine.connect() as connection:
+        assert connection.scalar(text(
+            "SELECT version_num FROM alembic_version"
+        )) == RUNTIME_EFFECT_RECEIPT_REVISION
+        assert "pipeline_run_effect_receipts" in inspect(connection).get_table_names()
+
+
+def test_runtime_effect_upgrade_carries_existing_runtime_table_authority(
+    migration_engine: Engine,
+) -> None:
+    _run_alembic(
+        migration_engine,
+        command.upgrade,
+        SCOPED_PERSON_RELATION_REVISION,
+    )
+    role = f"pdi_runtime_effect_acl_{uuid4().hex}"
+    created = False
+    try:
+        with migration_engine.begin() as connection:
+            connection.exec_driver_sql(f'CREATE ROLE "{role}" NOLOGIN')
+            created = True
+            connection.exec_driver_sql(
+                f'GRANT USAGE ON SCHEMA public TO "{role}"'
+            )
+            connection.exec_driver_sql(
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES "
+                f'IN SCHEMA public TO "{role}"'
+            )
+
+        _run_alembic(migration_engine, command.upgrade, "head")
+        with migration_engine.begin() as connection:
+            assert all(connection.scalar(text(
+                "SELECT has_table_privilege(:role,"
+                "'public.pipeline_run_effect_receipts',:privilege)"
+            ), {"role": role, "privilege": privilege}) for privilege in (
+                "SELECT", "INSERT", "UPDATE", "DELETE"
+            ))
+            asset_id, run_id = uuid4(), uuid4()
+            connection.execute(text(
+                "INSERT INTO assets "
+                "(id,resource_type,title,metadata,created_at,updated_at) "
+                "VALUES (:id,'file','ACL fixture','{}'::jsonb,now(),now())"
+            ), {"id": asset_id})
+            connection.execute(text(
+                "INSERT INTO pipeline_runs "
+                "(id,pipeline_key,kind,status,started_at,finished_at,error_code,"
+                "invocation_fingerprint) VALUES "
+                "(:id,'enrichment.file_metadata','enrichment','running',"
+                "now(),NULL,NULL,:invocation)"
+            ), {"id": run_id, "invocation": "a" * 64})
+
+        with migration_engine.connect() as connection:
+            transaction = connection.begin()
+            try:
+                connection.exec_driver_sql(f'SET LOCAL ROLE "{role}"')
+                assert connection.scalar(text(
+                    "SELECT count(*) FROM pipeline_run_effect_receipts"
+                )) == 0
+                connection.execute(text(
+                    "INSERT INTO pipeline_run_effect_receipts "
+                    "(id,version,pipeline_run_id,pipeline_key,subject_asset_id,"
+                    "generator_type,generator_name,generator_version,"
+                    "input_fingerprint,completed_at,created_statement_ids,"
+                    "deactivated_statement_ids,current_statement_ids,"
+                    "source_ids,"
+                    "statement_write_count,deactivated_statement_count,"
+                    "current_statement_count,enrichment_state_fingerprint,"
+                    "statement_effect_fingerprint,source_binding_fingerprint,"
+                    "fragment_fingerprint) VALUES "
+                    "(:id,1,:run,'enrichment.file_metadata',:asset,"
+                    "'deterministic_extractor','file_metadata','1',:digest,now(),"
+                    "ARRAY[]::uuid[],ARRAY[]::uuid[],ARRAY[]::uuid[],"
+                    "ARRAY[:source]::uuid[],0,0,0,:digest,:digest,:digest,:digest)"
+                ), {
+                    "id": uuid4(),
+                    "run": run_id,
+                    "asset": asset_id,
+                    "source": uuid4(),
+                    "digest": "b" * 64,
+                })
+            finally:
+                transaction.rollback()
+    finally:
+        if created:
+            with migration_engine.begin() as connection:
+                connection.exec_driver_sql(f'DROP OWNED BY "{role}"')
+                connection.exec_driver_sql(f'DROP ROLE "{role}"')
 
 
 def test_person_identity_schema_constraints_and_downgrade(
@@ -560,7 +740,7 @@ def test_upgrade_downgrade_upgrade(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == SCOPED_PERSON_RELATION_REVISION
+        ).scalar_one() == RUNTIME_EFFECT_RECEIPT_REVISION
 
 
 def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
@@ -667,7 +847,7 @@ def test_provider_identity_upgrade_preserves_existing_data_and_downgrades(
     with migration_engine.connect() as connection:
         assert connection.execute(
             text("SELECT version_num FROM alembic_version")
-        ).scalar_one() == SCOPED_PERSON_RELATION_REVISION
+        ).scalar_one() == RUNTIME_EFFECT_RECEIPT_REVISION
 
 
 def test_provider_sync_state_upgrade_downgrade_reupgrade(

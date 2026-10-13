@@ -16,7 +16,7 @@ def require(condition, code):
         raise Refused(code)
 
 
-HEAD = "e5a7b9d1f324"
+HEAD = "f6b8d0e2a435"
 PROVIDERS = ("nextcloud", "immich", "gmail", "integration-test")
 SOURCE_MAPPING = {
     "nextcloud": "nextcloud", "immich": "immich",
@@ -127,8 +127,8 @@ def registry_text(plan, env):
         require(url.scheme in {"http", "https"} and url.hostname and not
                 (url.username or url.password or url.query or url.fragment), "ENDPOINT_UNSAFE")
     q = json.dumps
-    lines = ["[[principals]]", f"id = {q(plan.principal)}", 'database_ref = "harry-personal-db"',
-             "enabled = true", "", "[[databases]]", 'ref = "harry-personal-db"', 'url_env = "DATABASE__URL"']
+    lines = ["[[principals]]", f"id = {q(plan.principal)}", 'database_ref = "primary-personal-db"',
+             "enabled = true", "", "[[databases]]", 'ref = "primary-personal-db"', 'url_env = "DATABASE__URL"']
     for provider in ("nextcloud", "immich"):
         prefix = provider.upper()
         secret = "NEXTCLOUD__PASSWORD" if provider == "nextcloud" else "IMMICH__API_KEY"
